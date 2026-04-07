@@ -14,8 +14,8 @@ import (
 
 // verifyCategoryOwnership checks that the category belongs to the budget and the user owns the budget.
 func verifyCategoryOwnership(budgetID, catID, userID uuid.UUID) error {
-	// First verify budget ownership.
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	// First verify budget access (owner or collaborator).
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return err
 	}
 
@@ -60,6 +60,12 @@ func CreateSubcategory(c *fiber.Ctx) error {
 
 	if req.Name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name is required"})
+	}
+	if len(req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+	}
+	if len(req.Icon) > maxIconLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
 	}
 
 	if err := verifyCategoryOwnership(budgetID, catID, userID); err != nil {
@@ -123,6 +129,16 @@ func UpdateSubcategory(c *fiber.Ctx) error {
 	var req models.UpdateSubcategoryRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+	}
+
+	if req.Name != nil && *req.Name == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name cannot be empty"})
+	}
+	if req.Name != nil && len(*req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+	}
+	if req.Icon != nil && len(*req.Icon) > maxIconLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
 	}
 
 	if err := verifyCategoryOwnership(budgetID, catID, userID); err != nil {

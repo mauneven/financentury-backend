@@ -51,7 +51,7 @@ func Protected() fiber.Handler {
 				return nil, jwt.ErrSignatureInvalid
 			}
 			return jwtSecret, nil
-		})
+		}, jwt.WithIssuer("financial-workspace"))
 
 		if err != nil || !token.Valid {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
@@ -73,15 +73,18 @@ func Protected() fiber.Handler {
 	}
 }
 
-// GenerateToken creates a signed JWT with 30-day expiry for the given user.
+// GenerateToken creates a signed JWT with 7-day expiry for the given user.
+// Includes issuer and subject claims for additional validation.
 func GenerateToken(userID uuid.UUID, email string) (string, error) {
 	now := time.Now()
 	claims := &Claims{
 		UserID: userID.String(),
 		Email:  email,
 		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "financial-workspace",
+			Subject:   userID.String(),
 			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(30 * 24 * time.Hour)),
+			ExpiresAt: jwt.NewNumericDate(now.Add(7 * 24 * time.Hour)),
 		},
 	}
 

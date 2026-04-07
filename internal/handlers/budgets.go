@@ -60,13 +60,14 @@ func getGuidedCategories() []guidedCategory {
 	}
 }
 
-// ListBudgets returns all budgets for the authenticated user.
+// ListBudgets returns all budgets for the authenticated user (owned + collaborative).
 func ListBudgets(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
 	if userID == uuid.Nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
 	}
 
+	// Fetch owned budgets.
 	query := database.NewFilter().
 		Select("*").
 		Eq("user_id", userID.String()).
@@ -91,6 +92,39 @@ func ListBudgets(c *fiber.Ctx) error {
 		budgets = make([]models.Budget, 0)
 	}
 
+	// Fetch budgets where user is a collaborator.
+	collabQuery := database.NewFilter().
+		Select("budget_id").
+		Eq("user_id", userID.String()).
+		Build()
+
+	collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabQuery)
+	if collabErr == nil && collabStatus == http.StatusOK {
+		var collabs []struct {
+			BudgetID string `json:"budget_id"`
+		}
+		if err := json.Unmarshal(collabBody, &collabs); err == nil && len(collabs) > 0 {
+			budgetIDs := make([]string, len(collabs))
+			for i, c := range collabs {
+				budgetIDs[i] = c.BudgetID
+			}
+
+			collabBudgetQuery := database.NewFilter().
+				Select("*").
+				In("id", budgetIDs).
+				Order("created_at", "desc").
+				Build()
+
+			collabBudgetBody, collabBudgetStatus, collabBudgetErr := database.DB.Get("budgets", collabBudgetQuery)
+			if collabBudgetErr == nil && collabBudgetStatus == http.StatusOK {
+				var collabBudgets []models.Budget
+				if err := json.Unmarshal(collabBudgetBody, &collabBudgets); err == nil {
+					budgets = append(budgets, collabBudgets...)
+				}
+			}
+		}
+	}
+
 	return c.JSON(budgets)
 }
 
@@ -113,9 +147,19 @@ func CreateBudget(c *fiber.Ctx) error {
 			Error: "name is required",
 		})
 	}
+	if len(req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+			Error: "name too long (max 200 characters)",
+		})
+	}
 	if req.MonthlyIncome <= 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 			Error: "monthly_income must be positive",
+		})
+	}
+	if req.MonthlyIncome > maxAmountValue {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+			Error: "monthly_income exceeds maximum allowed value",
 		})
 	}
 	if req.Currency == "" {
@@ -228,7 +272,7 @@ func CreateBudget(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(budget)
 }
 
-// GetBudget returns a single budget by ID.
+// GetBudget returns a single budget by ID (owner or collaborator).
 func GetBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
 	if userID == uuid.Nil {
@@ -241,10 +285,14 @@ func GetBudget(c *fiber.Ctx) error {
 		})
 	}
 
+	// Verify user has access (owner or collaborator).
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+	}
+
 	query := database.NewFilter().
 		Select("*").
 		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budgets", query)
@@ -284,7 +332,19 @@ func UpdateBudget(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate mode and currency if provided.
+	// Validate fields if provided.
+	if req.Name != nil && len(*req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+	}
+	if req.Name != nil && *req.Name == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name cannot be empty"})
+	}
+	if req.MonthlyIncome != nil && *req.MonthlyIncome <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "monthly_income must be positive"})
+	}
+	if req.MonthlyIncome != nil && *req.MonthlyIncome > maxAmountValue {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "monthly_income exceeds maximum allowed value"})
+	}
 	if req.Mode != nil {
 		validModes := map[string]bool{"manual": true, "guided": true}
 		if !validModes[*req.Mode] {

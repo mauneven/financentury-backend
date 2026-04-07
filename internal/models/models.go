@@ -53,13 +53,45 @@ type Subcategory struct {
 
 // Expense represents a budget expense.
 type Expense struct {
-	ID            uuid.UUID `json:"id"`
-	BudgetID      uuid.UUID `json:"budget_id"`
-	SubcategoryID uuid.UUID `json:"subcategory_id"`
-	Amount        float64   `json:"amount"`
-	Description   string    `json:"description"`
-	ExpenseDate   string    `json:"expense_date"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            uuid.UUID  `json:"id"`
+	BudgetID      uuid.UUID  `json:"budget_id"`
+	SubcategoryID uuid.UUID  `json:"subcategory_id"`
+	Amount        float64    `json:"amount"`
+	Description   string     `json:"description"`
+	ExpenseDate   string     `json:"expense_date"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// Collaborator represents a budget collaborator.
+type Collaborator struct {
+	ID       uuid.UUID `json:"id"`
+	BudgetID uuid.UUID `json:"budget_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Role     string    `json:"role"`
+	AddedAt  string    `json:"added_at"`
+	Profile  *Profile  `json:"profile,omitempty"`
+}
+
+// Invite represents a budget invite.
+type Invite struct {
+	ID          uuid.UUID  `json:"id"`
+	BudgetID    uuid.UUID  `json:"budget_id"`
+	InviteToken string     `json:"invite_token"`
+	CreatedBy   uuid.UUID  `json:"created_by"`
+	UsedBy      *uuid.UUID `json:"used_by,omitempty"`
+	UsedAt      *string    `json:"used_at,omitempty"`
+	ExpiresAt   string     `json:"expires_at"`
+	CreatedAt   string     `json:"created_at"`
+}
+
+// InviteInfo is the public invite preview response.
+type InviteInfo struct {
+	BudgetName  string `json:"budget_name"`
+	InviterName string `json:"inviter_name"`
+	ExpiresAt   string `json:"expires_at"`
+	IsExpired   bool   `json:"is_expired"`
+	IsUsed      bool   `json:"is_used"`
 }
 
 // --- Request/Response DTOs ---

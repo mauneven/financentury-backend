@@ -43,7 +43,7 @@ func ListCategories(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -124,8 +124,14 @@ func CreateCategory(c *fiber.Ctx) error {
 	if req.Name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name is required"})
 	}
+	if len(req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+	}
+	if len(req.Icon) > maxIconLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
+	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -184,7 +190,17 @@ func UpdateCategory(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if req.Name != nil && *req.Name == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name cannot be empty"})
+	}
+	if req.Name != nil && len(*req.Name) > maxNameLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+	}
+	if req.Icon != nil && len(*req.Icon) > maxIconLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
+	}
+
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -260,7 +276,7 @@ func DeleteCategory(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid category ID"})
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 

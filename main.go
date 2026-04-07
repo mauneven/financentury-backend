@@ -33,8 +33,16 @@ func main() {
 	// Initialize JWT validation.
 	middleware.Init(cfg.JWTSecret)
 
-	// Initialize Google OAuth handler.
-	handlers.InitAuth(cfg.GoogleClientID, cfg.GoogleClientSecret)
+	// Initialize Google OAuth handler with allowed redirect origins.
+	// The frontend URL and CORS origin are both permitted as redirect targets.
+	allowedOrigins := []string{cfg.FrontendURL}
+	if cfg.CORSOrigin != cfg.FrontendURL {
+		allowedOrigins = append(allowedOrigins, cfg.CORSOrigin)
+	}
+	handlers.InitAuth(cfg.GoogleClientID, cfg.GoogleClientSecret, allowedOrigins...)
+
+	// Initialize invite handler with frontend URL.
+	handlers.InitInvites(cfg.FrontendURL)
 
 	// Initialize Supabase REST API client.
 	database.Init(cfg.SupabaseURL, cfg.SupabaseAnonKey)

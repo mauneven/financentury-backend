@@ -18,10 +18,44 @@ import (
 // Package-level Google OAuth credentials.
 var googleClientID, googleClientSecret string
 
-// InitAuth configures the auth handler with Google OAuth credentials.
-func InitAuth(clientID, clientSecret string) {
+// allowedRedirectHosts stores the set of hosts that are permitted as OAuth redirect targets.
+var allowedRedirectHosts []string
+
+// InitAuth configures the auth handler with Google OAuth credentials and allowed redirect origins.
+func InitAuth(clientID, clientSecret string, allowedOrigins ...string) {
 	googleClientID = clientID
 	googleClientSecret = clientSecret
+	allowedRedirectHosts = allowedOrigins
+}
+
+// isAllowedRedirectURI validates the redirect_uri against the configured allowlist.
+// Only origins that were explicitly registered are accepted. This prevents open
+// redirect attacks where an attacker tricks the backend into sending the auth code
+// to a domain they control.
+func isAllowedRedirectURI(redirectURI string) bool {
+	parsed, err := url.Parse(redirectURI)
+	if err != nil {
+		return false
+	}
+	// Must be an absolute URL with https (or http for localhost dev).
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1")) {
+		return false
+	}
+	// The path must be exactly /auth/callback -- no query, no fragment.
+	if parsed.Path != "/auth/callback" {
+		return false
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	// Check the scheme+host against the allowlist.
+	origin := parsed.Scheme + "://" + parsed.Host
+	for _, allowed := range allowedRedirectHosts {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 // googleLoginRequest is the expected request body for Google login.
@@ -69,6 +103,13 @@ func GoogleLogin(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate redirect_uri against the allowlist to prevent open redirect attacks.
+	if !isAllowedRedirectURI(req.RedirectURI) {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+			Error: "redirect_uri is not allowed",
+		})
+	}
+
 	// Exchange authorization code for tokens.
 	tokenData := url.Values{
 		"client_id":     {googleClientID},
@@ -78,7 +119,9 @@ func GoogleLogin(c *fiber.Ctx) error {
 		"redirect_uri":  {req.RedirectURI},
 	}
 
-	tokenResp, err := http.Post(
+	// Use a timeout-protected HTTP client for the token exchange.
+	tokenHTTPClient := &http.Client{Timeout: 10 * time.Second}
+	tokenResp, err := tokenHTTPClient.Post(
 		"https://oauth2.googleapis.com/token",
 		"application/x-www-form-urlencoded",
 		strings.NewReader(tokenData.Encode()),
@@ -90,7 +133,8 @@ func GoogleLogin(c *fiber.Ctx) error {
 	}
 	defer tokenResp.Body.Close()
 
-	tokenBody, err := io.ReadAll(tokenResp.Body)
+	// Limit response body size to 1MB to prevent memory exhaustion.
+	tokenBody, err := io.ReadAll(io.LimitReader(tokenResp.Body, 1<<20))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
 			Error: "failed to read token response",
@@ -134,7 +178,8 @@ func GoogleLogin(c *fiber.Ctx) error {
 	}
 	defer userInfoResp.Body.Close()
 
-	userInfoBody, err := io.ReadAll(userInfoResp.Body)
+	// Limit response body size to 1MB.
+	userInfoBody, err := io.ReadAll(io.LimitReader(userInfoResp.Body, 1<<20))
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
 			Error: "failed to read user info response",
@@ -157,6 +202,11 @@ func GoogleLogin(c *fiber.Ctx) error {
 	if userInfo.Email == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
 			Error: "no email received from Google",
+		})
+	}
+	if !userInfo.VerifiedEmail {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
+			Error: "email address is not verified by Google",
 		})
 	}
 

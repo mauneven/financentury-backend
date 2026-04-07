@@ -23,7 +23,7 @@ func ListExpenses(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -72,6 +72,12 @@ func CreateExpense(c *fiber.Ctx) error {
 	if req.Amount <= 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount must be positive"})
 	}
+	if req.Amount > maxAmountValue {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount exceeds maximum allowed value"})
+	}
+	if len(req.Description) > maxDescriptionLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "description too long (max 1000 characters)"})
+	}
 	if req.ExpenseDate == "" {
 		req.ExpenseDate = time.Now().UTC().Format("2006-01-02")
 	}
@@ -83,7 +89,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		}
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -127,6 +133,7 @@ func CreateExpense(c *fiber.Ctx) error {
 	now := time.Now().UTC()
 	expenseID := uuid.New()
 
+	createdBy := userID
 	expense := models.Expense{
 		ID:            expenseID,
 		BudgetID:      budgetID,
@@ -134,6 +141,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		Amount:        req.Amount,
 		Description:   req.Description,
 		ExpenseDate:   req.ExpenseDate,
+		CreatedBy:     &createdBy,
 		CreatedAt:     now,
 	}
 
@@ -144,6 +152,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		"amount":         req.Amount,
 		"description":    req.Description,
 		"expense_date":   req.ExpenseDate,
+		"created_by":     userID.String(),
 		"created_at":     now.Format(time.RFC3339Nano),
 	}
 	payloadBytes, err := json.Marshal(payload)
@@ -179,14 +188,20 @@ func UpdateExpense(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
 	}
 
-	// Validate date format if provided.
+	// Validate fields if provided.
+	if req.Amount != nil && *req.Amount > maxAmountValue {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount exceeds maximum allowed value"})
+	}
+	if req.Description != nil && len(*req.Description) > maxDescriptionLength {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "description too long (max 1000 characters)"})
+	}
 	if req.ExpenseDate != nil && *req.ExpenseDate != "" {
 		if _, err := time.Parse("2006-01-02", *req.ExpenseDate); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
 		}
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
@@ -300,7 +315,7 @@ func DeleteExpense(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid expense ID"})
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 

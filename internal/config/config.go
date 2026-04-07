@@ -34,6 +34,9 @@ func Load() (*Config, error) {
 	if jwtSecret == "" {
 		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
 	}
+	if len(jwtSecret) < 32 {
+		return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters long for adequate security")
+	}
 
 	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
 	if googleClientID == "" {

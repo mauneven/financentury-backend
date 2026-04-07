@@ -78,12 +78,49 @@ func Migrate(c *fiber.Ctx) error {
 			Error: "at least one budget is required",
 		})
 	}
+	if len(req.Budgets) > 20 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+			Error: "too many budgets in migration (max 20)",
+		})
+	}
 
 	var createdBudgets []models.Budget
 
 	for _, mb := range req.Budgets {
 		now := time.Now().UTC()
 		budgetID := uuid.New()
+
+		// Validate budget fields.
+		if mb.Name == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "budget name is required",
+			})
+		}
+		if len(mb.Name) > 200 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "budget name too long (max 200 characters)",
+			})
+		}
+		if mb.MonthlyIncome < 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "monthly_income cannot be negative",
+			})
+		}
+		if mb.MonthlyIncome > 1e15 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "monthly_income exceeds maximum allowed value",
+			})
+		}
+		if len(mb.Categories) > 100 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "too many categories per budget (max 100)",
+			})
+		}
+		if len(mb.Expenses) > 10000 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "too many expenses per budget (max 10000)",
+			})
+		}
 
 		// Default values.
 		if mb.Currency == "" {
@@ -94,6 +131,18 @@ func Migrate(c *fiber.Ctx) error {
 		}
 		if mb.Mode == "" {
 			mb.Mode = "manual"
+		}
+		// Validate mode and currency.
+		validModes := map[string]bool{"manual": true, "guided": true}
+		if !validModes[mb.Mode] {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "invalid mode, must be 'manual' or 'guided'",
+			})
+		}
+		if len(mb.Currency) != 3 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+				Error: "invalid currency code",
+			})
 		}
 
 		// Create the budget.
@@ -128,6 +177,22 @@ func Migrate(c *fiber.Ctx) error {
 
 		// Create categories and subcategories.
 		for _, mc := range mb.Categories {
+			if mc.Name == "" || len(mc.Name) > 200 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "category name is required and must not exceed 200 characters",
+				})
+			}
+			if len(mc.Icon) > 50 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "category icon too long (max 50 characters)",
+				})
+			}
+			if len(mc.Subcategories) > 100 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "too many subcategories per category (max 100)",
+				})
+			}
+
 			catID := uuid.New()
 
 			catPayload := map[string]interface{}{
@@ -156,6 +221,17 @@ func Migrate(c *fiber.Ctx) error {
 
 			// Create subcategories.
 			for _, ms := range mc.Subcategories {
+				if ms.Name == "" || len(ms.Name) > 200 {
+					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+						Error: "subcategory name is required and must not exceed 200 characters",
+					})
+				}
+				if len(ms.Icon) > 50 {
+					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+						Error: "subcategory icon too long (max 50 characters)",
+					})
+				}
+
 				subID := uuid.New()
 
 				// Map the local ID to the real UUID.
@@ -191,6 +267,29 @@ func Migrate(c *fiber.Ctx) error {
 
 		// Create expenses using the localID -> real UUID map.
 		for _, me := range mb.Expenses {
+			if me.Amount < 0 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "expense amount cannot be negative",
+				})
+			}
+			if me.Amount > 1e15 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "expense amount exceeds maximum allowed value",
+				})
+			}
+			if len(me.Description) > 1000 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "expense description too long (max 1000 characters)",
+				})
+			}
+			if me.ExpenseDate != "" {
+				if _, err := time.Parse("2006-01-02", me.ExpenseDate); err != nil {
+					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+						Error: "invalid expense date format, use YYYY-MM-DD",
+					})
+				}
+			}
+
 			realSubID, ok := subLocalIDMap[me.LocalSubcategoryID]
 			if !ok {
 				// Skip expenses with unknown subcategory references.
