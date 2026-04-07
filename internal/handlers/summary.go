@@ -14,6 +14,9 @@ import (
 // GetBudgetSummary returns a comprehensive budget summary via the RPC function.
 func GetBudgetSummary(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -24,7 +27,10 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		"p_budget_id": budgetID.String(),
 		"p_user_id":   userID.String(),
 	}
-	rpcBytes, _ := json.Marshal(rpcPayload)
+	rpcBytes, err := json.Marshal(rpcPayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	body, statusCode, err := database.DB.RPC("get_budget_summary", rpcBytes)
 	if err != nil {
@@ -44,6 +50,9 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 // GetBudgetTrends returns monthly spending trends via the RPC function.
 func GetBudgetTrends(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -54,7 +63,10 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		"p_budget_id": budgetID.String(),
 		"p_user_id":   userID.String(),
 	}
-	rpcBytes, _ := json.Marshal(rpcPayload)
+	rpcBytes, err := json.Marshal(rpcPayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	body, statusCode, err := database.DB.RPC("get_budget_trends", rpcBytes)
 	if err != nil {

@@ -15,6 +15,9 @@ import (
 // ListExpenses returns all expenses for a budget.
 func ListExpenses(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -50,6 +53,9 @@ func ListExpenses(c *fiber.Ctx) error {
 // CreateExpense creates a new expense for a budget.
 func CreateExpense(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -68,6 +74,13 @@ func CreateExpense(c *fiber.Ctx) error {
 	}
 	if req.ExpenseDate == "" {
 		req.ExpenseDate = time.Now().UTC().Format("2006-01-02")
+	}
+
+	// Validate date format.
+	if req.ExpenseDate != "" {
+		if _, err := time.Parse("2006-01-02", req.ExpenseDate); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
+		}
 	}
 
 	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
@@ -133,7 +146,10 @@ func CreateExpense(c *fiber.Ctx) error {
 		"expense_date":   req.ExpenseDate,
 		"created_at":     now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, _ := json.Marshal(payload)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	_, statusCode, err = database.DB.Post("budget_expenses", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
@@ -146,6 +162,9 @@ func CreateExpense(c *fiber.Ctx) error {
 // UpdateExpense updates an existing expense.
 func UpdateExpense(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -158,6 +177,13 @@ func UpdateExpense(c *fiber.Ctx) error {
 	var req models.UpdateExpenseRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+	}
+
+	// Validate date format if provided.
+	if req.ExpenseDate != nil && *req.ExpenseDate != "" {
+		if _, err := time.Parse("2006-01-02", *req.ExpenseDate); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
+		}
 	}
 
 	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
@@ -241,7 +267,10 @@ func UpdateExpense(c *fiber.Ctx) error {
 		"description":    exp.Description,
 		"expense_date":   exp.ExpenseDate,
 	}
-	updateBytes, _ := json.Marshal(updatePayload)
+	updateBytes, err := json.Marshal(updatePayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	patchQuery := database.NewFilter().
 		Eq("id", expenseID.String()).
@@ -259,6 +288,9 @@ func UpdateExpense(c *fiber.Ctx) error {
 // DeleteExpense deletes an expense.
 func DeleteExpense(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})

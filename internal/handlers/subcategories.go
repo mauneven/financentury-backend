@@ -41,6 +41,9 @@ func verifyCategoryOwnership(budgetID, catID, userID uuid.UUID) error {
 // CreateSubcategory creates a new subcategory within a category.
 func CreateSubcategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -77,15 +80,18 @@ func CreateSubcategory(c *fiber.Ctx) error {
 	}
 
 	payload := map[string]interface{}{
-		"id":                subID.String(),
-		"category_id":       catID.String(),
-		"name":              req.Name,
+		"id":                 subID.String(),
+		"category_id":        catID.String(),
+		"name":               req.Name,
 		"allocation_percent": req.AllocationPercent,
-		"icon":              req.Icon,
-		"sort_order":        req.SortOrder,
-		"created_at":        now.Format(time.RFC3339Nano),
+		"icon":               req.Icon,
+		"sort_order":         req.SortOrder,
+		"created_at":         now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, _ := json.Marshal(payload)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	_, statusCode, err := database.DB.Post("budget_subcategories", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
@@ -98,6 +104,9 @@ func CreateSubcategory(c *fiber.Ctx) error {
 // UpdateSubcategory updates an existing subcategory.
 func UpdateSubcategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -154,12 +163,15 @@ func UpdateSubcategory(c *fiber.Ctx) error {
 	}
 
 	updatePayload := map[string]interface{}{
-		"name":              sub.Name,
+		"name":               sub.Name,
 		"allocation_percent": sub.AllocationPercent,
-		"icon":              sub.Icon,
-		"sort_order":        sub.SortOrder,
+		"icon":               sub.Icon,
+		"sort_order":         sub.SortOrder,
 	}
-	updateBytes, _ := json.Marshal(updatePayload)
+	updateBytes, err := json.Marshal(updatePayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	patchQuery := database.NewFilter().
 		Eq("id", subID.String()).
@@ -177,6 +189,9 @@ func UpdateSubcategory(c *fiber.Ctx) error {
 // DeleteSubcategory deletes a subcategory and its related expenses.
 func DeleteSubcategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})

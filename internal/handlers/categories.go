@@ -35,6 +35,9 @@ func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
 // ListCategories returns all categories (with subcategories) for a budget.
 func ListCategories(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -105,6 +108,9 @@ func ListCategories(c *fiber.Ctx) error {
 // CreateCategory creates a new category for a budget.
 func CreateCategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -137,15 +143,18 @@ func CreateCategory(c *fiber.Ctx) error {
 	}
 
 	payload := map[string]interface{}{
-		"id":                catID.String(),
-		"budget_id":         budgetID.String(),
-		"name":              req.Name,
+		"id":                 catID.String(),
+		"budget_id":          budgetID.String(),
+		"name":               req.Name,
 		"allocation_percent": req.AllocationPercent,
-		"icon":              req.Icon,
-		"sort_order":        req.SortOrder,
-		"created_at":        now.Format(time.RFC3339Nano),
+		"icon":               req.Icon,
+		"sort_order":         req.SortOrder,
+		"created_at":         now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, _ := json.Marshal(payload)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	_, statusCode, err := database.DB.Post("budget_categories", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
@@ -158,6 +167,9 @@ func CreateCategory(c *fiber.Ctx) error {
 // UpdateCategory updates an existing category.
 func UpdateCategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -210,12 +222,15 @@ func UpdateCategory(c *fiber.Ctx) error {
 	}
 
 	updatePayload := map[string]interface{}{
-		"name":              cat.Name,
+		"name":               cat.Name,
 		"allocation_percent": cat.AllocationPercent,
-		"icon":              cat.Icon,
-		"sort_order":        cat.SortOrder,
+		"icon":               cat.Icon,
+		"sort_order":         cat.SortOrder,
 	}
-	updateBytes, _ := json.Marshal(updatePayload)
+	updateBytes, err := json.Marshal(updatePayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	patchQuery := database.NewFilter().
 		Eq("id", catID.String()).
@@ -233,6 +248,9 @@ func UpdateCategory(c *fiber.Ctx) error {
 // DeleteCategory deletes a category and its subcategories.
 func DeleteCategory(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
@@ -265,17 +283,19 @@ func DeleteCategory(c *fiber.Ctx) error {
 
 	// Get subcategory IDs for this category to delete related expenses.
 	subQuery := database.NewFilter().Select("id").Eq("category_id", catID.String()).Build()
-	subBody, _, _ := database.DB.Get("budget_subcategories", subQuery)
+	subBody, subStatusCode, subErr := database.DB.Get("budget_subcategories", subQuery)
 
-	var subs []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(subBody, &subs); err == nil && len(subs) > 0 {
-		subIDs := make([]string, len(subs))
-		for i, s := range subs {
-			subIDs[i] = s.ID
+	if subErr == nil && subStatusCode == http.StatusOK {
+		var subs []struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(subBody, &subs); err == nil && len(subs) > 0 {
+			subIDs := make([]string, len(subs))
+			for i, s := range subs {
+				subIDs[i] = s.ID
+			}
+			// Delete expenses linked to these subcategories.
+			expQuery := database.NewFilter().In("subcategory_id", subIDs).Build()
+			_, _, _ = database.DB.Delete("budget_expenses", expQuery)
 		}
-		// Delete expenses linked to these subcategories.
-		expQuery := database.NewFilter().In("subcategory_id", subIDs).Build()
-		_, _, _ = database.DB.Delete("budget_expenses", expQuery)
 	}
 
 	// Delete subcategories.

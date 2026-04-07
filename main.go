@@ -44,9 +44,15 @@ func main() {
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
 			}
-			return c.Status(code).JSON(fiber.Map{"error": err.Error()})
+			msg := err.Error()
+			if code >= 500 {
+				log.Printf("internal error: %v", err)
+				msg = "internal server error"
+			}
+			return c.Status(code).JSON(fiber.Map{"error": msg})
 		},
-		AppName: "Financial Workspace API",
+		AppName:   "Financial Workspace API",
+		BodyLimit: 64 * 1024, // 64KB
 	})
 
 	// Global middleware.

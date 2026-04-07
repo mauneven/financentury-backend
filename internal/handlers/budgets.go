@@ -63,6 +63,9 @@ func getGuidedCategories() []guidedCategory {
 // ListBudgets returns all budgets for the authenticated user.
 func ListBudgets(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 
 	query := database.NewFilter().
 		Select("*").
@@ -94,6 +97,9 @@ func ListBudgets(c *fiber.Ctx) error {
 // CreateBudget creates a new budget and optionally seeds guided categories.
 func CreateBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 
 	var req models.CreateBudgetRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -120,6 +126,15 @@ func CreateBudget(c *fiber.Ctx) error {
 	}
 	if req.Mode == "" {
 		req.Mode = "manual"
+	}
+
+	// Validate mode and currency.
+	validModes := map[string]bool{"manual": true, "guided": true}
+	if !validModes[req.Mode] {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid mode, must be 'manual' or 'guided'"})
+	}
+	if len(req.Currency) != 3 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid currency code"})
 	}
 
 	now := time.Now().UTC()
@@ -150,7 +165,10 @@ func CreateBudget(c *fiber.Ctx) error {
 		"updated_at":            now.Format(time.RFC3339Nano),
 	}
 
-	payloadBytes, _ := json.Marshal(budgetPayload)
+	payloadBytes, err := json.Marshal(budgetPayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 	_, statusCode, err := database.DB.Post("budgets", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
 		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
@@ -163,15 +181,18 @@ func CreateBudget(c *fiber.Ctx) error {
 		for _, gc := range getGuidedCategories() {
 			catID := uuid.New()
 			catPayload := map[string]interface{}{
-				"id":                catID.String(),
-				"budget_id":         budget.ID.String(),
-				"name":              gc.Name,
+				"id":                 catID.String(),
+				"budget_id":          budget.ID.String(),
+				"name":               gc.Name,
 				"allocation_percent": gc.Percent,
-				"icon":              gc.Icon,
-				"sort_order":        gc.SortOrder,
-				"created_at":        now.Format(time.RFC3339Nano),
+				"icon":               gc.Icon,
+				"sort_order":         gc.SortOrder,
+				"created_at":         now.Format(time.RFC3339Nano),
 			}
-			catBytes, _ := json.Marshal(catPayload)
+			catBytes, err := json.Marshal(catPayload)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+			}
 			_, statusCode, err := database.DB.Post("budget_categories", catBytes)
 			if err != nil || statusCode != http.StatusCreated {
 				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
@@ -182,15 +203,18 @@ func CreateBudget(c *fiber.Ctx) error {
 			for _, gs := range gc.Subcategories {
 				subID := uuid.New()
 				subPayload := map[string]interface{}{
-					"id":                subID.String(),
-					"category_id":       catID.String(),
-					"name":              gs.Name,
+					"id":                 subID.String(),
+					"category_id":        catID.String(),
+					"name":               gs.Name,
 					"allocation_percent": gs.Percent,
-					"icon":              gs.Icon,
-					"sort_order":        gs.SortOrder,
-					"created_at":        now.Format(time.RFC3339Nano),
+					"icon":               gs.Icon,
+					"sort_order":         gs.SortOrder,
+					"created_at":         now.Format(time.RFC3339Nano),
 				}
-				subBytes, _ := json.Marshal(subPayload)
+				subBytes, err := json.Marshal(subPayload)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+				}
 				_, statusCode, err := database.DB.Post("budget_subcategories", subBytes)
 				if err != nil || statusCode != http.StatusCreated {
 					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
@@ -207,6 +231,9 @@ func CreateBudget(c *fiber.Ctx) error {
 // GetBudget returns a single budget by ID.
 func GetBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
@@ -240,6 +267,9 @@ func GetBudget(c *fiber.Ctx) error {
 // UpdateBudget updates an existing budget.
 func UpdateBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
@@ -252,6 +282,17 @@ func UpdateBudget(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 			Error: "invalid request body",
 		})
+	}
+
+	// Validate mode and currency if provided.
+	if req.Mode != nil {
+		validModes := map[string]bool{"manual": true, "guided": true}
+		if !validModes[*req.Mode] {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid mode, must be 'manual' or 'guided'"})
+		}
+	}
+	if req.Currency != nil && len(*req.Currency) != 3 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid currency code"})
 	}
 
 	// Fetch existing budget to verify ownership.
@@ -304,7 +345,10 @@ func UpdateBudget(c *fiber.Ctx) error {
 		"mode":                  b.Mode,
 		"updated_at":            b.UpdatedAt.Format(time.RFC3339Nano),
 	}
-	updateBytes, _ := json.Marshal(updatePayload)
+	updateBytes, err := json.Marshal(updatePayload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+	}
 
 	patchQuery := database.NewFilter().
 		Eq("id", budgetID.String()).
@@ -324,6 +368,9 @@ func UpdateBudget(c *fiber.Ctx) error {
 // DeleteBudget deletes a budget and all associated data.
 func DeleteBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	}
 	budgetID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
@@ -354,33 +401,47 @@ func DeleteBudget(c *fiber.Ctx) error {
 
 	// 1. Delete expenses for this budget.
 	expQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
-	_, _, _ = database.DB.Delete("budget_expenses", expQuery)
+	_, statusCode, err = database.DB.Delete("budget_expenses", expQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget expenses"})
+	}
 
 	// 2. Get category IDs to delete subcategories.
 	catQuery := database.NewFilter().Select("id").Eq("budget_id", budgetID.String()).Build()
-	catBody, _, _ := database.DB.Get("budget_categories", catQuery)
+	catBody, catStatusCode, catErr := database.DB.Get("budget_categories", catQuery)
 
-	var cats []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(catBody, &cats); err == nil && len(cats) > 0 {
-		catIDs := make([]string, len(cats))
-		for i, cat := range cats {
-			catIDs[i] = cat.ID
+	if catErr == nil && catStatusCode == http.StatusOK {
+		var cats []struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(catBody, &cats); err == nil && len(cats) > 0 {
+			catIDs := make([]string, len(cats))
+			for i, cat := range cats {
+				catIDs[i] = cat.ID
+			}
+			// Delete subcategories for all categories.
+			subQuery := database.NewFilter().In("category_id", catIDs).Build()
+			_, statusCode, err = database.DB.Delete("budget_subcategories", subQuery)
+			if err != nil || statusCode >= 300 {
+				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget subcategories"})
+			}
 		}
-		// Delete subcategories for all categories.
-		subQuery := database.NewFilter().In("category_id", catIDs).Build()
-		_, _, _ = database.DB.Delete("budget_subcategories", subQuery)
 	}
 
 	// 3. Delete categories.
 	delCatQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
-	_, _, _ = database.DB.Delete("budget_categories", delCatQuery)
+	_, statusCode, err = database.DB.Delete("budget_categories", delCatQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget categories"})
+	}
 
 	// 4. Delete the budget itself.
 	delBudgetQuery := database.NewFilter().
 		Eq("id", budgetID.String()).
 		Eq("user_id", userID.String()).
 		Build()
-	_, _, _ = database.DB.Delete("budgets", delBudgetQuery)
+	_, statusCode, err = database.DB.Delete("budgets", delBudgetQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget"})
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

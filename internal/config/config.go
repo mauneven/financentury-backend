@@ -19,7 +19,7 @@ type Config struct {
 func Load() (*Config, error) {
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	if supabaseURL == "" {
-		supabaseURL = "https://hceytkktkglzkcxlhpna.supabase.co"
+		return nil, fmt.Errorf("SUPABASE_URL environment variable is required")
 	}
 
 	supabaseAnonKey := os.Getenv("SUPABASE_ANON_KEY")
@@ -39,6 +39,9 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid PORT: %w", err)
 		}
 		port = parsed
+	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("PORT must be between 1 and 65535, got %d", port)
 	}
 
 	corsOrigin := os.Getenv("CORS_ORIGIN")
