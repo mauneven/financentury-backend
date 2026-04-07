@@ -8,11 +8,14 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	SupabaseURL    string
-	SupabaseAnonKey string
-	SupabaseJWTSecret string
-	Port           int
-	CORSOrigin     string
+	SupabaseURL        string
+	SupabaseAnonKey    string
+	JWTSecret          string
+	GoogleClientID     string
+	GoogleClientSecret string
+	FrontendURL        string
+	Port               int
+	CORSOrigin         string
 }
 
 // Load reads configuration from environment variables.
@@ -27,9 +30,24 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SUPABASE_ANON_KEY environment variable is required")
 	}
 
-	supabaseJWTSecret := os.Getenv("SUPABASE_JWT_SECRET")
-	if supabaseJWTSecret == "" {
-		return nil, fmt.Errorf("SUPABASE_JWT_SECRET environment variable is required")
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
+	}
+
+	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
+	if googleClientID == "" {
+		return nil, fmt.Errorf("GOOGLE_CLIENT_ID environment variable is required")
+	}
+
+	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	if googleClientSecret == "" {
+		return nil, fmt.Errorf("GOOGLE_CLIENT_SECRET environment variable is required")
+	}
+
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000"
 	}
 
 	port := 8080
@@ -50,10 +68,13 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		SupabaseURL:    supabaseURL,
-		SupabaseAnonKey: supabaseAnonKey,
-		SupabaseJWTSecret: supabaseJWTSecret,
-		Port:           port,
-		CORSOrigin:     corsOrigin,
+		SupabaseURL:        supabaseURL,
+		SupabaseAnonKey:    supabaseAnonKey,
+		JWTSecret:          jwtSecret,
+		GoogleClientID:     googleClientID,
+		GoogleClientSecret: googleClientSecret,
+		FrontendURL:        frontendURL,
+		Port:               port,
+		CORSOrigin:         corsOrigin,
 	}, nil
 }

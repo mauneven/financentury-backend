@@ -13,6 +13,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/the-financial-workspace/backend/internal/config"
 	"github.com/the-financial-workspace/backend/internal/database"
+	"github.com/the-financial-workspace/backend/internal/handlers"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/routes"
 )
@@ -29,8 +30,11 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Initialize Supabase JWT validation.
-	middleware.Init(cfg.SupabaseJWTSecret)
+	// Initialize JWT validation.
+	middleware.Init(cfg.JWTSecret)
+
+	// Initialize Google OAuth handler.
+	handlers.InitAuth(cfg.GoogleClientID, cfg.GoogleClientSecret)
 
 	// Initialize Supabase REST API client.
 	database.Init(cfg.SupabaseURL, cfg.SupabaseAnonKey)
@@ -52,7 +56,7 @@ func main() {
 			return c.Status(code).JSON(fiber.Map{"error": msg})
 		},
 		AppName:   "Financial Workspace API",
-		BodyLimit: 64 * 1024, // 64KB
+		BodyLimit: 4 * 1024 * 1024, // 4MB (increased for migration payloads)
 	})
 
 	// Global middleware.

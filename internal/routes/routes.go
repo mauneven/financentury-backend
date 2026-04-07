@@ -10,11 +10,17 @@ import (
 func Setup(app *fiber.App) {
 	api := app.Group("/api")
 
+	// Public auth routes.
+	api.Post("/auth/google", handlers.GoogleLogin)
+
 	// Protected routes.
 	protected := api.Group("", middleware.Protected())
 
-	// Auth routes (protected — requires valid Supabase JWT).
+	// Auth routes (protected — requires valid JWT).
 	protected.Get("/auth/me", handlers.Me)
+
+	// Migration route.
+	protected.Post("/migrate", handlers.Migrate)
 
 	// Budget routes.
 	budgets := protected.Group("/budgets")

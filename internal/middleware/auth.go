@@ -2,30 +2,29 @@ package middleware
 
 import (
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
-// SupabaseClaims matches the JWT claims issued by Supabase Auth.
-type SupabaseClaims struct {
-	Sub   string `json:"sub"`
-	Email string `json:"email"`
-	Role  string `json:"role"`
-	Aud   string `json:"aud"`
+// Claims represents the JWT claims issued by the backend.
+type Claims struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
 	jwt.RegisteredClaims
 }
 
-// jwtSecret holds the Supabase JWT secret used to validate tokens.
+// jwtSecret holds the secret used to sign and validate tokens.
 var jwtSecret []byte
 
-// Init configures the middleware package with the Supabase JWT secret.
-func Init(supabaseJWTSecret string) {
-	jwtSecret = []byte(supabaseJWTSecret)
+// Init configures the middleware package with the JWT secret.
+func Init(secret string) {
+	jwtSecret = []byte(secret)
 }
 
-// Protected is a Fiber middleware that validates a Supabase JWT from the
+// Protected is a Fiber middleware that validates a backend-issued JWT from the
 // Authorization header. On success it stores the user_id (uuid.UUID) and
 // email (string) in Fiber locals for downstream handlers.
 func Protected() fiber.Handler {
@@ -45,7 +44,7 @@ func Protected() fiber.Handler {
 		}
 
 		tokenStr := parts[1]
-		claims := &SupabaseClaims{}
+		claims := &Claims{}
 
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -60,8 +59,8 @@ func Protected() fiber.Handler {
 			})
 		}
 
-		// Parse the sub claim as a UUID (Supabase user ID).
-		userID, err := uuid.Parse(claims.Sub)
+		// Parse the user_id claim as a UUID.
+		userID, err := uuid.Parse(claims.UserID)
 		if err != nil {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "invalid user id in token",
@@ -72,6 +71,22 @@ func Protected() fiber.Handler {
 		c.Locals("email", claims.Email)
 		return c.Next()
 	}
+}
+
+// GenerateToken creates a signed JWT with 30-day expiry for the given user.
+func GenerateToken(userID uuid.UUID, email string) (string, error) {
+	now := time.Now()
+	claims := &Claims{
+		UserID: userID.String(),
+		Email:  email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(30 * 24 * time.Hour)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
 }
 
 // GetUserID extracts the user ID from the Fiber context.
