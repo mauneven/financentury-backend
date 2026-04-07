@@ -138,7 +138,10 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 		Eq("user_id", targetUserID.String()).
 		Build()
 
-	_, _, _ = database.DB.Delete("budget_collaborators", delQuery)
+	_, statusCode, err = database.DB.Delete("budget_collaborators", delQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete collaborator"})
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

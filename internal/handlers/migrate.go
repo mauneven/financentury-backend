@@ -101,9 +101,9 @@ func Migrate(c *fiber.Ctx) error {
 				Error: "budget name too long (max 200 characters)",
 			})
 		}
-		if mb.MonthlyIncome < 0 {
+		if mb.MonthlyIncome <= 0 {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-				Error: "monthly_income cannot be negative",
+				Error: "monthly_income must be positive",
 			})
 		}
 		if mb.MonthlyIncome > 1e15 {

@@ -244,14 +244,20 @@ func DeleteSubcategory(c *fiber.Ctx) error {
 
 	// Delete expenses linked to this subcategory.
 	expQuery := database.NewFilter().Eq("subcategory_id", subID.String()).Build()
-	_, _, _ = database.DB.Delete("budget_expenses", expQuery)
+	_, statusCode, err = database.DB.Delete("budget_expenses", expQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete subcategory expenses"})
+	}
 
 	// Delete the subcategory.
 	delQuery := database.NewFilter().
 		Eq("id", subID.String()).
 		Eq("category_id", catID.String()).
 		Build()
-	_, _, _ = database.DB.Delete("budget_subcategories", delQuery)
+	_, statusCode, err = database.DB.Delete("budget_subcategories", delQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete subcategory"})
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

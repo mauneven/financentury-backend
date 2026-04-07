@@ -310,20 +310,29 @@ func DeleteCategory(c *fiber.Ctx) error {
 			}
 			// Delete expenses linked to these subcategories.
 			expQuery := database.NewFilter().In("subcategory_id", subIDs).Build()
-			_, _, _ = database.DB.Delete("budget_expenses", expQuery)
+			_, statusCode, err := database.DB.Delete("budget_expenses", expQuery)
+			if err != nil || statusCode >= 300 {
+				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete category expenses"})
+			}
 		}
 	}
 
 	// Delete subcategories.
 	delSubQuery := database.NewFilter().Eq("category_id", catID.String()).Build()
-	_, _, _ = database.DB.Delete("budget_subcategories", delSubQuery)
+	_, statusCode, err = database.DB.Delete("budget_subcategories", delSubQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete subcategories"})
+	}
 
 	// Delete the category.
 	delCatQuery := database.NewFilter().
 		Eq("id", catID.String()).
 		Eq("budget_id", budgetID.String()).
 		Build()
-	_, _, _ = database.DB.Delete("budget_categories", delCatQuery)
+	_, statusCode, err = database.DB.Delete("budget_categories", delCatQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete category"})
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

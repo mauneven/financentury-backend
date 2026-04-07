@@ -35,16 +35,16 @@ func getGuidedCategories() []guidedCategory {
 		{
 			Name: "Necesidades", Percent: 50, Icon: "🏠", SortOrder: 1,
 			Subcategories: []guidedSubcategory{
-				{Name: "Vivienda", Percent: 28, Icon: "🏡", SortOrder: 1},
+				{Name: "Vivienda", Percent: 28, Icon: "🏠", SortOrder: 1},
 				{Name: "Comida", Percent: 12, Icon: "🍽️", SortOrder: 2},
 				{Name: "Transporte", Percent: 6, Icon: "🚗", SortOrder: 3},
 				{Name: "Servicios", Percent: 4, Icon: "💡", SortOrder: 4},
 			},
 		},
 		{
-			Name: "Deseos", Percent: 30, Icon: "🎉", SortOrder: 2,
+			Name: "Deseos", Percent: 30, Icon: "✨", SortOrder: 2,
 			Subcategories: []guidedSubcategory{
-				{Name: "Salidas", Percent: 10, Icon: "🍻", SortOrder: 1},
+				{Name: "Salidas", Percent: 10, Icon: "🎉", SortOrder: 1},
 				{Name: "Entretenimiento", Percent: 5, Icon: "🎬", SortOrder: 2},
 				{Name: "Ropa", Percent: 7, Icon: "👕", SortOrder: 3},
 				{Name: "Viajes", Percent: 8, Icon: "✈️", SortOrder: 4},
@@ -53,7 +53,7 @@ func getGuidedCategories() []guidedCategory {
 		{
 			Name: "Ahorro", Percent: 20, Icon: "💰", SortOrder: 3,
 			Subcategories: []guidedSubcategory{
-				{Name: "Fondo de emergencia", Percent: 8, Icon: "🛡️", SortOrder: 1},
+				{Name: "Fondo de emergencia", Percent: 8, Icon: "🏦", SortOrder: 1},
 				{Name: "Inversión", Percent: 12, Icon: "📈", SortOrder: 2},
 			},
 		},
@@ -493,7 +493,21 @@ func DeleteBudget(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget categories"})
 	}
 
-	// 4. Delete the budget itself.
+	// 4. Delete budget collaborators.
+	collabQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
+	_, statusCode, err = database.DB.Delete("budget_collaborators", collabQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget collaborators"})
+	}
+
+	// 5. Delete budget invites.
+	inviteQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
+	_, statusCode, err = database.DB.Delete("budget_invites", inviteQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget invites"})
+	}
+
+	// 6. Delete the budget itself.
 	delBudgetQuery := database.NewFilter().
 		Eq("id", budgetID.String()).
 		Eq("user_id", userID.String()).

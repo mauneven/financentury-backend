@@ -342,7 +342,10 @@ func DeleteExpense(c *fiber.Ctx) error {
 		Eq("budget_id", budgetID.String()).
 		Build()
 
-	_, _, _ = database.DB.Delete("budget_expenses", delQuery)
+	_, statusCode, err = database.DB.Delete("budget_expenses", delQuery)
+	if err != nil || statusCode >= 300 {
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete expense"})
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
