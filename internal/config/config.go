@@ -10,7 +10,7 @@ import (
 type Config struct {
 	SupabaseURL    string
 	SupabaseAnonKey string
-	JWTSecret      string
+	SupabaseJWTSecret string
 	Port           int
 	CORSOrigin     string
 }
@@ -27,9 +27,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SUPABASE_ANON_KEY environment variable is required")
 	}
 
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
+	supabaseJWTSecret := os.Getenv("SUPABASE_JWT_SECRET")
+	if supabaseJWTSecret == "" {
+		return nil, fmt.Errorf("SUPABASE_JWT_SECRET environment variable is required")
 	}
 
 	port := 8080
@@ -52,7 +52,7 @@ func Load() (*Config, error) {
 	return &Config{
 		SupabaseURL:    supabaseURL,
 		SupabaseAnonKey: supabaseAnonKey,
-		JWTSecret:      jwtSecret,
+		SupabaseJWTSecret: supabaseJWTSecret,
 		Port:           port,
 		CORSOrigin:     corsOrigin,
 	}, nil

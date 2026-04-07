@@ -29,8 +29,8 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Initialize JWT secret.
-	middleware.SetJWTSecret(cfg.JWTSecret)
+	// Initialize Supabase JWT validation.
+	middleware.Init(cfg.SupabaseJWTSecret)
 
 	// Initialize Supabase REST API client.
 	database.Init(cfg.SupabaseURL, cfg.SupabaseAnonKey)

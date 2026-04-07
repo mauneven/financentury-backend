@@ -6,14 +6,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// User represents a user account.
-type User struct {
-	ID           uuid.UUID `json:"id"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"`
-	FirstName    string    `json:"first_name"`
-	LastName     string    `json:"last_name,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+// Profile represents a user profile from the Supabase profiles table.
+type Profile struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	FullName  string    `json:"full_name"`
+	AvatarURL string    `json:"avatar_url"`
+	CreatedAt string    `json:"created_at"`
+	UpdatedAt string    `json:"updated_at"`
 }
 
 // Budget represents a user's budget.
@@ -63,26 +63,6 @@ type Expense struct {
 }
 
 // --- Request/Response DTOs ---
-
-// RegisterRequest is the payload for user registration.
-type RegisterRequest struct {
-	Email     string `json:"email"`
-	Password  string `json:"password"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name,omitempty"`
-}
-
-// LoginRequest is the payload for user login.
-type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-// AuthResponse is returned after successful auth.
-type AuthResponse struct {
-	Token string `json:"token"`
-	User  User   `json:"user"`
-}
 
 // CreateBudgetRequest is the payload for creating a budget.
 type CreateBudgetRequest struct {

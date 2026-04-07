@@ -10,13 +10,11 @@ import (
 func Setup(app *fiber.App) {
 	api := app.Group("/api")
 
-	// Public auth routes.
-	auth := api.Group("/auth")
-	auth.Post("/register", handlers.Register)
-	auth.Post("/login", handlers.Login)
-
 	// Protected routes.
 	protected := api.Group("", middleware.Protected())
+
+	// Auth routes (protected — requires valid Supabase JWT).
+	protected.Get("/auth/me", handlers.Me)
 
 	// Budget routes.
 	budgets := protected.Group("/budgets")

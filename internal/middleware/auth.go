@@ -2,45 +2,32 @@ package middleware
 
 import (
 	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
-// JWTClaims holds the custom JWT claims.
-type JWTClaims struct {
-	UserID uuid.UUID `json:"user_id"`
-	Email  string    `json:"email"`
+// SupabaseClaims matches the JWT claims issued by Supabase Auth.
+type SupabaseClaims struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email"`
+	Role  string `json:"role"`
+	Aud   string `json:"aud"`
 	jwt.RegisteredClaims
 }
 
-// jwtSecret is set during initialization.
+// jwtSecret holds the Supabase JWT secret used to validate tokens.
 var jwtSecret []byte
 
-// SetJWTSecret configures the JWT signing key.
-func SetJWTSecret(secret string) {
-	jwtSecret = []byte(secret)
+// Init configures the middleware package with the Supabase JWT secret.
+func Init(supabaseJWTSecret string) {
+	jwtSecret = []byte(supabaseJWTSecret)
 }
 
-// GenerateToken creates a signed JWT token for the given user.
-func GenerateToken(userID uuid.UUID, email string) (string, error) {
-	claims := JWTClaims{
-		UserID: userID,
-		Email:  email,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(72 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "financial-workspace",
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(jwtSecret)
-}
-
-// Protected is a Fiber middleware that validates the JWT from the Authorization header.
+// Protected is a Fiber middleware that validates a Supabase JWT from the
+// Authorization header. On success it stores the user_id (uuid.UUID) and
+// email (string) in Fiber locals for downstream handlers.
 func Protected() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
@@ -58,7 +45,7 @@ func Protected() fiber.Handler {
 		}
 
 		tokenStr := parts[1]
-		claims := &JWTClaims{}
+		claims := &SupabaseClaims{}
 
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -73,7 +60,15 @@ func Protected() fiber.Handler {
 			})
 		}
 
-		c.Locals("user_id", claims.UserID)
+		// Parse the sub claim as a UUID (Supabase user ID).
+		userID, err := uuid.Parse(claims.Sub)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "invalid user id in token",
+			})
+		}
+
+		c.Locals("user_id", userID)
 		c.Locals("email", claims.Email)
 		return c.Next()
 	}
