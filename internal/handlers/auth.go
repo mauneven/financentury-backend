@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -184,7 +186,12 @@ func GoogleLogin(c *fiber.Ctx) error {
 
 	// Look up or create profile by email.
 	profile, err := upsertProfile(userInfo)
-	if err != nil || profile.ID == uuid.Nil {
+	if err != nil {
+		log.Printf("[auth] upsertProfile failed for %s: %v", userInfo.Email, err)
+		return errInternal(c, "failed to create or find user profile")
+	}
+	if profile.ID == uuid.Nil {
+		log.Printf("[auth] upsertProfile returned nil ID for %s", userInfo.Email)
 		return errInternal(c, "failed to create or find user profile")
 	}
 
@@ -215,38 +222,51 @@ func upsertProfile(userInfo googleUserInfo) (models.Profile, error) {
 
 	body, statusCode, err := database.DB.Get("profiles", query)
 	if err != nil {
-		return models.Profile{}, err
+		log.Printf("[auth] GET profiles failed: %v", err)
+		return models.Profile{}, fmt.Errorf("database request failed: %w", err)
 	}
 
-	if statusCode == http.StatusOK {
-		var profiles []models.Profile
-		if err := json.Unmarshal(body, &profiles); err == nil && len(profiles) > 0 {
-			profile := profiles[0]
+	if statusCode != http.StatusOK {
+		log.Printf("[auth] GET profiles returned status %d: %s", statusCode, string(body))
+		return models.Profile{}, fmt.Errorf("database returned status %d", statusCode)
+	}
 
-			// Update name and avatar.
-			now := time.Now().UTC()
-			updatePayload := map[string]interface{}{
-				"full_name":  userInfo.Name,
-				"avatar_url": userInfo.Picture,
-				"updated_at": now.Format(time.RFC3339Nano),
-			}
-			updateBytes, err := marshalJSON(updatePayload)
-			if err == nil {
-				patchQuery := database.NewFilter().Eq("id", profile.ID.String()).Build()
-				database.DB.Patch("profiles", patchQuery, updateBytes)
-			}
+	var profiles []models.Profile
+	if err := json.Unmarshal(body, &profiles); err != nil {
+		log.Printf("[auth] failed to parse profiles response: %v, body: %s", err, string(body))
+		return models.Profile{}, fmt.Errorf("failed to parse profiles: %w", err)
+	}
 
-			profile.FullName = userInfo.Name
-			profile.AvatarURL = userInfo.Picture
-			return profile, nil
+	if len(profiles) > 0 {
+		profile := profiles[0]
+
+		// Update name and avatar.
+		now := time.Now().UTC()
+		updatePayload := map[string]interface{}{
+			"full_name":  userInfo.Name,
+			"avatar_url": userInfo.Picture,
+			"updated_at": now.Format(time.RFC3339Nano),
 		}
+		updateBytes, err := marshalJSON(updatePayload)
+		if err == nil {
+			patchQuery := database.NewFilter().Eq("id", profile.ID.String()).Build()
+			_, patchStatus, patchErr := database.DB.Patch("profiles", patchQuery, updateBytes)
+			if patchErr != nil || patchStatus != http.StatusOK {
+				log.Printf("[auth] PATCH profiles failed: status=%d err=%v", patchStatus, patchErr)
+			}
+		}
+
+		profile.FullName = userInfo.Name
+		profile.AvatarURL = userInfo.Picture
+		return profile, nil
 	}
 
-	return createNewProfile(userInfo), nil
+	// No existing profile found — create a new one.
+	return createNewProfile(userInfo)
 }
 
 // createNewProfile creates a new profile in the database from Google user info.
-func createNewProfile(userInfo googleUserInfo) models.Profile {
+func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 	now := time.Now().UTC()
 	profileID := uuid.New()
 
@@ -261,31 +281,47 @@ func createNewProfile(userInfo googleUserInfo) models.Profile {
 
 	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
-		return models.Profile{}
+		return models.Profile{}, fmt.Errorf("failed to marshal profile: %w", err)
 	}
 
 	respBody, statusCode, err := database.DB.Post("profiles", payloadBytes)
-	if err != nil || statusCode != http.StatusCreated {
-		// Race condition: try to fetch by email.
+	if err != nil {
+		log.Printf("[auth] POST profiles failed: %v", err)
+		return models.Profile{}, fmt.Errorf("failed to create profile: %w", err)
+	}
+
+	if statusCode != http.StatusCreated {
+		log.Printf("[auth] POST profiles returned status %d: %s", statusCode, string(respBody))
+
+		// Race condition: another request may have created the profile.
+		// Try to fetch by email.
 		query := database.NewFilter().
 			Select("id,email,full_name,avatar_url,created_at,updated_at").
 			Eq("email", userInfo.Email).
 			Build()
 
-		body, statusCode, err := database.DB.Get("profiles", query)
-		if err != nil || statusCode != http.StatusOK {
-			return models.Profile{}
+		body, getStatus, getErr := database.DB.Get("profiles", query)
+		if getErr != nil {
+			log.Printf("[auth] fallback GET profiles failed: %v", getErr)
+			return models.Profile{}, fmt.Errorf("profile creation failed (status %d) and fallback lookup failed: %w", statusCode, getErr)
+		}
+		if getStatus != http.StatusOK {
+			log.Printf("[auth] fallback GET profiles returned status %d: %s", getStatus, string(body))
+			return models.Profile{}, fmt.Errorf("profile creation failed (status %d) and fallback lookup returned %d", statusCode, getStatus)
 		}
 
 		var profiles []models.Profile
 		if err := json.Unmarshal(body, &profiles); err != nil || len(profiles) == 0 {
-			return models.Profile{}
+			log.Printf("[auth] fallback GET profiles returned no results or parse error: %v", err)
+			return models.Profile{}, fmt.Errorf("profile creation failed (status %d) and no profile found by email", statusCode)
 		}
-		return profiles[0]
+		return profiles[0], nil
 	}
 
 	var created []models.Profile
 	if err := json.Unmarshal(respBody, &created); err != nil || len(created) == 0 {
+		// POST returned 201 but response couldn't be parsed — return
+		// a locally constructed profile with the ID we generated.
 		return models.Profile{
 			ID:        profileID,
 			Email:     userInfo.Email,
@@ -293,9 +329,9 @@ func createNewProfile(userInfo googleUserInfo) models.Profile {
 			AvatarURL: userInfo.Picture,
 			CreatedAt: now.Format(time.RFC3339Nano),
 			UpdatedAt: now.Format(time.RFC3339Nano),
-		}
+		}, nil
 	}
-	return created[0]
+	return created[0], nil
 }
 
 // Me returns the authenticated user's profile from the profiles table.

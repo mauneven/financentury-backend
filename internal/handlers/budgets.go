@@ -159,6 +159,9 @@ func CreateBudget(c *fiber.Ctx) error {
 	if req.BillingPeriodMonths <= 0 {
 		req.BillingPeriodMonths = 1
 	}
+	if req.BillingCutoffDay <= 0 {
+		req.BillingCutoffDay = 1
+	}
 	if req.Mode == "" {
 		req.Mode = "manual"
 	}
@@ -169,6 +172,9 @@ func CreateBudget(c *fiber.Ctx) error {
 	}
 	if len(req.Currency) != maxCurrencyLength {
 		return errBadRequest(c, "invalid currency code")
+	}
+	if req.BillingCutoffDay < 1 || req.BillingCutoffDay > 31 {
+		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
 	}
 
 	now := time.Now().UTC()
@@ -181,6 +187,7 @@ func CreateBudget(c *fiber.Ctx) error {
 		MonthlyIncome:       req.MonthlyIncome,
 		Currency:            req.Currency,
 		BillingPeriodMonths: req.BillingPeriodMonths,
+		BillingCutoffDay:    req.BillingCutoffDay,
 		Mode:                req.Mode,
 		CreatedAt:           now,
 		UpdatedAt:           now,
@@ -193,6 +200,7 @@ func CreateBudget(c *fiber.Ctx) error {
 		"monthly_income":        budget.MonthlyIncome,
 		"currency":              budget.Currency,
 		"billing_period_months": budget.BillingPeriodMonths,
+		"billing_cutoff_day":    budget.BillingCutoffDay,
 		"mode":                  budget.Mode,
 		"created_at":            now.Format(time.RFC3339Nano),
 		"updated_at":            now.Format(time.RFC3339Nano),
@@ -340,6 +348,9 @@ func UpdateBudget(c *fiber.Ctx) error {
 	if req.BillingPeriodMonths != nil && *req.BillingPeriodMonths <= 0 {
 		return errBadRequest(c, "billing_period_months must be positive")
 	}
+	if req.BillingCutoffDay != nil && (*req.BillingCutoffDay < 1 || *req.BillingCutoffDay > 31) {
+		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
+	}
 
 	// Fetch existing budget to verify ownership.
 	getQuery := database.NewFilter().
@@ -373,6 +384,9 @@ func UpdateBudget(c *fiber.Ctx) error {
 	if req.BillingPeriodMonths != nil {
 		b.BillingPeriodMonths = *req.BillingPeriodMonths
 	}
+	if req.BillingCutoffDay != nil {
+		b.BillingCutoffDay = *req.BillingCutoffDay
+	}
 	if req.Mode != nil {
 		b.Mode = *req.Mode
 	}
@@ -383,6 +397,7 @@ func UpdateBudget(c *fiber.Ctx) error {
 		"monthly_income":        b.MonthlyIncome,
 		"currency":              b.Currency,
 		"billing_period_months": b.BillingPeriodMonths,
+		"billing_cutoff_day":    b.BillingCutoffDay,
 		"mode":                  b.Mode,
 		"updated_at":            b.UpdatedAt.Format(time.RFC3339Nano),
 	}

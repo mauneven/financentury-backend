@@ -91,6 +91,18 @@ func main() {
 	}))
 	app.Use(middleware.CORS(cfg.CORSOrigin))
 
+	// Security headers.
+	app.Use(func(c *fiber.Ctx) error {
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("X-Frame-Options", "DENY")
+		c.Set("X-XSS-Protection", "0") // Disabled in favor of CSP; legacy header can cause issues.
+		c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// CSP allows self + Google OAuth + inline styles (needed by chart libraries).
+		c.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss: https://accounts.google.com https://oauth2.googleapis.com; font-src 'self'")
+		return c.Next()
+	})
+
 	// Health check.
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{

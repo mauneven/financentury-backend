@@ -10,7 +10,7 @@ import (
 // endpoint for real-time updates.
 func Setup(app *fiber.App) {
 	// WebSocket endpoint (before API group to avoid prefix conflicts).
-	// Authentication is handled inside the WebSocket handler via query param token.
+	// Authentication is handled inside the WebSocket handler via first message.
 	app.Use("/ws", handlers.WebSocketUpgrade())
 	app.Get("/ws", handlers.WebSocketHandler())
 

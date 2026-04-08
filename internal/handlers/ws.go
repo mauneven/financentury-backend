@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"log"
 	"strings"
 	"time"
@@ -38,19 +39,33 @@ func WebSocketUpgrade() fiber.Handler {
 }
 
 // WebSocketHandler handles WebSocket connections. The client authenticates
-// by passing a JWT token as a query parameter: ws://host/ws?token=JWT.
-// Once connected, the server keeps the connection alive with periodic pings.
+// by sending its JWT token as the first message after connection (type: "auth").
+// This avoids exposing the token in query parameters (logged by servers/proxies).
 func WebSocketHandler() fiber.Handler {
 	return websocket.New(func(c *websocket.Conn) {
-		token := c.Query("token")
-		if token == "" {
-			log.Println("[ws] connection rejected: no token")
+		// Set a short deadline for the auth message.
+		_ = c.Conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+		// Read the first message which must be the auth payload.
+		_, msg, err := c.ReadMessage()
+		if err != nil {
+			log.Println("[ws] connection rejected: failed to read auth message")
+			_ = c.Close()
+			return
+		}
+
+		var authMsg struct {
+			Type  string `json:"type"`
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(msg, &authMsg); err != nil || authMsg.Type != "auth" || authMsg.Token == "" {
+			log.Println("[ws] connection rejected: invalid auth message")
 			_ = c.Close()
 			return
 		}
 
 		// Parse the JWT to extract the user ID.
-		userID, err := parseWSToken(token)
+		userID, err := parseWSToken(authMsg.Token)
 		if err != nil {
 			log.Printf("[ws] connection rejected: invalid token: %v", err)
 			_ = c.Close()

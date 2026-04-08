@@ -45,9 +45,10 @@ func PongWait() time.Duration { return pongWaitDuration }
 
 // Client represents a single WebSocket connection tied to a user.
 type Client struct {
-	Conn   *websocket.Conn
-	UserID string
-	mu     sync.Mutex // guards writes to the connection
+	Conn      *websocket.Conn
+	UserID    string
+	BudgetIDs map[string]bool // budget IDs this client has access to
+	mu        sync.Mutex      // guards writes to the connection
 }
 
 // WriteJSON sends a JSON-encoded message to the client in a thread-safe manner.
@@ -119,9 +120,14 @@ func (h *Hub) Run() {
 
 		case req := <-h.broadcast:
 			h.mu.RLock()
+			data, err := json.Marshal(req.msg)
+			if err != nil {
+				h.mu.RUnlock()
+				continue
+			}
 			for client := range h.clients {
-				data, err := json.Marshal(req.msg)
-				if err != nil {
+				// Only send to clients that have access to this budget.
+				if !client.BudgetIDs[req.budgetID] {
 					continue
 				}
 				func() {
@@ -152,6 +158,17 @@ func (h *Hub) Unregister(c *Client) {
 func (h *Hub) BroadcastToBudget(budgetID string, msg Message) {
 	msg.BudgetID = budgetID
 	h.broadcast <- broadcastRequest{budgetID: budgetID, msg: msg}
+}
+
+// SubscribeToBudget adds a budget ID to the client's subscription set so it
+// receives broadcasts for that budget.
+func (h *Hub) SubscribeToBudget(client *Client, budgetID string) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.BudgetIDs == nil {
+		client.BudgetIDs = make(map[string]bool)
+	}
+	client.BudgetIDs[budgetID] = true
 }
 
 // ClientCount returns the number of currently connected clients. Useful

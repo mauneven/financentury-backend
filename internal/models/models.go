@@ -24,6 +24,7 @@ type Budget struct {
 	MonthlyIncome       float64   `json:"monthly_income"`
 	Currency            string    `json:"currency"`
 	BillingPeriodMonths int       `json:"billing_period_months"`
+	BillingCutoffDay    int       `json:"billing_cutoff_day"`
 	Mode                string    `json:"mode"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
@@ -102,6 +103,7 @@ type CreateBudgetRequest struct {
 	MonthlyIncome       float64 `json:"monthly_income"`
 	Currency            string  `json:"currency"`
 	BillingPeriodMonths int     `json:"billing_period_months"`
+	BillingCutoffDay    int     `json:"billing_cutoff_day"`
 	Mode                string  `json:"mode"`
 }
 
@@ -111,6 +113,7 @@ type UpdateBudgetRequest struct {
 	MonthlyIncome       *float64 `json:"monthly_income,omitempty"`
 	Currency            *string  `json:"currency,omitempty"`
 	BillingPeriodMonths *int     `json:"billing_period_months,omitempty"`
+	BillingCutoffDay    *int     `json:"billing_cutoff_day,omitempty"`
 	Mode                *string  `json:"mode,omitempty"`
 }
 
