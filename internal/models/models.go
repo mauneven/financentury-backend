@@ -29,8 +29,8 @@ type Budget struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-// Category represents a budget category.
-type Category struct {
+// Section represents a budget section (top-level grouping, stored in budget_categories table).
+type Section struct {
 	ID                uuid.UUID `json:"id"`
 	BudgetID          uuid.UUID `json:"budget_id"`
 	Name              string    `json:"name"`
@@ -40,8 +40,8 @@ type Category struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
-// Subcategory represents a budget subcategory.
-type Subcategory struct {
+// Category represents a budget category (child of a Section, stored in budget_subcategories table).
+type Category struct {
 	ID                uuid.UUID `json:"id"`
 	CategoryID        uuid.UUID `json:"category_id"`
 	Name              string    `json:"name"`
@@ -53,14 +53,14 @@ type Subcategory struct {
 
 // Expense represents a budget expense.
 type Expense struct {
-	ID            uuid.UUID  `json:"id"`
-	BudgetID      uuid.UUID  `json:"budget_id"`
-	SubcategoryID uuid.UUID  `json:"subcategory_id"`
-	Amount        float64    `json:"amount"`
-	Description   string     `json:"description"`
-	ExpenseDate   string     `json:"expense_date"`
-	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID          uuid.UUID  `json:"id"`
+	BudgetID    uuid.UUID  `json:"budget_id"`
+	CategoryID  uuid.UUID  `json:"subcategory_id"`
+	Amount      float64    `json:"amount"`
+	Description string     `json:"description"`
+	ExpenseDate string     `json:"expense_date"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // Collaborator represents a budget collaborator.
@@ -114,6 +114,22 @@ type UpdateBudgetRequest struct {
 	Mode                *string  `json:"mode,omitempty"`
 }
 
+// CreateSectionRequest is the payload for creating a section.
+type CreateSectionRequest struct {
+	Name              string  `json:"name"`
+	AllocationPercent float64 `json:"allocation_percent"`
+	Icon              string  `json:"icon"`
+	SortOrder         int     `json:"sort_order"`
+}
+
+// UpdateSectionRequest is the payload for updating a section.
+type UpdateSectionRequest struct {
+	Name              *string  `json:"name,omitempty"`
+	AllocationPercent *float64 `json:"allocation_percent,omitempty"`
+	Icon              *string  `json:"icon,omitempty"`
+	SortOrder         *int     `json:"sort_order,omitempty"`
+}
+
 // CreateCategoryRequest is the payload for creating a category.
 type CreateCategoryRequest struct {
 	Name              string  `json:"name"`
@@ -130,62 +146,46 @@ type UpdateCategoryRequest struct {
 	SortOrder         *int     `json:"sort_order,omitempty"`
 }
 
-// CreateSubcategoryRequest is the payload for creating a subcategory.
-type CreateSubcategoryRequest struct {
-	Name              string  `json:"name"`
-	AllocationPercent float64 `json:"allocation_percent"`
-	Icon              string  `json:"icon"`
-	SortOrder         int     `json:"sort_order"`
-}
-
-// UpdateSubcategoryRequest is the payload for updating a subcategory.
-type UpdateSubcategoryRequest struct {
-	Name              *string  `json:"name,omitempty"`
-	AllocationPercent *float64 `json:"allocation_percent,omitempty"`
-	Icon              *string  `json:"icon,omitempty"`
-	SortOrder         *int     `json:"sort_order,omitempty"`
-}
-
 // CreateExpenseRequest is the payload for creating an expense.
 type CreateExpenseRequest struct {
-	SubcategoryID uuid.UUID `json:"subcategory_id"`
-	Amount        float64   `json:"amount"`
-	Description   string    `json:"description"`
-	ExpenseDate   string    `json:"expense_date"`
+	CategoryID  uuid.UUID `json:"subcategory_id"`
+	Amount      float64   `json:"amount"`
+	Description string    `json:"description"`
+	ExpenseDate string    `json:"expense_date"`
 }
 
 // UpdateExpenseRequest is the payload for updating an expense.
 type UpdateExpenseRequest struct {
-	SubcategoryID *uuid.UUID `json:"subcategory_id,omitempty"`
-	Amount        *float64   `json:"amount,omitempty"`
-	Description   *string    `json:"description,omitempty"`
-	ExpenseDate   *string    `json:"expense_date,omitempty"`
+	CategoryID  *uuid.UUID `json:"subcategory_id,omitempty"`
+	Amount      *float64   `json:"amount,omitempty"`
+	Description *string    `json:"description,omitempty"`
+	ExpenseDate *string    `json:"expense_date,omitempty"`
 }
 
 // --- Summary Response Types ---
 
-// SubcategorySummary contains a subcategory with its spending totals.
-type SubcategorySummary struct {
-	Subcategory     Subcategory `json:"subcategory"`
-	AllocatedAmount float64     `json:"allocated_amount"`
-	TotalSpent      float64     `json:"total_spent"`
-	ExpenseCount    int         `json:"expense_count"`
+// CategorySummary contains a category with its spending totals.
+type CategorySummary struct {
+	Category        Category `json:"category"`
+	AllocatedAmount float64  `json:"allocated_amount"`
+	TotalSpent      float64  `json:"total_spent"`
+	ExpenseCount    int      `json:"expense_count"`
 }
 
-// CategorySummary contains a category with subcategory summaries.
-type CategorySummary struct {
-	Category        Category             `json:"category"`
-	Subcategories   []SubcategorySummary `json:"subcategories"`
-	AllocatedAmount float64              `json:"allocated_amount"`
-	TotalSpent      float64              `json:"total_spent"`
+// SectionSummary contains a section with category summaries.
+type SectionSummary struct {
+	Section         Section           `json:"section"`
+	Categories      []CategorySummary `json:"categories"`
+	AllocatedAmount float64           `json:"allocated_amount"`
+	TotalSpent      float64           `json:"total_spent"`
 }
 
 // BudgetSummary is the full budget summary response.
 type BudgetSummary struct {
-	Budget      Budget            `json:"budget"`
-	Categories  []CategorySummary `json:"categories"`
-	TotalBudget float64           `json:"total_budget"`
-	TotalSpent  float64           `json:"total_spent"`
+	Budget      Budget           `json:"budget"`
+	Sections    []SectionSummary `json:"sections"`
+	TotalBudget float64          `json:"total_budget"`
+	TotalSpent  float64          `json:"total_spent"`
 }
 
 // MonthlyTrend represents spending for a single month.
@@ -194,17 +194,17 @@ type MonthlyTrend struct {
 	TotalSpent float64 `json:"total_spent"`
 }
 
-// CategoryTrend contains trends for a single category.
-type CategoryTrend struct {
-	CategoryID   uuid.UUID      `json:"category_id"`
-	CategoryName string         `json:"category_name"`
-	Months       []MonthlyTrend `json:"months"`
+// SectionTrend contains trends for a single section.
+type SectionTrend struct {
+	SectionID   uuid.UUID      `json:"section_id"`
+	SectionName string         `json:"section_name"`
+	Months      []MonthlyTrend `json:"months"`
 }
 
 // TrendsResponse is the trends endpoint response.
 type TrendsResponse struct {
-	BudgetID   uuid.UUID       `json:"budget_id"`
-	Categories []CategoryTrend `json:"categories"`
+	BudgetID uuid.UUID      `json:"budget_id"`
+	Sections []SectionTrend `json:"sections"`
 }
 
 // ErrorResponse is a standard error response.

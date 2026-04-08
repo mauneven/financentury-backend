@@ -80,6 +80,9 @@ func GetInviteInfo(c *fiber.Ctx) error {
 	if token == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite token is required"})
 	}
+	if len(token) > 128 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid invite token"})
+	}
 
 	// Fetch the invite by token.
 	query := database.NewFilter().
@@ -171,6 +174,9 @@ func AcceptInvite(c *fiber.Ctx) error {
 	token := c.Params("token")
 	if token == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite token is required"})
+	}
+	if len(token) > 128 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid invite token"})
 	}
 
 	// Fetch the invite by token.

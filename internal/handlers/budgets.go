@@ -12,29 +12,29 @@ import (
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
-// guidedCategory defines a category for the 50/30/20 guided mode.
-type guidedCategory struct {
-	Name          string
-	Percent       float64
-	Icon          string
-	SortOrder     int
-	Subcategories []guidedSubcategory
+// guidedSection defines a section for the 50/30/20 guided mode.
+type guidedSection struct {
+	Name       string
+	Percent    float64
+	Icon       string
+	SortOrder  int
+	Categories []guidedCategory
 }
 
-// guidedSubcategory defines a subcategory within a guided category.
-type guidedSubcategory struct {
+// guidedCategory defines a category within a guided section.
+type guidedCategory struct {
 	Name      string
 	Percent   float64
 	Icon      string
 	SortOrder int
 }
 
-// getGuidedCategories returns the 50/30/20 guided template.
-func getGuidedCategories() []guidedCategory {
-	return []guidedCategory{
+// getGuidedSections returns the 50/30/20 guided template.
+func getGuidedSections() []guidedSection {
+	return []guidedSection{
 		{
 			Name: "Necesidades", Percent: 50, Icon: "🏠", SortOrder: 1,
-			Subcategories: []guidedSubcategory{
+			Categories: []guidedCategory{
 				{Name: "Vivienda", Percent: 28, Icon: "🏠", SortOrder: 1},
 				{Name: "Comida", Percent: 12, Icon: "🍽️", SortOrder: 2},
 				{Name: "Transporte", Percent: 6, Icon: "🚗", SortOrder: 3},
@@ -43,7 +43,7 @@ func getGuidedCategories() []guidedCategory {
 		},
 		{
 			Name: "Deseos", Percent: 30, Icon: "✨", SortOrder: 2,
-			Subcategories: []guidedSubcategory{
+			Categories: []guidedCategory{
 				{Name: "Salidas", Percent: 10, Icon: "🎉", SortOrder: 1},
 				{Name: "Entretenimiento", Percent: 5, Icon: "🎬", SortOrder: 2},
 				{Name: "Ropa", Percent: 7, Icon: "👕", SortOrder: 3},
@@ -52,7 +52,7 @@ func getGuidedCategories() []guidedCategory {
 		},
 		{
 			Name: "Ahorro", Percent: 20, Icon: "💰", SortOrder: 3,
-			Subcategories: []guidedSubcategory{
+			Categories: []guidedCategory{
 				{Name: "Fondo de emergencia", Percent: 8, Icon: "🏦", SortOrder: 1},
 				{Name: "Inversión", Percent: 12, Icon: "📈", SortOrder: 2},
 			},
@@ -128,7 +128,7 @@ func ListBudgets(c *fiber.Ctx) error {
 	return c.JSON(budgets)
 }
 
-// CreateBudget creates a new budget and optionally seeds guided categories.
+// CreateBudget creates a new budget and optionally seeds guided sections.
 func CreateBudget(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
 	if userID == uuid.Nil {
@@ -220,49 +220,49 @@ func CreateBudget(c *fiber.Ctx) error {
 		})
 	}
 
-	// Seed guided categories if mode is "guided".
+	// Seed guided sections if mode is "guided".
 	if budget.Mode == "guided" {
-		for _, gc := range getGuidedCategories() {
-			catID := uuid.New()
-			catPayload := map[string]interface{}{
-				"id":                 catID.String(),
+		for _, gs := range getGuidedSections() {
+			sectionID := uuid.New()
+			sectionPayload := map[string]interface{}{
+				"id":                 sectionID.String(),
 				"budget_id":          budget.ID.String(),
-				"name":               gc.Name,
-				"allocation_percent": gc.Percent,
-				"icon":               gc.Icon,
-				"sort_order":         gc.SortOrder,
+				"name":               gs.Name,
+				"allocation_percent": gs.Percent,
+				"icon":               gs.Icon,
+				"sort_order":         gs.SortOrder,
 				"created_at":         now.Format(time.RFC3339Nano),
 			}
-			catBytes, err := json.Marshal(catPayload)
+			sectionBytes, err := json.Marshal(sectionPayload)
 			if err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
 			}
-			_, statusCode, err := database.DB.Post("budget_categories", catBytes)
+			_, statusCode, err := database.DB.Post("budget_categories", sectionBytes)
 			if err != nil || statusCode != http.StatusCreated {
 				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-					Error: "failed to create guided category",
+					Error: "failed to create guided section",
 				})
 			}
 
-			for _, gs := range gc.Subcategories {
-				subID := uuid.New()
-				subPayload := map[string]interface{}{
-					"id":                 subID.String(),
-					"category_id":        catID.String(),
-					"name":               gs.Name,
-					"allocation_percent": gs.Percent,
-					"icon":               gs.Icon,
-					"sort_order":         gs.SortOrder,
+			for _, gc := range gs.Categories {
+				catID := uuid.New()
+				catPayload := map[string]interface{}{
+					"id":                 catID.String(),
+					"category_id":        sectionID.String(),
+					"name":               gc.Name,
+					"allocation_percent": gc.Percent,
+					"icon":               gc.Icon,
+					"sort_order":         gc.SortOrder,
 					"created_at":         now.Format(time.RFC3339Nano),
 				}
-				subBytes, err := json.Marshal(subPayload)
+				catBytes, err := json.Marshal(catPayload)
 				if err != nil {
 					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
 				}
-				_, statusCode, err := database.DB.Post("budget_subcategories", subBytes)
+				_, statusCode, err := database.DB.Post("budget_subcategories", catBytes)
 				if err != nil || statusCode != http.StatusCreated {
 					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-						Error: "failed to create guided subcategory",
+						Error: "failed to create guided category",
 					})
 				}
 			}
@@ -353,6 +353,9 @@ func UpdateBudget(c *fiber.Ctx) error {
 	}
 	if req.Currency != nil && len(*req.Currency) != 3 {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid currency code"})
+	}
+	if req.BillingPeriodMonths != nil && *req.BillingPeriodMonths <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "billing_period_months must be positive"})
 	}
 
 	// Fetch existing budget to verify ownership.
@@ -466,31 +469,31 @@ func DeleteBudget(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget expenses"})
 	}
 
-	// 2. Get category IDs to delete subcategories.
-	catQuery := database.NewFilter().Select("id").Eq("budget_id", budgetID.String()).Build()
-	catBody, catStatusCode, catErr := database.DB.Get("budget_categories", catQuery)
+	// 2. Get section IDs to delete categories.
+	sectionQuery := database.NewFilter().Select("id").Eq("budget_id", budgetID.String()).Build()
+	sectionBody, sectionStatusCode, sectionErr := database.DB.Get("budget_categories", sectionQuery)
 
-	if catErr == nil && catStatusCode == http.StatusOK {
-		var cats []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(catBody, &cats); err == nil && len(cats) > 0 {
-			catIDs := make([]string, len(cats))
-			for i, cat := range cats {
-				catIDs[i] = cat.ID
+	if sectionErr == nil && sectionStatusCode == http.StatusOK {
+		var sections []struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(sectionBody, &sections); err == nil && len(sections) > 0 {
+			sectionIDs := make([]string, len(sections))
+			for i, s := range sections {
+				sectionIDs[i] = s.ID
 			}
-			// Delete subcategories for all categories.
-			subQuery := database.NewFilter().In("category_id", catIDs).Build()
-			_, statusCode, err = database.DB.Delete("budget_subcategories", subQuery)
+			// Delete categories for all sections.
+			catQuery := database.NewFilter().In("category_id", sectionIDs).Build()
+			_, statusCode, err = database.DB.Delete("budget_subcategories", catQuery)
 			if err != nil || statusCode >= 300 {
-				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget subcategories"})
+				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget categories"})
 			}
 		}
 	}
 
-	// 3. Delete categories.
-	delCatQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
-	_, statusCode, err = database.DB.Delete("budget_categories", delCatQuery)
+	// 3. Delete sections from budget_categories table.
+	delSectionQuery := database.NewFilter().Eq("budget_id", budgetID.String()).Build()
+	_, statusCode, err = database.DB.Delete("budget_categories", delSectionQuery)
 	if err != nil || statusCode >= 300 {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget categories"})
+		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete budget sections"})
 	}
 
 	// 4. Delete budget collaborators.

@@ -66,7 +66,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
 	}
 
-	if req.SubcategoryID == uuid.Nil {
+	if req.CategoryID == uuid.Nil {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory_id is required"})
 	}
 	if req.Amount <= 0 {
@@ -93,41 +93,41 @@ func CreateExpense(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
 	}
 
-	// Verify subcategory belongs to this budget (via category).
-	// Get the subcategory and check its category belongs to this budget.
-	subQuery := database.NewFilter().
+	// Verify category belongs to this budget (via its parent section).
+	// Get the category and check its parent section belongs to this budget.
+	catQuery := database.NewFilter().
 		Select("id,category_id").
-		Eq("id", req.SubcategoryID.String()).
+		Eq("id", req.CategoryID.String()).
 		Build()
 
-	subBody, statusCode, err := database.DB.Get("budget_subcategories", subQuery)
+	catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 	}
 
-	var subResults []struct {
+	var catResults []struct {
 		ID         string `json:"id"`
 		CategoryID string `json:"category_id"`
 	}
-	if err := json.Unmarshal(subBody, &subResults); err != nil || len(subResults) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+	if err := json.Unmarshal(catBody, &catResults); err != nil || len(catResults) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 	}
 
-	// Verify the category belongs to this budget.
-	catCheckQuery := database.NewFilter().
+	// Verify the parent section belongs to this budget.
+	sectionCheckQuery := database.NewFilter().
 		Select("id").
-		Eq("id", subResults[0].CategoryID).
+		Eq("id", catResults[0].CategoryID).
 		Eq("budget_id", budgetID.String()).
 		Build()
 
-	catBody, statusCode, err := database.DB.Get("budget_categories", catCheckQuery)
+	sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 	}
 
-	var catFound []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(catBody, &catFound); err != nil || len(catFound) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+	var sectionFound []struct{ ID string `json:"id"` }
+	if err := json.Unmarshal(sectionBody, &sectionFound); err != nil || len(sectionFound) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 	}
 
 	now := time.Now().UTC()
@@ -135,20 +135,20 @@ func CreateExpense(c *fiber.Ctx) error {
 
 	createdBy := userID
 	expense := models.Expense{
-		ID:            expenseID,
-		BudgetID:      budgetID,
-		SubcategoryID: req.SubcategoryID,
-		Amount:        req.Amount,
-		Description:   req.Description,
-		ExpenseDate:   req.ExpenseDate,
-		CreatedBy:     &createdBy,
-		CreatedAt:     now,
+		ID:          expenseID,
+		BudgetID:    budgetID,
+		CategoryID:  req.CategoryID,
+		Amount:      req.Amount,
+		Description: req.Description,
+		ExpenseDate: req.ExpenseDate,
+		CreatedBy:   &createdBy,
+		CreatedAt:   now,
 	}
 
 	payload := map[string]interface{}{
 		"id":             expenseID.String(),
 		"budget_id":      budgetID.String(),
-		"subcategory_id": req.SubcategoryID.String(),
+		"subcategory_id": req.CategoryID.String(),
 		"amount":         req.Amount,
 		"description":    req.Description,
 		"expense_date":   req.ExpenseDate,
@@ -189,13 +189,19 @@ func UpdateExpense(c *fiber.Ctx) error {
 	}
 
 	// Validate fields if provided.
+	if req.Amount != nil && *req.Amount <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount must be positive"})
+	}
 	if req.Amount != nil && *req.Amount > maxAmountValue {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount exceeds maximum allowed value"})
 	}
 	if req.Description != nil && len(*req.Description) > maxDescriptionLength {
 		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "description too long (max 1000 characters)"})
 	}
-	if req.ExpenseDate != nil && *req.ExpenseDate != "" {
+	if req.ExpenseDate != nil {
+		if *req.ExpenseDate == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "expense_date cannot be empty"})
+		}
 		if _, err := time.Parse("2006-01-02", *req.ExpenseDate); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
 		}
@@ -225,48 +231,45 @@ func UpdateExpense(c *fiber.Ctx) error {
 	exp := expenses[0]
 
 	// Apply partial updates.
-	if req.SubcategoryID != nil {
-		// Verify the new subcategory belongs to this budget.
-		subQuery := database.NewFilter().
+	if req.CategoryID != nil {
+		// Verify the new category belongs to this budget (via its parent section).
+		catQuery := database.NewFilter().
 			Select("id,category_id").
-			Eq("id", req.SubcategoryID.String()).
+			Eq("id", req.CategoryID.String()).
 			Build()
 
-		subBody, statusCode, err := database.DB.Get("budget_subcategories", subQuery)
+		catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
 		if err != nil || statusCode != http.StatusOK {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 		}
 
-		var subResults []struct {
+		var catResults []struct {
 			ID         string `json:"id"`
 			CategoryID string `json:"category_id"`
 		}
-		if err := json.Unmarshal(subBody, &subResults); err != nil || len(subResults) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+		if err := json.Unmarshal(catBody, &catResults); err != nil || len(catResults) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 		}
 
-		catCheckQuery := database.NewFilter().
+		sectionCheckQuery := database.NewFilter().
 			Select("id").
-			Eq("id", subResults[0].CategoryID).
+			Eq("id", catResults[0].CategoryID).
 			Eq("budget_id", budgetID.String()).
 			Build()
 
-		catBody, statusCode, err := database.DB.Get("budget_categories", catCheckQuery)
+		sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
 		if err != nil || statusCode != http.StatusOK {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 		}
 
-		var catFound []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(catBody, &catFound); err != nil || len(catFound) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory does not belong to this budget"})
+		var sectionFound []struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(sectionBody, &sectionFound); err != nil || len(sectionFound) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
 		}
 
-		exp.SubcategoryID = *req.SubcategoryID
+		exp.CategoryID = *req.CategoryID
 	}
 	if req.Amount != nil {
-		if *req.Amount <= 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount must be positive"})
-		}
 		exp.Amount = *req.Amount
 	}
 	if req.Description != nil {
@@ -277,7 +280,7 @@ func UpdateExpense(c *fiber.Ctx) error {
 	}
 
 	updatePayload := map[string]interface{}{
-		"subcategory_id": exp.SubcategoryID.String(),
+		"subcategory_id": exp.CategoryID.String(),
 		"amount":         exp.Amount,
 		"description":    exp.Description,
 		"expense_date":   exp.ExpenseDate,

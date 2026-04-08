@@ -41,16 +41,16 @@ func Setup(app *fiber.App) {
 	budgets.Get("/:id/collaborators", handlers.ListCollaborators)
 	budgets.Delete("/:id/collaborators/:userId", handlers.RemoveCollaborator)
 
-	// Category routes.
-	budgets.Get("/:id/categories", handlers.ListCategories)
-	budgets.Post("/:id/categories", handlers.CreateCategory)
-	budgets.Put("/:id/categories/:catId", handlers.UpdateCategory)
-	budgets.Delete("/:id/categories/:catId", handlers.DeleteCategory)
+	// Section routes.
+	budgets.Get("/:id/sections", handlers.ListSections)
+	budgets.Post("/:id/sections", handlers.CreateSection)
+	budgets.Put("/:id/sections/:sectionId", handlers.UpdateSection)
+	budgets.Delete("/:id/sections/:sectionId", handlers.DeleteSection)
 
-	// Subcategory routes.
-	budgets.Post("/:id/categories/:catId/subcategories", handlers.CreateSubcategory)
-	budgets.Put("/:id/categories/:catId/subcategories/:subId", handlers.UpdateSubcategory)
-	budgets.Delete("/:id/categories/:catId/subcategories/:subId", handlers.DeleteSubcategory)
+	// Category routes (nested under sections).
+	budgets.Post("/:id/sections/:sectionId/categories", handlers.CreateCategory)
+	budgets.Put("/:id/sections/:sectionId/categories/:catId", handlers.UpdateCategory)
+	budgets.Delete("/:id/sections/:sectionId/categories/:catId", handlers.DeleteCategory)
 
 	// Expense routes.
 	budgets.Get("/:id/expenses", handlers.ListExpenses)

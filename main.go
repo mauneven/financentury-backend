@@ -44,8 +44,10 @@ func main() {
 	// Initialize invite handler with frontend URL.
 	handlers.InitInvites(cfg.FrontendURL)
 
-	// Initialize Supabase REST API client.
-	database.Init(cfg.SupabaseURL, cfg.SupabaseAnonKey)
+	// Initialize Supabase REST API client with the service role key so that
+	// Row Level Security is bypassed -- the backend enforces its own access
+	// control in Go handler code.
+	database.Init(cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
 	defer database.Close()
 	log.Printf("initialized Supabase client for %s", cfg.SupabaseURL)
 

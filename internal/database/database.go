@@ -65,7 +65,8 @@ func (c *Client) doRequest(method, url string, body []byte, extraHeaders map[str
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit response body to 10MB to prevent memory exhaustion.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
 	}

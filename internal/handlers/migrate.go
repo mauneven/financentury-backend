@@ -22,27 +22,27 @@ type MigrateRequest struct {
 
 // MigrateBudget represents a budget to migrate.
 type MigrateBudget struct {
-	Name                string            `json:"name"`
-	MonthlyIncome       float64           `json:"monthly_income"`
-	Currency            string            `json:"currency"`
-	BillingPeriodMonths int               `json:"billing_period_months"`
-	Mode                string            `json:"mode"`
-	Categories          []MigrateCategory `json:"categories"`
-	Expenses            []MigrateExpense  `json:"expenses"`
+	Name                string           `json:"name"`
+	MonthlyIncome       float64          `json:"monthly_income"`
+	Currency            string           `json:"currency"`
+	BillingPeriodMonths int              `json:"billing_period_months"`
+	Mode                string           `json:"mode"`
+	Sections            []MigrateSection `json:"sections"`
+	Expenses            []MigrateExpense `json:"expenses"`
+}
+
+// MigrateSection represents a section to migrate.
+type MigrateSection struct {
+	Name              string            `json:"name"`
+	AllocationPercent float64           `json:"allocation_percent"`
+	Icon              string            `json:"icon"`
+	SortOrder         int               `json:"sort_order"`
+	LocalID           string            `json:"local_id"`
+	Categories        []MigrateCategory `json:"categories"`
 }
 
 // MigrateCategory represents a category to migrate.
 type MigrateCategory struct {
-	Name              string               `json:"name"`
-	AllocationPercent float64              `json:"allocation_percent"`
-	Icon              string               `json:"icon"`
-	SortOrder         int                  `json:"sort_order"`
-	LocalID           string               `json:"local_id"`
-	Subcategories     []MigrateSubcategory `json:"subcategories"`
-}
-
-// MigrateSubcategory represents a subcategory to migrate.
-type MigrateSubcategory struct {
 	Name              string  `json:"name"`
 	AllocationPercent float64 `json:"allocation_percent"`
 	Icon              string  `json:"icon"`
@@ -52,14 +52,14 @@ type MigrateSubcategory struct {
 
 // MigrateExpense represents an expense to migrate.
 type MigrateExpense struct {
-	LocalSubcategoryID string  `json:"local_subcategory_id"`
-	Amount             float64 `json:"amount"`
-	Description        string  `json:"description"`
-	ExpenseDate        string  `json:"expense_date"`
+	LocalCategoryID string  `json:"local_category_id"`
+	Amount          float64 `json:"amount"`
+	Description     string  `json:"description"`
+	ExpenseDate     string  `json:"expense_date"`
 }
 
 // Migrate handles POST /api/migrate (protected).
-// It imports budgets, categories, subcategories, and expenses from local data.
+// It imports budgets, sections, categories, and expenses from local data.
 func Migrate(c *fiber.Ctx) error {
 	userID := middleware.GetUserID(c)
 	if userID == uuid.Nil {
@@ -96,7 +96,7 @@ func Migrate(c *fiber.Ctx) error {
 				Error: "budget name is required",
 			})
 		}
-		if len(mb.Name) > 200 {
+		if len(mb.Name) > maxNameLength {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 				Error: "budget name too long (max 200 characters)",
 			})
@@ -106,14 +106,14 @@ func Migrate(c *fiber.Ctx) error {
 				Error: "monthly_income must be positive",
 			})
 		}
-		if mb.MonthlyIncome > 1e15 {
+		if mb.MonthlyIncome > maxAmountValue {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 				Error: "monthly_income exceeds maximum allowed value",
 			})
 		}
-		if len(mb.Categories) > 100 {
+		if len(mb.Sections) > 100 {
 			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-				Error: "too many categories per budget (max 100)",
+				Error: "too many sections per budget (max 100)",
 			})
 		}
 		if len(mb.Expenses) > 10000 {
@@ -172,94 +172,104 @@ func Migrate(c *fiber.Ctx) error {
 			})
 		}
 
-		// Build localID -> real UUID map for subcategories.
-		subLocalIDMap := make(map[string]uuid.UUID)
+		// Build localID -> real UUID map for categories.
+		catLocalIDMap := make(map[string]uuid.UUID)
 
-		// Create categories and subcategories.
-		for _, mc := range mb.Categories {
-			if mc.Name == "" || len(mc.Name) > 200 {
+		// Create sections and subcategories.
+		for _, ms := range mb.Sections {
+			if ms.Name == "" || len(ms.Name) > maxNameLength {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-					Error: "category name is required and must not exceed 200 characters",
+					Error: "section name is required and must not exceed 200 characters",
 				})
 			}
-			if len(mc.Icon) > 50 {
+			if len(ms.Icon) > maxIconLength {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-					Error: "category icon too long (max 50 characters)",
+					Error: "section icon too long (max 50 characters)",
 				})
 			}
-			if len(mc.Subcategories) > 100 {
+			if ms.AllocationPercent < 0 || ms.AllocationPercent > 100 {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-					Error: "too many subcategories per category (max 100)",
+					Error: "section allocation_percent must be between 0 and 100",
+				})
+			}
+			if len(ms.Categories) > 100 {
+				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+					Error: "too many categories per section (max 100)",
 				})
 			}
 
-			catID := uuid.New()
+			sectionID := uuid.New()
 
-			catPayload := map[string]interface{}{
-				"id":                 catID.String(),
+			sectionPayload := map[string]interface{}{
+				"id":                 sectionID.String(),
 				"budget_id":          budgetID.String(),
-				"name":               mc.Name,
-				"allocation_percent": mc.AllocationPercent,
-				"icon":               mc.Icon,
-				"sort_order":         mc.SortOrder,
+				"name":               ms.Name,
+				"allocation_percent": ms.AllocationPercent,
+				"icon":               ms.Icon,
+				"sort_order":         ms.SortOrder,
 				"created_at":         now.Format(time.RFC3339Nano),
 			}
 
-			catBytes, err := json.Marshal(catPayload)
+			sectionBytes, err := json.Marshal(sectionPayload)
 			if err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-					Error: "failed to serialize category",
+					Error: "failed to serialize section",
 				})
 			}
 
-			_, statusCode, err := database.DB.Post("budget_categories", catBytes)
+			_, statusCode, err := database.DB.Post("budget_categories", sectionBytes)
 			if err != nil || statusCode != http.StatusCreated {
 				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-					Error: fmt.Sprintf("failed to create category: %s", mc.Name),
+					Error: fmt.Sprintf("failed to create section: %s", ms.Name),
 				})
 			}
 
-			// Create subcategories.
-			for _, ms := range mc.Subcategories {
-				if ms.Name == "" || len(ms.Name) > 200 {
+			// Create categories for this section.
+			for _, mc := range ms.Categories {
+				if mc.Name == "" || len(mc.Name) > maxNameLength {
 					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-						Error: "subcategory name is required and must not exceed 200 characters",
+						Error: "category name is required and must not exceed 200 characters",
 					})
 				}
-				if len(ms.Icon) > 50 {
+				if len(mc.Icon) > maxIconLength {
 					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-						Error: "subcategory icon too long (max 50 characters)",
+						Error: "category icon too long (max 50 characters)",
+					})
+				}
+				if mc.AllocationPercent < 0 || mc.AllocationPercent > 100 {
+					return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
+						Error: "category allocation_percent must be between 0 and 100",
 					})
 				}
 
-				subID := uuid.New()
+				catID := uuid.New()
 
 				// Map the local ID to the real UUID.
-				if ms.LocalID != "" {
-					subLocalIDMap[ms.LocalID] = subID
+				if mc.LocalID != "" {
+					catLocalIDMap[mc.LocalID] = catID
 				}
 
-				subPayload := map[string]interface{}{
-					"id":                 subID.String(),
-					"category_id":        catID.String(),
-					"name":               ms.Name,
-					"allocation_percent": ms.AllocationPercent,
-					"icon":               ms.Icon,
-					"sort_order":         ms.SortOrder,
+				catPayload := map[string]interface{}{
+					"id":                 catID.String(),
+					"category_id":        sectionID.String(),
+					"name":               mc.Name,
+					"allocation_percent": mc.AllocationPercent,
+					"icon":               mc.Icon,
+					"sort_order":         mc.SortOrder,
 					"created_at":         now.Format(time.RFC3339Nano),
 				}
 
-				subBytes, err := json.Marshal(subPayload)
+				catBytes, err := json.Marshal(catPayload)
 				if err != nil {
 					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-						Error: "failed to serialize subcategory",
+						Error: "failed to serialize category",
 					})
 				}
 
-				_, statusCode, err := database.DB.Post("budget_subcategories", subBytes)
+				_, statusCode, err := database.DB.Post("budget_subcategories", catBytes)
 				if err != nil || statusCode != http.StatusCreated {
 					return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-						Error: fmt.Sprintf("failed to create subcategory: %s", ms.Name),
+						Error: fmt.Sprintf("failed to create category: %s", mc.Name),
 					})
 				}
 			}
@@ -267,17 +277,17 @@ func Migrate(c *fiber.Ctx) error {
 
 		// Create expenses using the localID -> real UUID map.
 		for _, me := range mb.Expenses {
-			if me.Amount < 0 {
+			if me.Amount <= 0 {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-					Error: "expense amount cannot be negative",
+					Error: "expense amount must be positive",
 				})
 			}
-			if me.Amount > 1e15 {
+			if me.Amount > maxAmountValue {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 					Error: "expense amount exceeds maximum allowed value",
 				})
 			}
-			if len(me.Description) > 1000 {
+			if len(me.Description) > maxDescriptionLength {
 				return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
 					Error: "expense description too long (max 1000 characters)",
 				})
@@ -290,9 +300,9 @@ func Migrate(c *fiber.Ctx) error {
 				}
 			}
 
-			realSubID, ok := subLocalIDMap[me.LocalSubcategoryID]
+			realCatID, ok := catLocalIDMap[me.LocalCategoryID]
 			if !ok {
-				// Skip expenses with unknown subcategory references.
+				// Skip expenses with unknown category references.
 				continue
 			}
 
@@ -305,7 +315,7 @@ func Migrate(c *fiber.Ctx) error {
 			expPayload := map[string]interface{}{
 				"id":             expenseID.String(),
 				"budget_id":      budgetID.String(),
-				"subcategory_id": realSubID.String(),
+				"subcategory_id": realCatID.String(),
 				"amount":         me.Amount,
 				"description":    me.Description,
 				"expense_date":   expenseDate,
