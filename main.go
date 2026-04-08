@@ -8,14 +8,17 @@ import (
 	"syscall"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gofiber/fiber/v2/middleware/requestid"
 	"github.com/joho/godotenv"
 	"github.com/the-financial-workspace/backend/internal/config"
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/handlers"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/routes"
+	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
 func main() {
@@ -44,6 +47,12 @@ func main() {
 	// Initialize invite handler with frontend URL.
 	handlers.InitInvites(cfg.FrontendURL)
 
+	// Initialize WebSocket hub for real-time updates.
+	hub := ws.NewHub()
+	go hub.Run()
+	handlers.InitWebSocket(hub)
+	log.Println("WebSocket hub started")
+
 	// Initialize Supabase REST API client with the service role key so that
 	// Row Level Security is bypassed -- the backend enforces its own access
 	// control in Go handler code.
@@ -60,7 +69,8 @@ func main() {
 			}
 			msg := err.Error()
 			if code >= 500 {
-				log.Printf("internal error: %v", err)
+				log.Printf("[error] request_id=%s method=%s path=%s err=%v",
+					c.Locals("requestid"), c.Method(), c.Path(), err)
 				msg = "internal server error"
 			}
 			return c.Status(code).JSON(fiber.Map{"error": msg})
@@ -71,18 +81,25 @@ func main() {
 
 	// Global middleware.
 	app.Use(recover.New())
+	app.Use(requestid.New())
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelDefault,
+	}))
 	app.Use(logger.New(logger.Config{
-		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
+		Format:     "${time} | ${status} | ${latency} | ${method} ${path} | rid=${locals:requestid}\n",
 		TimeFormat: "2006-01-02 15:04:05",
 	}))
 	app.Use(middleware.CORS(cfg.CORSOrigin))
 
 	// Health check.
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
+		return c.JSON(fiber.Map{
+			"status":     "ok",
+			"ws_clients": hub.ClientCount(),
+		})
 	})
 
-	// Setup routes.
+	// Setup routes (including WebSocket).
 	routes.Setup(app)
 
 	// Graceful shutdown.

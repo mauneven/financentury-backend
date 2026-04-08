@@ -92,6 +92,12 @@ func GenerateToken(userID uuid.UUID, email string) (string, error) {
 	return token.SignedString(jwtSecret)
 }
 
+// JWTSecret returns the signing key so that other packages (e.g. WebSocket
+// authentication) can validate tokens without duplicating the secret storage.
+func JWTSecret() []byte {
+	return jwtSecret
+}
+
 // GetUserID extracts the user ID from the Fiber context.
 func GetUserID(c *fiber.Ctx) uuid.UUID {
 	userID, ok := c.Locals("user_id").(uuid.UUID)

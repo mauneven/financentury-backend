@@ -1,32 +1,79 @@
+// Package database provides the Supabase REST API client used by handlers
+// to interact with the PostgreSQL database via PostgREST.
 package database
 
 import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Client is the Supabase REST API client that replaces the pgx connection pool.
+// maxResponseSize limits response bodies to 10 MB.
+const maxResponseSize = 10 << 20
+
+// Client is the Supabase REST API client that replaces a direct database
+// connection pool. It uses connection pooling via http.Transport for efficient
+// HTTP/1.1 and HTTP/2 connection reuse.
 type Client struct {
 	BaseURL    string
 	APIKey     string
 	HTTPClient *http.Client
 }
 
+// bufPool is a sync.Pool of *bytes.Buffer used to reduce allocations when
+// reading response bodies in hot paths.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
+// getBuf retrieves a buffer from the pool and resets it.
+func getBuf() *bytes.Buffer {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+// putBuf returns a buffer to the pool.
+func putBuf(buf *bytes.Buffer) {
+	// Prevent excessively large buffers from being returned to the pool.
+	if buf.Cap() <= 1<<20 {
+		bufPool.Put(buf)
+	}
+}
+
 // DB is the global Supabase client instance.
 var DB *Client
 
-// NewClient creates a new Supabase REST API client.
+// NewClient creates a new Supabase REST API client with an optimised
+// http.Transport that enables connection pooling and keep-alive.
 func NewClient(baseURL, apiKey string) *Client {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		HTTPClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   15 * time.Second,
+			Transport: transport,
 		},
 	}
 }
@@ -39,7 +86,8 @@ func Init(baseURL, apiKey string) {
 // Close is a no-op for the HTTP client (kept for API compatibility).
 func Close() {}
 
-// doRequest executes an HTTP request with the Supabase auth headers.
+// doRequest executes an HTTP request with the Supabase auth headers. It uses
+// a pooled buffer to read the response body efficiently.
 func (c *Client) doRequest(method, url string, body []byte, extraHeaders map[string]string) ([]byte, int, error) {
 	var bodyReader io.Reader
 	if body != nil {
@@ -65,13 +113,20 @@ func (c *Client) doRequest(method, url string, body []byte, extraHeaders map[str
 	}
 	defer resp.Body.Close()
 
-	// Limit response body to 10MB to prevent memory exhaustion.
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// Read into pooled buffer.
+	buf := getBuf()
+	defer putBuf(buf)
+
+	_, err = io.Copy(buf, io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	return respBody, resp.StatusCode, nil
+	// Copy the buffer contents to a new slice so the buffer can be returned.
+	result := make([]byte, buf.Len())
+	copy(result, buf.Bytes())
+
+	return result, resp.StatusCode, nil
 }
 
 // Get performs a GET request on the given table with query parameters.
@@ -124,7 +179,7 @@ func (c *Client) RPC(functionName string, body []byte) ([]byte, int, error) {
 
 // --- Filter Builder Helpers ---
 
-// Filter helps build PostgREST query strings.
+// Filter helps build PostgREST query strings in a type-safe, chainable way.
 type Filter struct {
 	params []string
 }
@@ -186,7 +241,7 @@ func (f *Filter) Limit(n int) *Filter {
 	return f
 }
 
-// Build returns the query string.
+// Build returns the assembled query string.
 func (f *Filter) Build() string {
 	return strings.Join(f.params, "&")
 }

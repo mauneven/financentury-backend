@@ -8,43 +8,31 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
-	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
+	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// verifyBudgetOwnership checks that the authenticated user owns the budget via Supabase REST.
-func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
-	query := database.NewFilter().
-		Select("id").
-		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budgets", query)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return fiber.ErrNotFound
-	}
-	return nil
+// SectionWithCategories embeds a Section and its child Categories for the
+// ListSections response.
+type SectionWithCategories struct {
+	models.Section
+	Categories []models.Category `json:"categories"`
 }
 
 // ListSections returns all sections (each with its categories) for a budget.
 func ListSections(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	// Fetch sections from budget_categories table.
@@ -56,12 +44,12 @@ func ListSections(c *fiber.Ctx) error {
 
 	sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch sections"})
+		return errInternal(c, "failed to fetch sections")
 	}
 
 	var sections []models.Section
 	if err := json.Unmarshal(sectionBody, &sections); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to parse sections"})
+		return errInternal(c, "failed to parse sections")
 	}
 
 	if sections == nil {
@@ -69,11 +57,6 @@ func ListSections(c *fiber.Ctx) error {
 	}
 
 	// Build response with categories per section.
-	type SectionWithCategories struct {
-		models.Section
-		Categories []models.Category `json:"categories"`
-	}
-
 	result := make([]SectionWithCategories, 0, len(sections))
 	for _, section := range sections {
 		catQuery := database.NewFilter().
@@ -84,12 +67,12 @@ func ListSections(c *fiber.Ctx) error {
 
 		catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
 		if err != nil || statusCode != http.StatusOK {
-			return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch categories"})
+			return errInternal(c, "failed to fetch categories")
 		}
 
 		var cats []models.Category
 		if err := json.Unmarshal(catBody, &cats); err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to parse categories"})
+			return errInternal(c, "failed to parse categories")
 		}
 
 		if cats == nil {
@@ -106,36 +89,38 @@ func ListSections(c *fiber.Ctx) error {
 }
 
 // CreateSection creates a new section for a budget.
+// On success it broadcasts a section_created event via WebSocket.
 func CreateSection(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
 
 	var req models.CreateSectionRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+		return errBadRequest(c, "invalid request body")
 	}
 
 	if req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name is required"})
+		return errBadRequest(c, "name is required")
 	}
 	if len(req.Name) > maxNameLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+		return errBadRequest(c, "name too long (max 200 characters)")
 	}
 	if len(req.Icon) > maxIconLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
+		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
 	if req.AllocationPercent < 0 || req.AllocationPercent > 100 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "allocation_percent must be between 0 and 100"})
+		return errBadRequest(c, "allocation_percent must be between 0 and 100")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	now := time.Now().UTC()
@@ -160,54 +145,60 @@ func CreateSection(c *fiber.Ctx) error {
 		"sort_order":         req.SortOrder,
 		"created_at":         now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	_, statusCode, err := database.DB.Post("budget_categories", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to create section"})
+		return errInternal(c, "failed to create section")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeSectionCreated, section)
 
 	return c.Status(fiber.StatusCreated).JSON(section)
 }
 
 // UpdateSection updates an existing section.
+// On success it broadcasts a section_updated event via WebSocket.
 func UpdateSection(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
-	sectionID, err := uuid.Parse(c.Params("sectionId"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid section ID"})
+
+	sectionID, ok := parseUUIDParam(c, "sectionId")
+	if !ok {
+		return errBadRequest(c, "invalid section ID")
 	}
 
 	var req models.UpdateSectionRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+		return errBadRequest(c, "invalid request body")
 	}
 
+	// Validate optional fields.
 	if req.Name != nil && *req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name cannot be empty"})
+		return errBadRequest(c, "name cannot be empty")
 	}
 	if req.Name != nil && len(*req.Name) > maxNameLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "name too long (max 200 characters)"})
+		return errBadRequest(c, "name too long (max 200 characters)")
 	}
 	if req.Icon != nil && len(*req.Icon) > maxIconLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "icon too long (max 50 characters)"})
+		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
 	if req.AllocationPercent != nil && (*req.AllocationPercent < 0 || *req.AllocationPercent > 100) {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "allocation_percent must be between 0 and 100"})
+		return errBadRequest(c, "allocation_percent must be between 0 and 100")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	// Fetch existing section from budget_categories table.
@@ -219,12 +210,12 @@ func UpdateSection(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_categories", getQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch section"})
+		return errInternal(c, "failed to fetch section")
 	}
 
 	var sections []models.Section
 	if err := json.Unmarshal(body, &sections); err != nil || len(sections) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "section not found"})
+		return errNotFound(c, "section not found")
 	}
 
 	section := sections[0]
@@ -249,9 +240,9 @@ func UpdateSection(c *fiber.Ctx) error {
 		"icon":               section.Icon,
 		"sort_order":         section.SortOrder,
 	}
-	updateBytes, err := json.Marshal(updatePayload)
+	updateBytes, err := marshalJSON(updatePayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	patchQuery := database.NewFilter().
@@ -261,29 +252,34 @@ func UpdateSection(c *fiber.Ctx) error {
 
 	_, statusCode, err = database.DB.Patch("budget_categories", patchQuery, updateBytes)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to update section"})
+		return errInternal(c, "failed to update section")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeSectionUpdated, section)
 
 	return c.JSON(section)
 }
 
-// DeleteSection deletes a section and its categories.
+// DeleteSection deletes a section and its categories (and related expenses).
+// On success it broadcasts a section_deleted event via WebSocket.
 func DeleteSection(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
-	sectionID, err := uuid.Parse(c.Params("sectionId"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid section ID"})
+
+	sectionID, ok := parseUUIDParam(c, "sectionId")
+	if !ok {
+		return errBadRequest(c, "invalid section ID")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	// Verify section exists in budget_categories table.
@@ -295,16 +291,18 @@ func DeleteSection(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to verify section"})
+		return errInternal(c, "failed to verify section")
 	}
 
 	var found []struct{ ID string `json:"id"` }
 	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "section not found"})
+		return errNotFound(c, "section not found")
 	}
 
+	sid := sectionID.String()
+
 	// Get category IDs for this section to delete related expenses.
-	catQuery := database.NewFilter().Select("id").Eq("category_id", sectionID.String()).Build()
+	catQuery := database.NewFilter().Select("id").Eq("category_id", sid).Build()
 	catBody, catStatusCode, catErr := database.DB.Get("budget_subcategories", catQuery)
 
 	if catErr == nil && catStatusCode == http.StatusOK {
@@ -314,31 +312,32 @@ func DeleteSection(c *fiber.Ctx) error {
 			for i, ct := range cats {
 				catIDs[i] = ct.ID
 			}
-			// Delete expenses linked to these categories.
 			expQuery := database.NewFilter().In("subcategory_id", catIDs).Build()
 			_, statusCode, err := database.DB.Delete("budget_expenses", expQuery)
 			if err != nil || statusCode >= 300 {
-				return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete section expenses"})
+				return errInternal(c, "failed to delete section expenses")
 			}
 		}
 	}
 
-	// Delete categories belonging to this section (from budget_subcategories table).
-	delCatQuery := database.NewFilter().Eq("category_id", sectionID.String()).Build()
+	// Delete categories belonging to this section.
+	delCatQuery := database.NewFilter().Eq("category_id", sid).Build()
 	_, statusCode, err = database.DB.Delete("budget_subcategories", delCatQuery)
 	if err != nil || statusCode >= 300 {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete categories"})
+		return errInternal(c, "failed to delete categories")
 	}
 
-	// Delete the section from budget_categories table.
+	// Delete the section.
 	delSectionQuery := database.NewFilter().
-		Eq("id", sectionID.String()).
+		Eq("id", sid).
 		Eq("budget_id", budgetID.String()).
 		Build()
 	_, statusCode, err = database.DB.Delete("budget_categories", delSectionQuery)
 	if err != nil || statusCode >= 300 {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete section"})
+		return errInternal(c, "failed to delete section")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeSectionDeleted, map[string]string{"id": sid})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

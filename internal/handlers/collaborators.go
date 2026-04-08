@@ -5,55 +5,28 @@ import (
 	"net/http"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
-	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
+	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// verifyBudgetAccess checks that the user is the budget owner or a collaborator.
-func verifyBudgetAccess(budgetID, userID uuid.UUID) error {
-	// Check ownership first.
-	if err := verifyBudgetOwnership(budgetID, userID); err == nil {
-		return nil
-	}
-
-	// Check if user is a collaborator.
-	query := database.NewFilter().
-		Select("id").
-		Eq("budget_id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_collaborators", query)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return fiber.ErrNotFound
-	}
-	return nil
-}
-
-// ListCollaborators returns all collaborators for a budget (owner or collaborator).
+// ListCollaborators returns all collaborators for a budget (owner or
+// collaborator). Each collaborator record is enriched with profile info.
 func ListCollaborators(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
-	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
-	// Verify user has access (owner or collaborator).
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
-	// Fetch collaborators.
 	query := database.NewFilter().
 		Select("*").
 		Eq("budget_id", budgetID.String()).
@@ -62,12 +35,12 @@ func ListCollaborators(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_collaborators", query)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch collaborators"})
+		return errInternal(c, "failed to fetch collaborators")
 	}
 
 	var collaborators []models.Collaborator
 	if err := json.Unmarshal(body, &collaborators); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to parse collaborators"})
+		return errInternal(c, "failed to parse collaborators")
 	}
 
 	if collaborators == nil {
@@ -81,8 +54,8 @@ func ListCollaborators(c *fiber.Ctx) error {
 			Eq("id", collab.UserID.String()).
 			Build()
 
-		profileBody, statusCode, err := database.DB.Get("profiles", profileQuery)
-		if err != nil || statusCode != http.StatusOK {
+		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+		if profileErr != nil || profileStatus != http.StatusOK {
 			continue
 		}
 
@@ -95,24 +68,28 @@ func ListCollaborators(c *fiber.Ctx) error {
 	return c.JSON(collaborators)
 }
 
-// RemoveCollaborator removes a collaborator from a budget (owner only).
+// RemoveCollaborator removes a collaborator from a budget. Only the budget
+// owner can perform this action.
+// On success it broadcasts a collaborator_removed event via WebSocket.
 func RemoveCollaborator(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
-	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
-	}
-	targetUserID, err := uuid.Parse(c.Params("userId"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid user ID"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
-	// Verify the requesting user is the budget owner.
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
+	targetUserID, ok := parseUUIDParam(c, "userId")
+	if !ok {
+		return errBadRequest(c, "invalid user ID")
+	}
+
+	// Only the budget owner can remove collaborators.
 	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusForbidden).JSON(models.ErrorResponse{Error: "only the budget owner can remove collaborators"})
+		return errForbidden(c, "only the budget owner can remove collaborators")
 	}
 
 	// Verify the collaborator exists.
@@ -124,12 +101,12 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_collaborators", checkQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to verify collaborator"})
+		return errInternal(c, "failed to verify collaborator")
 	}
 
 	var found []struct{ ID string `json:"id"` }
 	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "collaborator not found"})
+		return errNotFound(c, "collaborator not found")
 	}
 
 	// Delete the collaborator.
@@ -140,8 +117,12 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 
 	_, statusCode, err = database.DB.Delete("budget_collaborators", delQuery)
 	if err != nil || statusCode >= 300 {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete collaborator"})
+		return errInternal(c, "failed to delete collaborator")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeCollabRemoved, map[string]string{
+		"user_id": targetUserID.String(),
+	})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

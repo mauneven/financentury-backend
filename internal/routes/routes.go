@@ -6,8 +6,14 @@ import (
 	"github.com/the-financial-workspace/backend/internal/middleware"
 )
 
-// Setup registers all API routes on the Fiber app.
+// Setup registers all API routes on the Fiber app, including the WebSocket
+// endpoint for real-time updates.
 func Setup(app *fiber.App) {
+	// WebSocket endpoint (before API group to avoid prefix conflicts).
+	// Authentication is handled inside the WebSocket handler via query param token.
+	app.Use("/ws", handlers.WebSocketUpgrade())
+	app.Get("/ws", handlers.WebSocketHandler())
+
 	api := app.Group("/api")
 
 	// Public auth routes with strict rate limiting to prevent brute-force.

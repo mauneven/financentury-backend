@@ -15,40 +15,44 @@ import (
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
-// Package-level Google OAuth credentials.
+// Google OAuth credentials set at startup via InitAuth.
 var googleClientID, googleClientSecret string
 
-// allowedRedirectHosts stores the set of hosts that are permitted as OAuth redirect targets.
+// allowedRedirectHosts stores the set of hosts that are permitted as OAuth
+// redirect targets.
 var allowedRedirectHosts []string
 
-// InitAuth configures the auth handler with Google OAuth credentials and allowed redirect origins.
+// oauthHTTPTimeout is the HTTP timeout for calls to Google's OAuth APIs.
+const oauthHTTPTimeout = 10 * time.Second
+
+// maxOAuthResponseSize limits OAuth response bodies to 1 MB.
+const maxOAuthResponseSize = 1 << 20
+
+// InitAuth configures the auth handler with Google OAuth credentials and
+// allowed redirect origins.
 func InitAuth(clientID, clientSecret string, allowedOrigins ...string) {
 	googleClientID = clientID
 	googleClientSecret = clientSecret
 	allowedRedirectHosts = allowedOrigins
 }
 
-// isAllowedRedirectURI validates the redirect_uri against the configured allowlist.
-// Only origins that were explicitly registered are accepted. This prevents open
-// redirect attacks where an attacker tricks the backend into sending the auth code
-// to a domain they control.
+// isAllowedRedirectURI validates the redirect_uri against the configured
+// allowlist. Only origins that were explicitly registered are accepted,
+// preventing open redirect attacks.
 func isAllowedRedirectURI(redirectURI string) bool {
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
 		return false
 	}
-	// Must be an absolute URL with https (or http for localhost dev).
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1")) {
 		return false
 	}
-	// The path must be exactly /auth/callback -- no query, no fragment.
 	if parsed.Path != "/auth/callback" {
 		return false
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return false
 	}
-	// Check the scheme+host against the allowlist.
 	origin := parsed.Scheme + "://" + parsed.Host
 	for _, allowed := range allowedRedirectHosts {
 		if origin == allowed {
@@ -81,33 +85,22 @@ type googleUserInfo struct {
 	Picture       string `json:"picture"`
 }
 
-// GoogleLogin handles POST /api/auth/google.
-// It exchanges a Google authorization code for user info, upserts the profile,
-// and returns a backend-issued JWT.
+// GoogleLogin handles POST /api/auth/google. It exchanges a Google
+// authorization code for user info, upserts the profile, and returns a
+// backend-issued JWT.
 func GoogleLogin(c *fiber.Ctx) error {
 	var req googleLoginRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-			Error: "invalid request body",
-		})
+		return errBadRequest(c, "invalid request body")
 	}
-
 	if req.Code == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-			Error: "code is required",
-		})
+		return errBadRequest(c, "code is required")
 	}
 	if req.RedirectURI == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-			Error: "redirect_uri is required",
-		})
+		return errBadRequest(c, "redirect_uri is required")
 	}
-
-	// Validate redirect_uri against the allowlist to prevent open redirect attacks.
 	if !isAllowedRedirectURI(req.RedirectURI) {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{
-			Error: "redirect_uri is not allowed",
-		})
+		return errBadRequest(c, "redirect_uri is not allowed")
 	}
 
 	// Exchange authorization code for tokens.
@@ -119,28 +112,21 @@ func GoogleLogin(c *fiber.Ctx) error {
 		"redirect_uri":  {req.RedirectURI},
 	}
 
-	// Use a timeout-protected HTTP client for the token exchange.
-	tokenHTTPClient := &http.Client{Timeout: 10 * time.Second}
+	tokenHTTPClient := &http.Client{Timeout: oauthHTTPTimeout}
 	tokenResp, err := tokenHTTPClient.Post(
 		"https://oauth2.googleapis.com/token",
 		"application/x-www-form-urlencoded",
 		strings.NewReader(tokenData.Encode()),
 	)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to exchange authorization code",
-		})
+		return errInternal(c, "failed to exchange authorization code")
 	}
 	defer tokenResp.Body.Close()
 
-	// Limit response body size to 1MB to prevent memory exhaustion.
-	tokenBody, err := io.ReadAll(io.LimitReader(tokenResp.Body, 1<<20))
+	tokenBody, err := io.ReadAll(io.LimitReader(tokenResp.Body, maxOAuthResponseSize))
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to read token response",
-		})
+		return errInternal(c, "failed to read token response")
 	}
-
 	if tokenResp.StatusCode != http.StatusOK {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
 			Error: "failed to exchange authorization code with Google",
@@ -149,11 +135,8 @@ func GoogleLogin(c *fiber.Ctx) error {
 
 	var tokenResult googleTokenResponse
 	if err := json.Unmarshal(tokenBody, &tokenResult); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to parse token response",
-		})
+		return errInternal(c, "failed to parse token response")
 	}
-
 	if tokenResult.AccessToken == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
 			Error: "no access token received from Google",
@@ -163,29 +146,21 @@ func GoogleLogin(c *fiber.Ctx) error {
 	// Fetch user info from Google.
 	userInfoReq, err := http.NewRequest("GET", "https://www.googleapis.com/oauth2/v2/userinfo", nil)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to create userinfo request",
-		})
+		return errInternal(c, "failed to create userinfo request")
 	}
 	userInfoReq.Header.Set("Authorization", "Bearer "+tokenResult.AccessToken)
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := &http.Client{Timeout: oauthHTTPTimeout}
 	userInfoResp, err := httpClient.Do(userInfoReq)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to fetch user info from Google",
-		})
+		return errInternal(c, "failed to fetch user info from Google")
 	}
 	defer userInfoResp.Body.Close()
 
-	// Limit response body size to 1MB.
-	userInfoBody, err := io.ReadAll(io.LimitReader(userInfoResp.Body, 1<<20))
+	userInfoBody, err := io.ReadAll(io.LimitReader(userInfoResp.Body, maxOAuthResponseSize))
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to read user info response",
-		})
+		return errInternal(c, "failed to read user info response")
 	}
-
 	if userInfoResp.StatusCode != http.StatusOK {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
 			Error: "failed to fetch user info from Google",
@@ -194,11 +169,8 @@ func GoogleLogin(c *fiber.Ctx) error {
 
 	var userInfo googleUserInfo
 	if err := json.Unmarshal(userInfoBody, &userInfo); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to parse user info",
-		})
+		return errInternal(c, "failed to parse user info")
 	}
-
 	if userInfo.Email == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
 			Error: "no email received from Google",
@@ -211,63 +183,15 @@ func GoogleLogin(c *fiber.Ctx) error {
 	}
 
 	// Look up or create profile by email.
-	query := database.NewFilter().
-		Select("id,email,full_name,avatar_url,created_at,updated_at").
-		Eq("email", userInfo.Email).
-		Build()
-
-	body, statusCode, err := database.DB.Get("profiles", query)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to query profiles",
-		})
-	}
-
-	var profile models.Profile
-
-	if statusCode == http.StatusOK {
-		var profiles []models.Profile
-		if err := json.Unmarshal(body, &profiles); err == nil && len(profiles) > 0 {
-			// Profile exists - update full_name and avatar_url.
-			profile = profiles[0]
-
-			now := time.Now().UTC()
-			updatePayload := map[string]interface{}{
-				"full_name":  userInfo.Name,
-				"avatar_url": userInfo.Picture,
-				"updated_at": now.Format(time.RFC3339Nano),
-			}
-			updateBytes, err := json.Marshal(updatePayload)
-			if err == nil {
-				patchQuery := database.NewFilter().
-					Eq("id", profile.ID.String()).
-					Build()
-				database.DB.Patch("profiles", patchQuery, updateBytes)
-			}
-
-			profile.FullName = userInfo.Name
-			profile.AvatarURL = userInfo.Picture
-		} else {
-			// No profile found - create a new one.
-			profile = createNewProfile(userInfo)
-		}
-	} else {
-		// Error fetching - try to create new profile anyway.
-		profile = createNewProfile(userInfo)
-	}
-
-	if profile.ID == uuid.Nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to create or find user profile",
-		})
+	profile, err := upsertProfile(userInfo)
+	if err != nil || profile.ID == uuid.Nil {
+		return errInternal(c, "failed to create or find user profile")
 	}
 
 	// Generate backend JWT.
 	token, err := middleware.GenerateToken(profile.ID, profile.Email)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to generate token",
-		})
+		return errInternal(c, "failed to generate token")
 	}
 
 	return c.JSON(fiber.Map{
@@ -279,6 +203,46 @@ func GoogleLogin(c *fiber.Ctx) error {
 			"avatar_url": profile.AvatarURL,
 		},
 	})
+}
+
+// upsertProfile looks up a profile by email and updates it if found, or
+// creates a new one.
+func upsertProfile(userInfo googleUserInfo) (models.Profile, error) {
+	query := database.NewFilter().
+		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		Eq("email", userInfo.Email).
+		Build()
+
+	body, statusCode, err := database.DB.Get("profiles", query)
+	if err != nil {
+		return models.Profile{}, err
+	}
+
+	if statusCode == http.StatusOK {
+		var profiles []models.Profile
+		if err := json.Unmarshal(body, &profiles); err == nil && len(profiles) > 0 {
+			profile := profiles[0]
+
+			// Update name and avatar.
+			now := time.Now().UTC()
+			updatePayload := map[string]interface{}{
+				"full_name":  userInfo.Name,
+				"avatar_url": userInfo.Picture,
+				"updated_at": now.Format(time.RFC3339Nano),
+			}
+			updateBytes, err := marshalJSON(updatePayload)
+			if err == nil {
+				patchQuery := database.NewFilter().Eq("id", profile.ID.String()).Build()
+				database.DB.Patch("profiles", patchQuery, updateBytes)
+			}
+
+			profile.FullName = userInfo.Name
+			profile.AvatarURL = userInfo.Picture
+			return profile, nil
+		}
+	}
+
+	return createNewProfile(userInfo), nil
 }
 
 // createNewProfile creates a new profile in the database from Google user info.
@@ -295,14 +259,14 @@ func createNewProfile(userInfo googleUserInfo) models.Profile {
 		"updated_at": now.Format(time.RFC3339Nano),
 	}
 
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
 		return models.Profile{}
 	}
 
 	respBody, statusCode, err := database.DB.Post("profiles", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
-		// If insertion fails (e.g. race condition), try to fetch by email.
+		// Race condition: try to fetch by email.
 		query := database.NewFilter().
 			Select("id,email,full_name,avatar_url,created_at,updated_at").
 			Eq("email", userInfo.Email).
@@ -337,7 +301,10 @@ func createNewProfile(userInfo googleUserInfo) models.Profile {
 // Me returns the authenticated user's profile from the profiles table.
 // This endpoint must be behind the Protected middleware.
 func Me(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
+	}
 
 	query := database.NewFilter().
 		Select("id,email,full_name,avatar_url,created_at,updated_at").
@@ -345,28 +312,17 @@ func Me(c *fiber.Ctx) error {
 		Build()
 
 	body, statusCode, err := database.DB.Get("profiles", query)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to fetch profile",
-		})
-	}
-	if statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to fetch profile",
-		})
+	if err != nil || statusCode != http.StatusOK {
+		return errInternal(c, "failed to fetch profile")
 	}
 
 	var profiles []models.Profile
 	if err := json.Unmarshal(body, &profiles); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{
-			Error: "failed to parse profile",
-		})
+		return errInternal(c, "failed to parse profile")
 	}
 
 	if len(profiles) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{
-			Error: "profile not found",
-		})
+		return errNotFound(c, "profile not found")
 	}
 
 	return c.JSON(profiles[0])

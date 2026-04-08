@@ -8,23 +8,24 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
-	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
+	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// ListExpenses returns all expenses for a budget.
+// ListExpenses returns all expenses for a budget, ordered by date descending.
 func ListExpenses(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	query := database.NewFilter().
@@ -35,12 +36,12 @@ func ListExpenses(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch expenses"})
+		return errInternal(c, "failed to fetch expenses")
 	}
 
 	var expenses []models.Expense
 	if err := json.Unmarshal(body, &expenses); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to parse expenses"})
+		return errInternal(c, "failed to parse expenses")
 	}
 
 	if expenses == nil {
@@ -51,89 +52,56 @@ func ListExpenses(c *fiber.Ctx) error {
 }
 
 // CreateExpense creates a new expense for a budget.
+// On success it broadcasts an expense_created event via WebSocket.
 func CreateExpense(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
 
 	var req models.CreateExpenseRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+		return errBadRequest(c, "invalid request body")
 	}
 
+	// Validate required fields.
 	if req.CategoryID == uuid.Nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "subcategory_id is required"})
+		return errBadRequest(c, "subcategory_id is required")
 	}
 	if req.Amount <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount must be positive"})
+		return errBadRequest(c, "amount must be positive")
 	}
 	if req.Amount > maxAmountValue {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount exceeds maximum allowed value"})
+		return errBadRequest(c, "amount exceeds maximum allowed value")
 	}
 	if len(req.Description) > maxDescriptionLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "description too long (max 1000 characters)"})
+		return errBadRequest(c, "description too long (max 1000 characters)")
 	}
 	if req.ExpenseDate == "" {
-		req.ExpenseDate = time.Now().UTC().Format("2006-01-02")
+		req.ExpenseDate = time.Now().UTC().Format(dateFormat)
 	}
-
-	// Validate date format.
-	if req.ExpenseDate != "" {
-		if _, err := time.Parse("2006-01-02", req.ExpenseDate); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
-		}
+	if !isValidDate(req.ExpenseDate) {
+		return errBadRequest(c, "invalid date format, use YYYY-MM-DD")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
-	// Verify category belongs to this budget (via its parent section).
-	// Get the category and check its parent section belongs to this budget.
-	catQuery := database.NewFilter().
-		Select("id,category_id").
-		Eq("id", req.CategoryID.String()).
-		Build()
-
-	catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-	}
-
-	var catResults []struct {
-		ID         string `json:"id"`
-		CategoryID string `json:"category_id"`
-	}
-	if err := json.Unmarshal(catBody, &catResults); err != nil || len(catResults) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-	}
-
-	// Verify the parent section belongs to this budget.
-	sectionCheckQuery := database.NewFilter().
-		Select("id").
-		Eq("id", catResults[0].CategoryID).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-	}
-
-	var sectionFound []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(sectionBody, &sectionFound); err != nil || len(sectionFound) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
+	// Verify category belongs to this budget.
+	if err := verifyCategoryBelongsToBudget(req.CategoryID, budgetID); err != nil {
+		return errBadRequest(c, "category does not belong to this budget")
 	}
 
 	now := time.Now().UTC()
 	expenseID := uuid.New()
-
 	createdBy := userID
+
 	expense := models.Expense{
 		ID:          expenseID,
 		BudgetID:    budgetID,
@@ -155,60 +123,65 @@ func CreateExpense(c *fiber.Ctx) error {
 		"created_by":     userID.String(),
 		"created_at":     now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
-	_, statusCode, err = database.DB.Post("budget_expenses", payloadBytes)
+	_, statusCode, err := database.DB.Post("budget_expenses", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to create expense"})
+		return errInternal(c, "failed to create expense")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeExpenseCreated, expense)
 
 	return c.Status(fiber.StatusCreated).JSON(expense)
 }
 
 // UpdateExpense updates an existing expense.
+// On success it broadcasts an expense_updated event via WebSocket.
 func UpdateExpense(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
-	expenseID, err := uuid.Parse(c.Params("expenseId"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid expense ID"})
+
+	expenseID, ok := parseUUIDParam(c, "expenseId")
+	if !ok {
+		return errBadRequest(c, "invalid expense ID")
 	}
 
 	var req models.UpdateExpenseRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid request body"})
+		return errBadRequest(c, "invalid request body")
 	}
 
-	// Validate fields if provided.
+	// Validate optional fields.
 	if req.Amount != nil && *req.Amount <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount must be positive"})
+		return errBadRequest(c, "amount must be positive")
 	}
 	if req.Amount != nil && *req.Amount > maxAmountValue {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "amount exceeds maximum allowed value"})
+		return errBadRequest(c, "amount exceeds maximum allowed value")
 	}
 	if req.Description != nil && len(*req.Description) > maxDescriptionLength {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "description too long (max 1000 characters)"})
+		return errBadRequest(c, "description too long (max 1000 characters)")
 	}
 	if req.ExpenseDate != nil {
 		if *req.ExpenseDate == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "expense_date cannot be empty"})
+			return errBadRequest(c, "expense_date cannot be empty")
 		}
-		if _, err := time.Parse("2006-01-02", *req.ExpenseDate); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid date format, use YYYY-MM-DD"})
+		if !isValidDate(*req.ExpenseDate) {
+			return errBadRequest(c, "invalid date format, use YYYY-MM-DD")
 		}
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	// Fetch existing expense.
@@ -220,53 +193,21 @@ func UpdateExpense(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_expenses", getQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch expense"})
+		return errInternal(c, "failed to fetch expense")
 	}
 
 	var expenses []models.Expense
 	if err := json.Unmarshal(body, &expenses); err != nil || len(expenses) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "expense not found"})
+		return errNotFound(c, "expense not found")
 	}
 
 	exp := expenses[0]
 
 	// Apply partial updates.
 	if req.CategoryID != nil {
-		// Verify the new category belongs to this budget (via its parent section).
-		catQuery := database.NewFilter().
-			Select("id,category_id").
-			Eq("id", req.CategoryID.String()).
-			Build()
-
-		catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
-		if err != nil || statusCode != http.StatusOK {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
+		if err := verifyCategoryBelongsToBudget(*req.CategoryID, budgetID); err != nil {
+			return errBadRequest(c, "category does not belong to this budget")
 		}
-
-		var catResults []struct {
-			ID         string `json:"id"`
-			CategoryID string `json:"category_id"`
-		}
-		if err := json.Unmarshal(catBody, &catResults); err != nil || len(catResults) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-		}
-
-		sectionCheckQuery := database.NewFilter().
-			Select("id").
-			Eq("id", catResults[0].CategoryID).
-			Eq("budget_id", budgetID.String()).
-			Build()
-
-		sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
-		if err != nil || statusCode != http.StatusOK {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-		}
-
-		var sectionFound []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(sectionBody, &sectionFound); err != nil || len(sectionFound) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "category does not belong to this budget"})
-		}
-
 		exp.CategoryID = *req.CategoryID
 	}
 	if req.Amount != nil {
@@ -285,9 +226,9 @@ func UpdateExpense(c *fiber.Ctx) error {
 		"description":    exp.Description,
 		"expense_date":   exp.ExpenseDate,
 	}
-	updateBytes, err := json.Marshal(updatePayload)
+	updateBytes, err := marshalJSON(updatePayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	patchQuery := database.NewFilter().
@@ -297,58 +238,67 @@ func UpdateExpense(c *fiber.Ctx) error {
 
 	_, statusCode, err = database.DB.Patch("budget_expenses", patchQuery, updateBytes)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to update expense"})
+		return errInternal(c, "failed to update expense")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeExpenseUpdated, exp)
 
 	return c.JSON(exp)
 }
 
 // DeleteExpense deletes an expense.
+// On success it broadcasts an expense_deleted event via WebSocket.
 func DeleteExpense(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
 	}
-	expenseID, err := uuid.Parse(c.Params("expenseId"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid expense ID"})
+
+	expenseID, ok := parseUUIDParam(c, "expenseId")
+	if !ok {
+		return errBadRequest(c, "invalid expense ID")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
+
+	eid := expenseID.String()
 
 	// Verify expense exists.
 	checkQuery := database.NewFilter().
 		Select("id").
-		Eq("id", expenseID.String()).
+		Eq("id", eid).
 		Eq("budget_id", budgetID.String()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", checkQuery)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to verify expense"})
+		return errInternal(c, "failed to verify expense")
 	}
 
 	var found []struct{ ID string `json:"id"` }
 	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "expense not found"})
+		return errNotFound(c, "expense not found")
 	}
 
 	// Delete the expense.
 	delQuery := database.NewFilter().
-		Eq("id", expenseID.String()).
+		Eq("id", eid).
 		Eq("budget_id", budgetID.String()).
 		Build()
 
 	_, statusCode, err = database.DB.Delete("budget_expenses", delQuery)
 	if err != nil || statusCode >= 300 {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to delete expense"})
+		return errInternal(c, "failed to delete expense")
 	}
+
+	broadcast(budgetID.String(), ws.MessageTypeExpenseDeleted, map[string]string{"id": eid})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

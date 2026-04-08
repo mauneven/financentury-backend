@@ -10,43 +10,53 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
-	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
+	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
 // Package-level frontend URL for invite links.
 var frontendURL string
 
-// InitInvites configures the invites handler with the frontend URL.
+// maxInviteTokenLength is the upper bound for invite token query parameters.
+const maxInviteTokenLength = 128
+
+// inviteTokenBytes is the number of random bytes used for invite tokens.
+const inviteTokenBytes = 32
+
+// inviteExpiry is how long an invite link remains valid.
+const inviteExpiry = 7 * 24 * time.Hour
+
+// InitInvites configures the invites handler with the frontend URL used to
+// construct invite links.
 func InitInvites(url string) {
 	frontendURL = url
 }
 
 // CreateInvite generates a new invite link for a budget (owner only).
 func CreateInvite(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
-	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
-	// Verify the user is the budget owner (budgets.user_id = authenticated user).
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
 	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
-	// Generate a unique invite token: 32 bytes -> hex encode.
-	tokenBytes := make([]byte, 32)
+	// Generate a unique invite token.
+	tokenBytes := make([]byte, inviteTokenBytes)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to generate invite token"})
+		return errInternal(c, "failed to generate invite token")
 	}
 	inviteToken := hex.EncodeToString(tokenBytes)
 
 	now := time.Now().UTC()
-	expiresAt := now.Add(7 * 24 * time.Hour)
+	expiresAt := now.Add(inviteExpiry)
 	inviteID := uuid.New()
 
 	payload := map[string]interface{}{
@@ -57,14 +67,14 @@ func CreateInvite(c *fiber.Ctx) error {
 		"expires_at":   expiresAt.Format(time.RFC3339Nano),
 		"created_at":   now.Format(time.RFC3339Nano),
 	}
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	_, statusCode, err := database.DB.Post("budget_invites", payloadBytes)
 	if err != nil || statusCode != http.StatusCreated {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to create invite"})
+		return errInternal(c, "failed to create invite")
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
@@ -78,10 +88,10 @@ func CreateInvite(c *fiber.Ctx) error {
 func GetInviteInfo(c *fiber.Ctx) error {
 	token := c.Params("token")
 	if token == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite token is required"})
+		return errBadRequest(c, "invite token is required")
 	}
-	if len(token) > 128 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid invite token"})
+	if len(token) > maxInviteTokenLength {
+		return errBadRequest(c, "invalid invite token")
 	}
 
 	// Fetch the invite by token.
@@ -92,12 +102,12 @@ func GetInviteInfo(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_invites", query)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch invite"})
+		return errInternal(c, "failed to fetch invite")
 	}
 
 	var invites []models.Invite
 	if err := json.Unmarshal(body, &invites); err != nil || len(invites) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "invite not found"})
+		return errNotFound(c, "invite not found")
 	}
 
 	invite := invites[0]
@@ -108,16 +118,16 @@ func GetInviteInfo(c *fiber.Ctx) error {
 		Eq("id", invite.BudgetID.String()).
 		Build()
 
-	budgetBody, statusCode, err := database.DB.Get("budgets", budgetQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch budget"})
+	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
+	if budgetErr != nil || budgetStatus != http.StatusOK {
+		return errInternal(c, "failed to fetch budget")
 	}
 
 	var budgets []struct {
 		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(budgetBody, &budgets); err != nil || len(budgets) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
 	// Fetch inviter name.
@@ -126,57 +136,50 @@ func GetInviteInfo(c *fiber.Ctx) error {
 		Eq("id", invite.CreatedBy.String()).
 		Build()
 
-	profileBody, statusCode, err := database.DB.Get("profiles", profileQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch inviter profile"})
-	}
-
-	var profiles []struct {
-		FullName string `json:"full_name"`
-	}
+	profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
 	inviterName := "Unknown"
-	if err := json.Unmarshal(profileBody, &profiles); err == nil && len(profiles) > 0 {
-		inviterName = profiles[0].FullName
-	}
-
-	// Determine if expired or used.
-	isExpired := false
-	expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
-	if parseErr == nil && time.Now().UTC().After(expiresAt) {
-		isExpired = true
-	}
-	// Also try parsing without nano precision.
-	if parseErr != nil {
-		expiresAt, parseErr = time.Parse(time.RFC3339, invite.ExpiresAt)
-		if parseErr == nil && time.Now().UTC().After(expiresAt) {
-			isExpired = true
+	if profileErr == nil && profileStatus == http.StatusOK {
+		var profiles []struct {
+			FullName string `json:"full_name"`
+		}
+		if err := json.Unmarshal(profileBody, &profiles); err == nil && len(profiles) > 0 {
+			inviterName = profiles[0].FullName
 		}
 	}
 
-	isUsed := invite.UsedBy != nil
+	// Determine expiry.
+	isExpired := false
+	expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
+	if parseErr != nil {
+		expiresAt, parseErr = time.Parse(time.RFC3339, invite.ExpiresAt)
+	}
+	if parseErr == nil && time.Now().UTC().After(expiresAt) {
+		isExpired = true
+	}
 
 	return c.JSON(models.InviteInfo{
 		BudgetName:  budgets[0].Name,
 		InviterName: inviterName,
 		ExpiresAt:   invite.ExpiresAt,
 		IsExpired:   isExpired,
-		IsUsed:      isUsed,
+		IsUsed:      invite.UsedBy != nil,
 	})
 }
 
 // AcceptInvite accepts an invite and adds the user as a collaborator.
+// On success it broadcasts a collaborator_added event via WebSocket.
 func AcceptInvite(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
 	token := c.Params("token")
 	if token == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite token is required"})
+		return errBadRequest(c, "invite token is required")
 	}
-	if len(token) > 128 {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid invite token"})
+	if len(token) > maxInviteTokenLength {
+		return errBadRequest(c, "invalid invite token")
 	}
 
 	// Fetch the invite by token.
@@ -187,57 +190,56 @@ func AcceptInvite(c *fiber.Ctx) error {
 
 	body, statusCode, err := database.DB.Get("budget_invites", query)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch invite"})
+		return errInternal(c, "failed to fetch invite")
 	}
 
 	var invites []models.Invite
 	if err := json.Unmarshal(body, &invites); err != nil || len(invites) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "invite not found"})
+		return errNotFound(c, "invite not found")
 	}
 
 	invite := invites[0]
 
-	// Check if already used.
 	if invite.UsedBy != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite has already been used"})
+		return errBadRequest(c, "invite has already been used")
 	}
 
-	// Check if expired.
+	// Check expiry.
 	expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
 	if parseErr != nil {
 		expiresAt, parseErr = time.Parse(time.RFC3339, invite.ExpiresAt)
 	}
 	if parseErr == nil && time.Now().UTC().After(expiresAt) {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invite has expired"})
+		return errBadRequest(c, "invite has expired")
 	}
 
-	// Check if the user is the budget owner (can't join own budget).
+	// Prevent owner from joining their own budget.
 	ownerQuery := database.NewFilter().
 		Select("id").
 		Eq("id", invite.BudgetID.String()).
 		Eq("user_id", userID.String()).
 		Build()
 
-	ownerBody, statusCode, err := database.DB.Get("budgets", ownerQuery)
-	if err == nil && statusCode == http.StatusOK {
+	ownerBody, ownerStatus, ownerErr := database.DB.Get("budgets", ownerQuery)
+	if ownerErr == nil && ownerStatus == http.StatusOK {
 		var ownerFound []struct{ ID string `json:"id"` }
 		if err := json.Unmarshal(ownerBody, &ownerFound); err == nil && len(ownerFound) > 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "you are already the owner of this budget"})
+			return errBadRequest(c, "you are already the owner of this budget")
 		}
 	}
 
-	// Check if user is already a collaborator.
+	// Prevent duplicate collaborator.
 	collabCheckQuery := database.NewFilter().
 		Select("id").
 		Eq("budget_id", invite.BudgetID.String()).
 		Eq("user_id", userID.String()).
 		Build()
 
-	collabBody, statusCode, err := database.DB.Get("budget_collaborators", collabCheckQuery)
-	if err == nil && statusCode == http.StatusOK {
+	collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabCheckQuery)
+	if collabErr == nil && collabStatus == http.StatusOK {
 		var collabFound []struct{ ID string `json:"id"` }
 		if err := json.Unmarshal(collabBody, &collabFound); err == nil && len(collabFound) > 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "you are already a collaborator on this budget"})
+			return errBadRequest(c, "you are already a collaborator on this budget")
 		}
 	}
 
@@ -248,9 +250,9 @@ func AcceptInvite(c *fiber.Ctx) error {
 		"used_by": userID.String(),
 		"used_at": now.Format(time.RFC3339Nano),
 	}
-	usedBytes, err := json.Marshal(usedPayload)
+	usedBytes, err := marshalJSON(usedPayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	patchQuery := database.NewFilter().
@@ -259,7 +261,7 @@ func AcceptInvite(c *fiber.Ctx) error {
 
 	_, statusCode, err = database.DB.Patch("budget_invites", patchQuery, usedBytes)
 	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to update invite"})
+		return errInternal(c, "failed to update invite")
 	}
 
 	// Add user to budget_collaborators.
@@ -271,14 +273,14 @@ func AcceptInvite(c *fiber.Ctx) error {
 		"role":      "collaborator",
 		"added_at":  now.Format(time.RFC3339Nano),
 	}
-	collabBytes, err := json.Marshal(collabPayload)
+	collabBytes, err := marshalJSON(collabPayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	_, statusCode, err = database.DB.Post("budget_collaborators", collabBytes)
 	if err != nil || statusCode != http.StatusCreated {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to add collaborator"})
+		return errInternal(c, "failed to add collaborator")
 	}
 
 	// Return the budget data.
@@ -287,15 +289,19 @@ func AcceptInvite(c *fiber.Ctx) error {
 		Eq("id", invite.BudgetID.String()).
 		Build()
 
-	budgetBody, statusCode, err := database.DB.Get("budgets", budgetQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch budget"})
+	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
+	if budgetErr != nil || budgetStatus != http.StatusOK {
+		return errInternal(c, "failed to fetch budget")
 	}
 
 	var budgets []models.Budget
 	if err := json.Unmarshal(budgetBody, &budgets); err != nil || len(budgets) == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
+
+	broadcast(invite.BudgetID.String(), ws.MessageTypeCollabAdded, map[string]string{
+		"user_id": userID.String(),
+	})
 
 	return c.JSON(budgets[0])
 }

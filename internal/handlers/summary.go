@@ -5,79 +5,80 @@ import (
 	"net/http"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
-	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
-// GetBudgetSummary returns a comprehensive budget summary via the RPC function.
+// GetBudgetSummary returns a comprehensive budget summary via the Supabase
+// RPC function get_budget_summary. The result is passed through as raw JSON.
 func GetBudgetSummary(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
-	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
-	// Call the RPC function get_budget_summary.
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
 	rpcPayload := map[string]string{
 		"p_budget_id": budgetID.String(),
 		"p_user_id":   userID.String(),
 	}
 	rpcBytes, err := json.Marshal(rpcPayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	body, statusCode, err := database.DB.RPC("get_budget_summary", rpcBytes)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch budget summary"})
+		return errInternal(c, "failed to fetch budget summary")
 	}
 
 	if statusCode != http.StatusOK {
-		// RPC may return 404 or error if budget not found or not owned.
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
-	// The RPC function returns JSON directly. Pass it through as-is.
 	c.Set("Content-Type", "application/json")
 	return c.Send(body)
 }
 
-// GetBudgetTrends returns monthly spending trends via the RPC function.
+// GetBudgetTrends returns monthly spending trends via the Supabase RPC
+// function get_budget_trends. The result is passed through as raw JSON.
 func GetBudgetTrends(c *fiber.Ctx) error {
-	userID := middleware.GetUserID(c)
-	if userID == uuid.Nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{Error: "unauthorized"})
-	}
-	budgetID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.ErrorResponse{Error: "invalid budget ID"})
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
 	}
 
-	// Call the RPC function get_budget_trends.
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
 	rpcPayload := map[string]string{
 		"p_budget_id": budgetID.String(),
 		"p_user_id":   userID.String(),
 	}
 	rpcBytes, err := json.Marshal(rpcPayload)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to serialize request"})
+		return errInternal(c, "failed to serialize request")
 	}
 
 	body, statusCode, err := database.DB.RPC("get_budget_trends", rpcBytes)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(models.ErrorResponse{Error: "failed to fetch budget trends"})
+		return errInternal(c, "failed to fetch budget trends")
 	}
 
 	if statusCode != http.StatusOK {
-		return c.Status(fiber.StatusNotFound).JSON(models.ErrorResponse{Error: "budget not found"})
+		return errNotFound(c, "budget not found")
 	}
 
-	// The RPC function returns JSON directly. Pass it through as-is.
 	c.Set("Content-Type", "application/json")
 	return c.Send(body)
 }
+
+// Ensure models.ErrorResponse is used (prevents unused-import lint in some
+// configurations while keeping the import list clean).
+var _ = models.ErrorResponse{}
