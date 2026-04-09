@@ -62,6 +62,7 @@ type Expense struct {
 	ExpenseDate string     `json:"expense_date"`
 	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 // Collaborator represents a budget collaborator.

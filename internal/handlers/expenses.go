@@ -111,6 +111,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		ExpenseDate: req.ExpenseDate,
 		CreatedBy:   &createdBy,
 		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	payload := map[string]interface{}{
@@ -122,6 +123,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		"expense_date":   req.ExpenseDate,
 		"created_by":     userID.String(),
 		"created_at":     now.Format(time.RFC3339Nano),
+		"updated_at":     now.Format(time.RFC3339Nano),
 	}
 	payloadBytes, err := marshalJSON(payload)
 	if err != nil {
@@ -220,11 +222,15 @@ func UpdateExpense(c *fiber.Ctx) error {
 		exp.ExpenseDate = *req.ExpenseDate
 	}
 
+	now := time.Now().UTC()
+	exp.UpdatedAt = now
+
 	updatePayload := map[string]interface{}{
 		"subcategory_id": exp.CategoryID.String(),
 		"amount":         exp.Amount,
 		"description":    exp.Description,
 		"expense_date":   exp.ExpenseDate,
+		"updated_at":     now.Format(time.RFC3339Nano),
 	}
 	updateBytes, err := marshalJSON(updatePayload)
 	if err != nil {
