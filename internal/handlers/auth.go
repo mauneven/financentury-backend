@@ -271,12 +271,13 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 	profileID := uuid.New()
 
 	payload := map[string]interface{}{
-		"id":         profileID.String(),
-		"email":      userInfo.Email,
-		"full_name":  userInfo.Name,
-		"avatar_url": userInfo.Picture,
-		"created_at": now.Format(time.RFC3339Nano),
-		"updated_at": now.Format(time.RFC3339Nano),
+		"id":            profileID.String(),
+		"email":         userInfo.Email,
+		"full_name":     userInfo.Name,
+		"avatar_url":    userInfo.Picture,
+		"auth_provider": "google",
+		"created_at":    now.Format(time.RFC3339Nano),
+		"updated_at":    now.Format(time.RFC3339Nano),
 	}
 
 	payloadBytes, err := marshalJSON(payload)

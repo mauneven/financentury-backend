@@ -18,6 +18,8 @@ func Setup(app *fiber.App) {
 
 	// Public auth routes with strict rate limiting to prevent brute-force.
 	api.Post("/auth/google", middleware.AuthRateLimiter(), handlers.GoogleLogin)
+	api.Post("/auth/register", middleware.AuthRateLimiter(), handlers.Register)
+	api.Post("/auth/login", middleware.AuthRateLimiter(), handlers.Login)
 
 	// Public invite info (no auth needed).
 	api.Get("/invites/:token", handlers.GetInviteInfo)

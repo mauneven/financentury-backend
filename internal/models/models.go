@@ -8,12 +8,14 @@ import (
 
 // Profile represents a user profile from the Supabase profiles table.
 type Profile struct {
-	ID        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	FullName  string    `json:"full_name"`
-	AvatarURL string    `json:"avatar_url"`
-	CreatedAt string    `json:"created_at"`
-	UpdatedAt string    `json:"updated_at"`
+	ID           uuid.UUID `json:"id"`
+	Email        string    `json:"email"`
+	FullName     string    `json:"full_name"`
+	AvatarURL    string    `json:"avatar_url"`
+	PasswordHash string    `json:"-"`                        // never sent to client
+	AuthProvider string    `json:"auth_provider,omitempty"`
+	CreatedAt    string    `json:"created_at"`
+	UpdatedAt    string    `json:"updated_at"`
 }
 
 // Budget represents a user's budget.
