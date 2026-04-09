@@ -213,9 +213,21 @@ func (f *Filter) Gt(column, value string) *Filter {
 	return f
 }
 
+// Gte adds a greater-than-or-equal filter: column=gte.value
+func (f *Filter) Gte(column, value string) *Filter {
+	f.params = append(f.params, column+"=gte."+url.QueryEscape(value))
+	return f
+}
+
 // Lt adds a less-than filter: column=lt.value
 func (f *Filter) Lt(column, value string) *Filter {
 	f.params = append(f.params, column+"=lt."+url.QueryEscape(value))
+	return f
+}
+
+// Lte adds a less-than-or-equal filter: column=lte.value
+func (f *Filter) Lte(column, value string) *Filter {
+	f.params = append(f.params, column+"=lte."+url.QueryEscape(value))
 	return f
 }
 

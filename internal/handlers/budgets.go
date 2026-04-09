@@ -31,31 +31,35 @@ type guidedCategory struct {
 
 // getGuidedSections returns the 50/30/20 guided template used to seed new
 // guided-mode budgets.
+// getGuidedSections returns the 50/30/20 guided template used to seed new
+// guided-mode budgets. Category Percent values represent the percentage of
+// the PARENT SECTION (not the total budget). For example, Vivienda at 56%
+// means 56% of the Necesidades section (which itself is 50% of total).
 func getGuidedSections() []guidedSection {
 	return []guidedSection{
 		{
-			Name: "Necesidades", Percent: 50, Icon: "🏠", SortOrder: 1,
+			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
 			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 28, Icon: "🏠", SortOrder: 1},
-				{Name: "Comida", Percent: 12, Icon: "🍽️", SortOrder: 2},
-				{Name: "Transporte", Percent: 6, Icon: "🚗", SortOrder: 3},
-				{Name: "Servicios", Percent: 4, Icon: "💡", SortOrder: 4},
+				{Name: "Vivienda", Percent: 56, Icon: "home", SortOrder: 1},
+				{Name: "Comida", Percent: 24, Icon: "utensils", SortOrder: 2},
+				{Name: "Transporte", Percent: 12, Icon: "car", SortOrder: 3},
+				{Name: "Servicios", Percent: 8, Icon: "lightbulb", SortOrder: 4},
 			},
 		},
 		{
-			Name: "Deseos", Percent: 30, Icon: "✨", SortOrder: 2,
+			Name: "Deseos", Percent: 30, Icon: "party", SortOrder: 2,
 			Categories: []guidedCategory{
-				{Name: "Salidas", Percent: 10, Icon: "🎉", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 5, Icon: "🎬", SortOrder: 2},
-				{Name: "Ropa", Percent: 7, Icon: "👕", SortOrder: 3},
-				{Name: "Viajes", Percent: 8, Icon: "✈️", SortOrder: 4},
+				{Name: "Salidas", Percent: 33, Icon: "party", SortOrder: 1},
+				{Name: "Entretenimiento", Percent: 17, Icon: "clapperboard", SortOrder: 2},
+				{Name: "Ropa", Percent: 23, Icon: "shirt", SortOrder: 3},
+				{Name: "Viajes", Percent: 27, Icon: "plane", SortOrder: 4},
 			},
 		},
 		{
-			Name: "Ahorro", Percent: 20, Icon: "💰", SortOrder: 3,
+			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 3,
 			Categories: []guidedCategory{
-				{Name: "Fondo de emergencia", Percent: 8, Icon: "🏦", SortOrder: 1},
-				{Name: "Inversión", Percent: 12, Icon: "📈", SortOrder: 2},
+				{Name: "Fondo de emergencia", Percent: 40, Icon: "landmark", SortOrder: 1},
+				{Name: "Inversión", Percent: 60, Icon: "trending", SortOrder: 2},
 			},
 		},
 	}

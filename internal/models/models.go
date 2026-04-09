@@ -168,12 +168,25 @@ type UpdateExpenseRequest struct {
 
 // --- Summary Response Types ---
 
+// SummaryCategoryView is the category representation used in summary responses.
+// It maps the DB column "category_id" to the JSON key "section_id" because the
+// frontend Category type uses "section_id" to refer to the parent section.
+type SummaryCategoryView struct {
+	ID                uuid.UUID `json:"id"`
+	SectionID         uuid.UUID `json:"section_id"`
+	Name              string    `json:"name"`
+	AllocationPercent float64   `json:"allocation_percent"`
+	Icon              string    `json:"icon"`
+	SortOrder         int       `json:"sort_order"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
 // CategorySummary contains a category with its spending totals.
 type CategorySummary struct {
-	Category        Category `json:"category"`
-	AllocatedAmount float64  `json:"allocated_amount"`
-	TotalSpent      float64  `json:"total_spent"`
-	ExpenseCount    int      `json:"expense_count"`
+	Category        SummaryCategoryView `json:"category"`
+	AllocatedAmount float64             `json:"allocated_amount"`
+	TotalSpent      float64             `json:"total_spent"`
+	ExpenseCount    int                 `json:"expense_count"`
 }
 
 // SectionSummary contains a section with category summaries.
@@ -198,17 +211,20 @@ type MonthlyTrend struct {
 	TotalSpent float64 `json:"total_spent"`
 }
 
-// SectionTrend contains trends for a single section.
+// SectionTrend contains trends for a single section. JSON keys use
+// "category_id" / "category_name" because the frontend type calls sections
+// "categories" in the trends context.
 type SectionTrend struct {
-	SectionID   uuid.UUID      `json:"section_id"`
-	SectionName string         `json:"section_name"`
+	SectionID   uuid.UUID      `json:"category_id"`
+	SectionName string         `json:"category_name"`
 	Months      []MonthlyTrend `json:"months"`
 }
 
-// TrendsResponse is the trends endpoint response.
+// TrendsResponse is the trends endpoint response. The JSON key "categories"
+// actually contains section-level trend data (matching the frontend type).
 type TrendsResponse struct {
 	BudgetID uuid.UUID      `json:"budget_id"`
-	Sections []SectionTrend `json:"sections"`
+	Sections []SectionTrend `json:"categories"`
 }
 
 // ErrorResponse is a standard error response.
