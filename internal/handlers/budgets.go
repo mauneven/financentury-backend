@@ -10,6 +10,7 @@ import (
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
+	"golang.org/x/sync/errgroup"
 )
 
 // guidedSection defines a section for a budget template mode.
@@ -194,62 +195,90 @@ func getSectionsForMode(mode string) []guidedSection {
 }
 
 // ListBudgets returns all budgets for the authenticated user (owned + collaborative).
+// Supports limit/offset pagination via query params.
 func ListBudgets(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
 		return errUnauthorized(c)
 	}
 
-	// Fetch owned budgets.
-	query := database.NewFilter().
-		Select("*").
-		Eq("user_id", userID.String()).
-		Order("created_at", "desc").
-		Build()
+	limit, offset := parsePaginationParams(c)
+	uid := userID.String()
 
-	body, statusCode, err := database.DB.Get("budgets", query)
-	if err != nil || statusCode != http.StatusOK {
+	var (
+		budgets []models.Budget
+		collabs []struct {
+			BudgetID string `json:"budget_id"`
+		}
+	)
+
+	// Run the owned-budgets query and collaborator-IDs query in parallel.
+	g := new(errgroup.Group)
+
+	g.Go(func() error {
+		query := database.NewFilter().
+			Select("*").
+			Eq("user_id", uid).
+			Order("created_at", "desc").
+			Limit(limit).
+			Offset(offset).
+			Build()
+
+		body, statusCode, err := database.DB.Get("budgets", query)
+		if err != nil || statusCode != http.StatusOK {
+			return fiber.ErrInternalServerError
+		}
+
+		if err := json.Unmarshal(body, &budgets); err != nil {
+			return fiber.ErrInternalServerError
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		collabQuery := database.NewFilter().
+			Select("budget_id").
+			Eq("user_id", uid).
+			Build()
+
+		collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabQuery)
+		if collabErr != nil || collabStatus != http.StatusOK {
+			// Non-fatal: user may simply have no collaborations.
+			return nil
+		}
+
+		_ = json.Unmarshal(collabBody, &collabs)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
 		return errInternal(c, "failed to fetch budgets")
-	}
-
-	var budgets []models.Budget
-	if err := json.Unmarshal(body, &budgets); err != nil {
-		return errInternal(c, "failed to parse budgets")
 	}
 
 	if budgets == nil {
 		budgets = make([]models.Budget, 0)
 	}
 
-	// Fetch budgets where user is a collaborator.
-	collabQuery := database.NewFilter().
-		Select("budget_id").
-		Eq("user_id", userID.String()).
-		Build()
-
-	collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabQuery)
-	if collabErr == nil && collabStatus == http.StatusOK {
-		var collabs []struct {
-			BudgetID string `json:"budget_id"`
+	// Fetch the actual collaborative budgets (sequential; depends on collabs result).
+	if len(collabs) > 0 {
+		budgetIDs := make([]string, len(collabs))
+		for i, cb := range collabs {
+			budgetIDs[i] = cb.BudgetID
 		}
-		if err := json.Unmarshal(collabBody, &collabs); err == nil && len(collabs) > 0 {
-			budgetIDs := make([]string, len(collabs))
-			for i, cb := range collabs {
-				budgetIDs[i] = cb.BudgetID
-			}
 
-			collabBudgetQuery := database.NewFilter().
-				Select("*").
-				In("id", budgetIDs).
-				Order("created_at", "desc").
-				Build()
+		collabBudgetQuery := database.NewFilter().
+			Select("*").
+			In("id", budgetIDs).
+			Order("created_at", "desc").
+			Limit(limit).
+			Offset(offset).
+			Build()
 
-			collabBudgetBody, collabBudgetStatus, collabBudgetErr := database.DB.Get("budgets", collabBudgetQuery)
-			if collabBudgetErr == nil && collabBudgetStatus == http.StatusOK {
-				var collabBudgets []models.Budget
-				if err := json.Unmarshal(collabBudgetBody, &collabBudgets); err == nil {
-					budgets = append(budgets, collabBudgets...)
-				}
+		collabBudgetBody, collabBudgetStatus, collabBudgetErr := database.DB.Get("budgets", collabBudgetQuery)
+		if collabBudgetErr == nil && collabBudgetStatus == http.StatusOK {
+			var collabBudgets []models.Budget
+			if err := json.Unmarshal(collabBudgetBody, &collabBudgets); err == nil {
+				budgets = append(budgets, collabBudgets...)
 			}
 		}
 	}

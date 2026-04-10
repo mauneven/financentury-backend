@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/mail"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -76,6 +78,25 @@ func clearLoginAttempts(email string) {
 	delete(loginAttempts, email)
 }
 
+func init() {
+	// Start a background goroutine to periodically purge expired entries
+	// from the loginAttempts map, preventing unbounded memory growth.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			loginAttemptsMu.Lock()
+			now := time.Now()
+			for email, rec := range loginAttempts {
+				if now.After(rec.expiresAt) {
+					delete(loginAttempts, email)
+				}
+			}
+			loginAttemptsMu.Unlock()
+		}
+	}()
+}
+
 // bcryptCost is the bcrypt work factor. Set to 12 (above the default of 10)
 // for a financial application to increase brute-force resistance.
 const bcryptCost = 12
@@ -127,7 +148,7 @@ func Register(c *fiber.Ctx) error {
 	}
 
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
-	if !strings.Contains(req.Email, "@") || !strings.Contains(req.Email, ".") {
+	if _, err := mail.ParseAddress(req.Email); err != nil {
 		return errBadRequest(c, "invalid email address")
 	}
 
@@ -138,6 +159,22 @@ func Register(c *fiber.Ctx) error {
 	// prevent silent truncation and potential hash collisions.
 	if len([]byte(req.Password)) > maxPasswordBytes {
 		return errBadRequest(c, "password must not exceed 72 bytes")
+	}
+	// Password complexity: require at least one uppercase letter, one
+	// lowercase letter, and one digit for a financial application.
+	var hasUpper, hasLower, hasDigit bool
+	for _, r := range req.Password {
+		switch {
+		case unicode.IsUpper(r):
+			hasUpper = true
+		case unicode.IsLower(r):
+			hasLower = true
+		case unicode.IsDigit(r):
+			hasDigit = true
+		}
+	}
+	if !hasUpper || !hasLower || !hasDigit {
+		return errBadRequest(c, "password must contain at least one uppercase letter, one lowercase letter, and one digit")
 	}
 
 	// Check if email already exists.

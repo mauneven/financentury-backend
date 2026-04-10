@@ -52,6 +52,51 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errNotFound(c, "section not found")
 	}
 
+	// Validate that total category allocation won't exceed the section's allocation.
+	sectionQuery := database.NewFilter().
+		Select("allocation_percent").
+		Eq("id", sectionID.String()).
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	sectionBody, sectionStatus, sectionErr := database.DB.Get("budget_categories", sectionQuery)
+	if sectionErr != nil || sectionStatus != http.StatusOK {
+		return errInternal(c, "failed to fetch section allocation")
+	}
+
+	var parentSections []struct {
+		AllocationPercent float64 `json:"allocation_percent"`
+	}
+	if err := json.Unmarshal(sectionBody, &parentSections); err != nil || len(parentSections) == 0 {
+		return errInternal(c, "failed to parse section allocation")
+	}
+	sectionAllocation := parentSections[0].AllocationPercent
+
+	existingCatQuery := database.NewFilter().
+		Select("allocation_percent").
+		Eq("category_id", sectionID.String()).
+		Build()
+
+	existingCatBody, existingCatStatus, existingCatErr := database.DB.Get("budget_subcategories", existingCatQuery)
+	if existingCatErr != nil || existingCatStatus != http.StatusOK {
+		return errInternal(c, "failed to check existing category allocations")
+	}
+
+	var existingCats []struct {
+		AllocationPercent float64 `json:"allocation_percent"`
+	}
+	if err := json.Unmarshal(existingCatBody, &existingCats); err != nil {
+		return errInternal(c, "failed to parse existing category allocations")
+	}
+
+	var totalCatAllocation float64
+	for _, ec := range existingCats {
+		totalCatAllocation += ec.AllocationPercent
+	}
+	if totalCatAllocation+req.AllocationPercent > sectionAllocation {
+		return errBadRequest(c, "total category allocation would exceed section allocation")
+	}
+
 	now := time.Now().UTC()
 	catID := uuid.New()
 
@@ -153,6 +198,57 @@ func UpdateCategory(c *fiber.Ctx) error {
 	}
 
 	cat := cats[0]
+
+	// Validate that updated total category allocation won't exceed the section's allocation.
+	if req.AllocationPercent != nil {
+		secQuery := database.NewFilter().
+			Select("allocation_percent").
+			Eq("id", sectionID.String()).
+			Eq("budget_id", budgetID.String()).
+			Build()
+
+		secBody, secStatus, secErr := database.DB.Get("budget_categories", secQuery)
+		if secErr != nil || secStatus != http.StatusOK {
+			return errInternal(c, "failed to fetch section allocation")
+		}
+
+		var parentSecs []struct {
+			AllocationPercent float64 `json:"allocation_percent"`
+		}
+		if err := json.Unmarshal(secBody, &parentSecs); err != nil || len(parentSecs) == 0 {
+			return errInternal(c, "failed to parse section allocation")
+		}
+		secAllocation := parentSecs[0].AllocationPercent
+
+		allCatQuery := database.NewFilter().
+			Select("id,allocation_percent").
+			Eq("category_id", sectionID.String()).
+			Build()
+
+		allCatBody, allCatStatus, allCatErr := database.DB.Get("budget_subcategories", allCatQuery)
+		if allCatErr != nil || allCatStatus != http.StatusOK {
+			return errInternal(c, "failed to check existing category allocations")
+		}
+
+		var allCats []struct {
+			ID                string  `json:"id"`
+			AllocationPercent float64 `json:"allocation_percent"`
+		}
+		if err := json.Unmarshal(allCatBody, &allCats); err != nil {
+			return errInternal(c, "failed to parse existing category allocations")
+		}
+
+		var totalCatAlloc float64
+		for _, ac := range allCats {
+			if ac.ID == catID.String() {
+				continue // exclude the category being updated
+			}
+			totalCatAlloc += ac.AllocationPercent
+		}
+		if totalCatAlloc+*req.AllocationPercent > secAllocation {
+			return errBadRequest(c, "total category allocation would exceed section allocation")
+		}
+	}
 
 	// Apply partial updates.
 	if req.Name != nil {

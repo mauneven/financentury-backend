@@ -47,21 +47,33 @@ func ListCollaborators(c *fiber.Ctx) error {
 		collaborators = make([]models.Collaborator, 0)
 	}
 
-	// Enrich each collaborator with their profile info.
-	for i, collab := range collaborators {
+	// Batch-fetch all collaborator profiles in a single query instead of N+1.
+	if len(collaborators) > 0 {
+		userIDs := make([]string, len(collaborators))
+		for i, collab := range collaborators {
+			userIDs[i] = collab.UserID.String()
+		}
+
 		profileQuery := database.NewFilter().
 			Select("id,email,full_name,avatar_url,created_at,updated_at").
-			Eq("id", collab.UserID.String()).
+			In("id", userIDs).
 			Build()
 
 		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
-		if profileErr != nil || profileStatus != http.StatusOK {
-			continue
-		}
-
-		var profiles []models.Profile
-		if err := json.Unmarshal(profileBody, &profiles); err == nil && len(profiles) > 0 {
-			collaborators[i].Profile = &profiles[0]
+		if profileErr == nil && profileStatus == http.StatusOK {
+			var profiles []models.Profile
+			if err := json.Unmarshal(profileBody, &profiles); err == nil {
+				// Index profiles by ID for O(1) lookup.
+				profileMap := make(map[string]*models.Profile, len(profiles))
+				for i := range profiles {
+					profileMap[profiles[i].ID.String()] = &profiles[i]
+				}
+				for i := range collaborators {
+					if p, ok := profileMap[collaborators[i].UserID.String()]; ok {
+						collaborators[i].Profile = p
+					}
+				}
+			}
 		}
 	}
 

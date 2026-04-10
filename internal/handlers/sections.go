@@ -142,6 +142,32 @@ func CreateSection(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	// Validate that total allocation across all sections won't exceed 100%.
+	existingQuery := database.NewFilter().
+		Select("allocation_percent").
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	existingBody, existingStatus, existingErr := database.DB.Get("budget_categories", existingQuery)
+	if existingErr != nil || existingStatus != http.StatusOK {
+		return errInternal(c, "failed to check existing allocations")
+	}
+
+	var existingSections []struct {
+		AllocationPercent float64 `json:"allocation_percent"`
+	}
+	if err := json.Unmarshal(existingBody, &existingSections); err != nil {
+		return errInternal(c, "failed to parse existing allocations")
+	}
+
+	var totalAllocation float64
+	for _, s := range existingSections {
+		totalAllocation += s.AllocationPercent
+	}
+	if totalAllocation+req.AllocationPercent > 100 {
+		return errBadRequest(c, "total allocation would exceed 100%")
+	}
+
 	now := time.Now().UTC()
 	sectionID := uuid.New()
 
@@ -238,6 +264,38 @@ func UpdateSection(c *fiber.Ctx) error {
 	}
 
 	section := sections[0]
+
+	// Validate that updated total allocation across all sections won't exceed 100%.
+	if req.AllocationPercent != nil {
+		allQuery := database.NewFilter().
+			Select("id,allocation_percent").
+			Eq("budget_id", budgetID.String()).
+			Build()
+
+		allBody, allStatus, allErr := database.DB.Get("budget_categories", allQuery)
+		if allErr != nil || allStatus != http.StatusOK {
+			return errInternal(c, "failed to check existing allocations")
+		}
+
+		var allSections []struct {
+			ID                string  `json:"id"`
+			AllocationPercent float64 `json:"allocation_percent"`
+		}
+		if err := json.Unmarshal(allBody, &allSections); err != nil {
+			return errInternal(c, "failed to parse existing allocations")
+		}
+
+		var totalAllocation float64
+		for _, s := range allSections {
+			if s.ID == sectionID.String() {
+				continue // exclude the section being updated
+			}
+			totalAllocation += s.AllocationPercent
+		}
+		if totalAllocation+*req.AllocationPercent > 100 {
+			return errBadRequest(c, "total allocation would exceed 100%")
+		}
+	}
 
 	// Apply partial updates.
 	if req.Name != nil {

@@ -142,8 +142,8 @@ func TestMaxNameLength(t *testing.T) {
 }
 
 func TestMaxDescriptionLength(t *testing.T) {
-	if maxDescriptionLength != 1000 {
-		t.Errorf("maxDescriptionLength = %d, want 1000", maxDescriptionLength)
+	if maxDescriptionLength != 500 {
+		t.Errorf("maxDescriptionLength = %d, want 500", maxDescriptionLength)
 	}
 }
 

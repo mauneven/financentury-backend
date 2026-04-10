@@ -72,6 +72,10 @@ func WebSocketHandler() fiber.Handler {
 			return
 		}
 
+		// Limit incoming WebSocket message size to prevent memory exhaustion
+		// from oversized or malicious payloads.
+		c.Conn.SetReadLimit(4096)
+
 		client := &ws.Client{
 			Conn:   c.Conn,
 			UserID: userID,

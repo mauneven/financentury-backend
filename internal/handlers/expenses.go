@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,6 +12,31 @@ import (
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
+
+// parsePaginationParams extracts limit and offset from query params with
+// sensible defaults (limit=100, offset=0) and a hard ceiling (limit<=500).
+func parsePaginationParams(c *fiber.Ctx) (limit, offset int) {
+	const defaultLimit = 100
+	const maxLimit = 500
+
+	limit = defaultLimit
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+
+	offset = 0
+	if v := c.Query("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	return limit, offset
+}
 
 // ListExpenses returns all expenses for a budget, ordered by date descending.
 func ListExpenses(c *fiber.Ctx) error {
@@ -28,10 +54,14 @@ func ListExpenses(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	limit, offset := parsePaginationParams(c)
+
 	query := database.NewFilter().
-		Select("*").
+		Select("id,budget_id,subcategory_id,amount,description,expense_date,created_by,created_at,updated_at").
 		Eq("budget_id", budgetID.String()).
 		Order("expense_date", "desc").
+		Limit(limit).
+		Offset(offset).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)
@@ -80,7 +110,7 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "amount exceeds maximum allowed value")
 	}
 	if len(req.Description) > maxDescriptionLength {
-		return errBadRequest(c, "description too long (max 1000 characters)")
+		return errBadRequest(c, "description too long (max 500 characters)")
 	}
 	if req.ExpenseDate == "" {
 		req.ExpenseDate = time.Now().UTC().Format(dateFormat)
@@ -171,7 +201,7 @@ func UpdateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "amount exceeds maximum allowed value")
 	}
 	if req.Description != nil && len(*req.Description) > maxDescriptionLength {
-		return errBadRequest(c, "description too long (max 1000 characters)")
+		return errBadRequest(c, "description too long (max 500 characters)")
 	}
 	if req.ExpenseDate != nil {
 		if *req.ExpenseDate == "" {

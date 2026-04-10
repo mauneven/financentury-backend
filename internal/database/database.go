@@ -253,6 +253,12 @@ func (f *Filter) Limit(n int) *Filter {
 	return f
 }
 
+// Offset skips the first n rows. Used together with Limit for pagination.
+func (f *Filter) Offset(n int) *Filter {
+	f.params = append(f.params, fmt.Sprintf("offset=%d", n))
+	return f
+}
+
 // Build returns the assembled query string.
 func (f *Filter) Build() string {
 	return strings.Join(f.params, "&")

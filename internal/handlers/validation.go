@@ -19,7 +19,8 @@ const (
 	// maxNameLength is the upper bound for name fields (budgets, sections, categories).
 	maxNameLength = 200
 	// maxDescriptionLength is the upper bound for description fields.
-	maxDescriptionLength = 1000
+	// Aligned with frontend limit of 500 characters.
+	maxDescriptionLength = 500
 	// maxIconLength is the upper bound for icon/emoji fields.
 	maxIconLength = 50
 	// maxCurrencyLength is the expected length for ISO currency codes.

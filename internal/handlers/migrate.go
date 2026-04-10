@@ -316,7 +316,7 @@ func validateMigrateExpense(me MigrateExpense) error {
 		return fiber.NewError(fiber.StatusBadRequest, "expense amount exceeds maximum allowed value")
 	}
 	if len(me.Description) > maxDescriptionLength {
-		return fiber.NewError(fiber.StatusBadRequest, "expense description too long (max 1000 characters)")
+		return fiber.NewError(fiber.StatusBadRequest, "expense description too long (max 500 characters)")
 	}
 	if me.ExpenseDate != "" && !isValidDate(me.ExpenseDate) {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid expense date format, use YYYY-MM-DD")
