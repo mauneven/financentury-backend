@@ -275,6 +275,12 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	totalBudget = roundAmount(totalBudget)
 	totalSpent = roundAmount(totalSpent)
 
+	// If no sections have been allocated yet, show the full monthly income
+	// as the budget total so the dashboard doesn't appear completely empty.
+	if totalBudget == 0 && budget.MonthlyIncome > 0 {
+		totalBudget = roundAmount(budget.MonthlyIncome)
+	}
+
 	resp := models.BudgetSummary{
 		Budget:      *budget,
 		Sections:    sectionSummaries,
