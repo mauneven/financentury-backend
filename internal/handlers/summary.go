@@ -223,12 +223,16 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	}
 
 	// 7. Build the response.
-	var totalBudget, totalSpent float64
+	// total_budget is ALWAYS the budget's monthly_income – it is the true
+	// budget amount the user configured.  Section allocations are portions of
+	// this total; summing them would only equal monthly_income when 100% is
+	// allocated and would be wrong otherwise.
+	totalBudget := roundAmount(budget.MonthlyIncome)
+	var totalSpent float64
 
 	sectionSummaries := make([]models.SectionSummary, 0, len(sections))
 	for _, section := range sections {
 		sectionAllocated := roundAmount(budget.MonthlyIncome * section.AllocationPercent / 100)
-		totalBudget += sectionAllocated
 
 		cats := catsBySection[section.ID]
 		catSummaries := make([]models.CategorySummary, 0, len(cats))
@@ -272,14 +276,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		})
 	}
 
-	totalBudget = roundAmount(totalBudget)
 	totalSpent = roundAmount(totalSpent)
-
-	// If no sections have been allocated yet, show the full monthly income
-	// as the budget total so the dashboard doesn't appear completely empty.
-	if totalBudget == 0 && budget.MonthlyIncome > 0 {
-		totalBudget = roundAmount(budget.MonthlyIncome)
-	}
 
 	resp := models.BudgetSummary{
 		Budget:      *budget,
