@@ -135,7 +135,7 @@ func UpdateCategory(c *fiber.Ctx) error {
 		return errNotFound(c, "section not found")
 	}
 
-	// Fetch existing category from budget_subcategories table.
+	// Fetch existing category from the categories table.
 	getQuery := database.NewFilter().
 		Select("*").
 		Eq("id", catID.String()).

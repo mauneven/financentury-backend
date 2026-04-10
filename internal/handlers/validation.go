@@ -192,7 +192,7 @@ func verifySectionOwnership(budgetID, sectionID, userID uuid.UUID) error {
 	return nil
 }
 
-// verifyCategoryBelongsToBudget verifies that a subcategory (by its ID)
+// verifyCategoryBelongsToBudget verifies that a category (by its ID)
 // ultimately belongs to the given budget by checking its parent section.
 func verifyCategoryBelongsToBudget(categoryID, budgetID uuid.UUID) error {
 	catQuery := database.NewFilter().

@@ -205,8 +205,8 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		catsBySection[cat.CategoryID] = append(catsBySection[cat.CategoryID], cat)
 	}
 
-	// 6. Aggregate expenses by subcategory_id. Pre-size to the number of
-	//    categories since that is the upper bound of distinct subcategory IDs.
+	// 6. Aggregate expenses by category_id. Pre-size to the number of
+	//    categories since that is the upper bound of distinct category IDs.
 	type expenseAgg struct {
 		totalSpent float64
 		count      int
@@ -330,7 +330,7 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 
 	g.Go(func() error {
 		var fetchErr error
-		// For trends we only need subcategory_id, amount, and expense_date.
+		// For trends we only need category_id, amount, and expense_date.
 		allExpenses, fetchErr = fetchExpensesForTrends(budgetID)
 		if fetchErr != nil {
 			return fmt.Errorf("fetch expenses: %w", fetchErr)
@@ -357,7 +357,7 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		}
 	}
 
-	// Map subcategory -> parent section.
+	// Map category -> parent section.
 	subcatToSection := make(map[uuid.UUID]uuid.UUID, len(categories))
 	for _, cat := range categories {
 		subcatToSection[cat.ID] = cat.CategoryID
@@ -543,7 +543,7 @@ func fetchAllExpenses(budgetID uuid.UUID) ([]models.Expense, error) {
 }
 
 // fetchAllExpensesForSummary loads only the columns needed for budget summary
-// aggregation (subcategory_id, amount) for ALL expenses (no date filter).
+// aggregation (category_id, amount) for ALL expenses (no date filter).
 // Used for one-time budgets where every expense counts toward the total.
 func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
@@ -567,7 +567,7 @@ func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 }
 
 // fetchExpensesForSummary loads only the columns needed for budget summary
-// aggregation (subcategory_id, amount) within the current billing period.
+// aggregation (category_id, amount) within the current billing period.
 // Fetching fewer columns reduces data transfer for budgets with many expenses.
 func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]models.Expense, error) {
 	query := database.NewFilter().
@@ -592,7 +592,7 @@ func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]model
 }
 
 // fetchExpensesForTrends loads only the columns needed for trends aggregation
-// (subcategory_id, amount, expense_date) for all time. Ordering is unnecessary
+// (category_id, amount, expense_date) for all time. Ordering is unnecessary
 // since we aggregate by date in Go.
 func fetchExpensesForTrends(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().

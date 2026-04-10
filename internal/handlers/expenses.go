@@ -71,7 +71,7 @@ func CreateExpense(c *fiber.Ctx) error {
 
 	// Validate required fields.
 	if req.CategoryID == uuid.Nil {
-		return errBadRequest(c, "subcategory_id is required")
+		return errBadRequest(c, "category_id is required")
 	}
 	if req.Amount <= 0 {
 		return errBadRequest(c, "amount must be positive")

@@ -386,7 +386,7 @@ func TestAllocationMath_CorrectFormula(t *testing.T) {
 // ---------- Template Sections Validation ----------
 
 // TestAllTemplates_CategoriesSumTo100 verifies that every template's
-// sub-category percentages within each section sum to 100.
+// category percentages within each section sum to 100.
 func TestAllTemplates_CategoriesSumTo100(t *testing.T) {
 	templates := map[string][]guidedSection{
 		"balanced":   getBalancedSections(),
@@ -570,6 +570,129 @@ func TestSortMonthlyTrends_SingleElement(t *testing.T) {
 	sortMonthlyTrends(trends)
 	if trends[0].Month != "2026-01-01" {
 		t.Error("single element sort failed")
+	}
+}
+
+func TestSortMonthlyTrends_AlreadySorted(t *testing.T) {
+	trends := []models.MonthlyTrend{
+		{Month: "2026-01-01", TotalSpent: 100},
+		{Month: "2026-02-01", TotalSpent: 200},
+		{Month: "2026-03-01", TotalSpent: 300},
+	}
+	sortMonthlyTrends(trends)
+	expected := []string{"2026-01-01", "2026-02-01", "2026-03-01"}
+	for i, want := range expected {
+		if trends[i].Month != want {
+			t.Errorf("already sorted: index %d = %v, want %v", i, trends[i].Month, want)
+		}
+	}
+}
+
+func TestSortMonthlyTrends_ReverseSorted(t *testing.T) {
+	trends := []models.MonthlyTrend{
+		{Month: "2026-03-01", TotalSpent: 300},
+		{Month: "2026-02-01", TotalSpent: 200},
+		{Month: "2026-01-01", TotalSpent: 100},
+	}
+	sortMonthlyTrends(trends)
+	expected := []string{"2026-01-01", "2026-02-01", "2026-03-01"}
+	for i, want := range expected {
+		if trends[i].Month != want {
+			t.Errorf("reverse sorted: index %d = %v, want %v", i, trends[i].Month, want)
+		}
+	}
+	// Verify amounts followed the dates.
+	if trends[0].TotalSpent != 100 || trends[2].TotalSpent != 300 {
+		t.Error("amounts should follow their dates after sorting")
+	}
+}
+
+func TestSortMonthlyTrends_DuplicateDates(t *testing.T) {
+	trends := []models.MonthlyTrend{
+		{Month: "2026-02-01", TotalSpent: 50},
+		{Month: "2026-01-01", TotalSpent: 100},
+		{Month: "2026-02-01", TotalSpent: 75},
+	}
+	sortMonthlyTrends(trends)
+	if trends[0].Month != "2026-01-01" {
+		t.Errorf("first should be 2026-01-01, got %v", trends[0].Month)
+	}
+	if trends[1].Month != "2026-02-01" || trends[2].Month != "2026-02-01" {
+		t.Error("duplicate dates should both appear")
+	}
+}
+
+// ---------- roundAmount Additional Edge Cases ----------
+
+func TestRoundAmount_LargeValues(t *testing.T) {
+	// Verify roundAmount handles large monetary values typical of COP.
+	got := roundAmount(5000000.0 * 50.0 / 100.0)
+	if got != 2500000.0 {
+		t.Errorf("roundAmount(5000000*50/100) = %v, want 2500000", got)
+	}
+}
+
+func TestRoundAmount_RepeatingDecimal(t *testing.T) {
+	// 1/3 = 0.333... rounded to 2 decimal places = 0.33
+	got := roundAmount(1.0 / 3.0)
+	if got != 0.33 {
+		t.Errorf("roundAmount(1/3) = %v, want 0.33", got)
+	}
+}
+
+func TestRoundAmount_HalfCent(t *testing.T) {
+	// 0.005 should round to 0.01 (banker's rounding in math.Round)
+	got := roundAmount(0.005)
+	if got != 0.01 {
+		t.Errorf("roundAmount(0.005) = %v, want 0.01", got)
+	}
+}
+
+// ---------- shiftMonths Tests ----------
+
+func TestShiftMonths_Forward(t *testing.T) {
+	d := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	got := shiftMonths(d, 3, 15)
+	want := time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("shiftMonths forward 3: got %v, want %v", got, want)
+	}
+}
+
+func TestShiftMonths_BackwardAcrossYear(t *testing.T) {
+	d := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	got := shiftMonths(d, -3, 1)
+	want := time.Date(2025, 11, 1, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("shiftMonths back 3 across year: got %v, want %v", got, want)
+	}
+}
+
+func TestShiftMonths_ClampToShorterMonth(t *testing.T) {
+	// Shifting from Jan 31 forward to Feb should clamp to Feb 28.
+	d := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
+	got := shiftMonths(d, 1, 31)
+	want := time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("shiftMonths Jan31 -> Feb: got %v, want %v", got, want)
+	}
+}
+
+func TestShiftMonths_ZeroShift(t *testing.T) {
+	d := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	got := shiftMonths(d, 0, 15)
+	want := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("shiftMonths zero: got %v, want %v", got, want)
+	}
+}
+
+func TestShiftMonths_BackMultipleYears(t *testing.T) {
+	d := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	got := shiftMonths(d, -24, 1) // 2 years back
+	want := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("shiftMonths back 24: got %v, want %v", got, want)
 	}
 }
 

@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,7 +44,7 @@ type Section struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
-// Category represents a budget category (child of a Section, stored in budget_subcategories table).
+// Category represents a budget category (child of a Section, stored in the categories table).
 type Category struct {
 	ID                uuid.UUID `json:"id"`
 	CategoryID        uuid.UUID `json:"category_id"`
@@ -58,13 +59,34 @@ type Category struct {
 type Expense struct {
 	ID          uuid.UUID  `json:"id"`
 	BudgetID    uuid.UUID  `json:"budget_id"`
-	CategoryID  uuid.UUID  `json:"subcategory_id"`
+	CategoryID  uuid.UUID  `json:"category_id"`
 	Amount      float64    `json:"amount"`
 	Description string     `json:"description"`
 	ExpenseDate string     `json:"expense_date"`
 	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// UnmarshalJSON handles both the DB column name (subcategory_id) and the
+// canonical API field name (category_id) so that expenses read from the
+// database deserialize correctly even though the DB column has not been
+// renamed yet.
+func (e *Expense) UnmarshalJSON(data []byte) error {
+	type Alias Expense
+	aux := &struct {
+		*Alias
+		SubcategoryID *uuid.UUID `json:"subcategory_id,omitempty"`
+	}{Alias: (*Alias)(e)}
+
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	// If category_id was not set but subcategory_id was, use subcategory_id.
+	if e.CategoryID == uuid.Nil && aux.SubcategoryID != nil {
+		e.CategoryID = *aux.SubcategoryID
+	}
+	return nil
 }
 
 // Collaborator represents a budget collaborator.
@@ -154,7 +176,7 @@ type UpdateCategoryRequest struct {
 
 // CreateExpenseRequest is the payload for creating an expense.
 type CreateExpenseRequest struct {
-	CategoryID  uuid.UUID `json:"subcategory_id"`
+	CategoryID  uuid.UUID `json:"category_id"`
 	Amount      float64   `json:"amount"`
 	Description string    `json:"description"`
 	ExpenseDate string    `json:"expense_date"`
@@ -162,7 +184,7 @@ type CreateExpenseRequest struct {
 
 // UpdateExpenseRequest is the payload for updating an expense.
 type UpdateExpenseRequest struct {
-	CategoryID  *uuid.UUID `json:"subcategory_id,omitempty"`
+	CategoryID  *uuid.UUID `json:"category_id,omitempty"`
 	Amount      *float64   `json:"amount,omitempty"`
 	Description *string    `json:"description,omitempty"`
 	ExpenseDate *string    `json:"expense_date,omitempty"`

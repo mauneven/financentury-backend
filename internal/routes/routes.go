@@ -25,7 +25,7 @@ func Setup(app *fiber.App) {
 	api.Get("/invites/:token", handlers.GetInviteInfo)
 
 	// Protected routes.
-	protected := api.Group("", middleware.Protected())
+	protected := api.Group("", middleware.Protected(), middleware.APIRateLimiter())
 
 	// Auth routes (protected -- requires valid JWT).
 	protected.Get("/auth/me", handlers.Me)
