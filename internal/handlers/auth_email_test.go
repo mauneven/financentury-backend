@@ -109,6 +109,31 @@ func TestRegisterValidation_ShortPassword(t *testing.T) {
 	}
 }
 
+func TestRegisterValidation_PasswordMaxBytes(t *testing.T) {
+	// Passwords exceeding bcrypt's 72-byte limit should be rejected.
+	tests := []struct {
+		name     string
+		password string
+		valid    bool
+	}{
+		{"exactly 72 bytes", string(make([]byte, 72)), true},
+		{"73 bytes", string(make([]byte, 73)), false},
+		{"100 bytes", string(make([]byte, 100)), false},
+	}
+
+	for _, tt := range tests {
+		// Fill with valid ASCII so len(password) >= 8.
+		pw := make([]byte, len(tt.password))
+		for i := range pw {
+			pw[i] = 'a'
+		}
+		valid := len(pw) >= 8 && len(pw) <= maxPasswordBytes
+		if valid != tt.valid {
+			t.Errorf("%s: expected valid=%v, got %v (len=%d)", tt.name, tt.valid, valid, len(pw))
+		}
+	}
+}
+
 // --- Login validation tests ---
 
 func TestLoginValidation_EmptyFields(t *testing.T) {
@@ -135,10 +160,17 @@ func TestLoginValidation_EmptyFields(t *testing.T) {
 
 // --- Bcrypt round-trip tests ---
 
+func TestBcryptCostConstant(t *testing.T) {
+	// Verify the bcrypt cost is set to 12 for the financial app.
+	if bcryptCost != 12 {
+		t.Errorf("expected bcryptCost=12, got %d", bcryptCost)
+	}
+}
+
 func TestBcryptHashRoundTrip(t *testing.T) {
 	password := "mySecurePassword123"
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		t.Fatalf("bcrypt.GenerateFromPassword failed: %v", err)
 	}
@@ -157,11 +189,11 @@ func TestBcryptHashRoundTrip(t *testing.T) {
 func TestBcryptHashUniqueness(t *testing.T) {
 	password := "samePassword"
 
-	hash1, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash1, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		t.Fatalf("first hash failed: %v", err)
 	}
-	hash2, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash2, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		t.Fatalf("second hash failed: %v", err)
 	}
@@ -196,6 +228,60 @@ func TestProfileWithPasswordUnmarshal(t *testing.T) {
 	}
 	if p.ID.String() != "550e8400-e29b-41d4-a716-446655440000" {
 		t.Errorf("unexpected ID: %s", p.ID)
+	}
+}
+
+// --- Per-email rate limiter tests ---
+
+func TestEmailRateLimit_AllowsUpToMax(t *testing.T) {
+	email := "ratelimit-test-allow@example.com"
+	defer clearLoginAttempts(email)
+
+	for i := 0; i < maxLoginAttemptsPerEmail; i++ {
+		if checkEmailRateLimit(email) {
+			t.Fatalf("should not be rate-limited after %d attempts", i)
+		}
+		recordFailedLogin(email)
+	}
+	// Now should be limited.
+	if !checkEmailRateLimit(email) {
+		t.Error("should be rate-limited after max attempts")
+	}
+}
+
+func TestEmailRateLimit_ClearsOnSuccess(t *testing.T) {
+	email := "ratelimit-test-clear@example.com"
+	defer clearLoginAttempts(email)
+
+	for i := 0; i < maxLoginAttemptsPerEmail; i++ {
+		recordFailedLogin(email)
+	}
+	if !checkEmailRateLimit(email) {
+		t.Fatal("should be rate-limited")
+	}
+
+	clearLoginAttempts(email)
+
+	if checkEmailRateLimit(email) {
+		t.Error("should not be rate-limited after clearing")
+	}
+}
+
+func TestEmailRateLimit_DifferentEmails(t *testing.T) {
+	email1 := "ratelimit-test-a@example.com"
+	email2 := "ratelimit-test-b@example.com"
+	defer clearLoginAttempts(email1)
+	defer clearLoginAttempts(email2)
+
+	for i := 0; i < maxLoginAttemptsPerEmail; i++ {
+		recordFailedLogin(email1)
+	}
+
+	if !checkEmailRateLimit(email1) {
+		t.Error("email1 should be rate-limited")
+	}
+	if checkEmailRateLimit(email2) {
+		t.Error("email2 should not be rate-limited")
 	}
 }
 

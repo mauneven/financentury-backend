@@ -20,6 +20,10 @@ type SectionWithCategories struct {
 }
 
 // ListSections returns all sections (each with its categories) for a budget.
+//
+// Categories are fetched in a single batched query using an IN filter on
+// section IDs, replacing the previous N+1 pattern that issued one query per
+// section.
 func ListSections(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -56,29 +60,44 @@ func ListSections(c *fiber.Ctx) error {
 		sections = make([]models.Section, 0)
 	}
 
-	// Build response with categories per section.
-	result := make([]SectionWithCategories, 0, len(sections))
-	for _, section := range sections {
+	// Batch-fetch all categories for every section in one query instead of
+	// issuing one query per section (N+1 elimination).
+	catsBySection := make(map[uuid.UUID][]models.Category, len(sections))
+
+	if len(sections) > 0 {
+		sectionIDs := make([]string, len(sections))
+		for i, s := range sections {
+			sectionIDs[i] = s.ID.String()
+		}
+
 		catQuery := database.NewFilter().
 			Select("*").
-			Eq("category_id", section.ID.String()).
+			In("category_id", sectionIDs).
 			Order("sort_order", "asc").
 			Build()
 
-		catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
-		if err != nil || statusCode != http.StatusOK {
+		catBody, catStatus, catErr := database.DB.Get("budget_subcategories", catQuery)
+		if catErr != nil || catStatus != http.StatusOK {
 			return errInternal(c, "failed to fetch categories")
 		}
 
-		var cats []models.Category
-		if err := json.Unmarshal(catBody, &cats); err != nil {
+		var allCats []models.Category
+		if err := json.Unmarshal(catBody, &allCats); err != nil {
 			return errInternal(c, "failed to parse categories")
 		}
 
+		for _, cat := range allCats {
+			catsBySection[cat.CategoryID] = append(catsBySection[cat.CategoryID], cat)
+		}
+	}
+
+	// Build response with categories grouped under their parent section.
+	result := make([]SectionWithCategories, 0, len(sections))
+	for _, section := range sections {
+		cats := catsBySection[section.ID]
 		if cats == nil {
 			cats = make([]models.Category, 0)
 		}
-
 		result = append(result, SectionWithCategories{
 			Section:    section,
 			Categories: cats,

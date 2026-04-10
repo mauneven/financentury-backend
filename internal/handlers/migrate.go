@@ -140,7 +140,7 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 		mb.Mode = "manual"
 	}
 	if !validBudgetModes[mb.Mode] {
-		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid mode, must be 'manual' or 'guided'")
+		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid mode")
 	}
 	if len(mb.Currency) != maxCurrencyLength {
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid currency code")

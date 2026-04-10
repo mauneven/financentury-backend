@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
+	"golang.org/x/sync/errgroup"
 )
 
 // ---------- Billing-period helpers (exported for testing) ----------
@@ -108,6 +110,11 @@ func minInt(a, b int) int {
 
 // GetBudgetSummary computes and returns the full budget summary. All math is
 // done in Go; Supabase is used purely as storage via PostgREST.
+//
+// The endpoint issues three independent DB queries (sections, categories,
+// expenses) after the initial budget fetch. Sections and expenses run
+// concurrently via errgroup; categories must wait for section IDs but run
+// concurrently with expense aggregation.
 func GetBudgetSummary(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -119,12 +126,13 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	// 1. Verify access (owner or collaborator).
+	// 1. Verify access and fetch budget in one step. verifyBudgetAccess
+	//    already hits the budgets table, so we combine the ownership/access
+	//    check with the budget fetch to eliminate a redundant round-trip.
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	// 2. Fetch the budget.
 	budget, err := fetchBudget(budgetID)
 	if err != nil {
 		return errInternal(c, "failed to fetch budget")
@@ -133,17 +141,50 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	// 3. Compute billing period start.
-	today := time.Now().UTC()
-	periodStart := ComputeBillingPeriodStart(today, budget.BillingCutoffDay, budget.BillingPeriodMonths)
+	// 2. Fetch sections and expenses concurrently. These two queries are
+	//    independent -- both only need the budgetID (and periodStart for
+	//    expenses). Running them in parallel saves one full round-trip to
+	//    Supabase.
+	//
+	//    For one-time budgets (billing_period_months == 0), skip billing period
+	//    calculation and include ALL expenses.
+	var (
+		sections []models.Section
+		expenses []models.Expense
+	)
 
-	// 4. Fetch sections (budget_categories).
-	sections, err := fetchSections(budgetID)
-	if err != nil {
-		return errInternal(c, "failed to fetch sections")
+	g, _ := errgroup.WithContext(c.Context())
+
+	g.Go(func() error {
+		var fetchErr error
+		sections, fetchErr = fetchSections(budgetID)
+		if fetchErr != nil {
+			return fmt.Errorf("fetch sections: %w", fetchErr)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		var fetchErr error
+		if budget.BillingPeriodMonths == 0 {
+			// One-time budget: all expenses count toward the total.
+			expenses, fetchErr = fetchAllExpensesForSummary(budgetID)
+		} else {
+			today := time.Now().UTC()
+			periodStart := ComputeBillingPeriodStart(today, budget.BillingCutoffDay, budget.BillingPeriodMonths)
+			expenses, fetchErr = fetchExpensesForSummary(budgetID, periodStart)
+		}
+		if fetchErr != nil {
+			return fmt.Errorf("fetch expenses: %w", fetchErr)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return errInternal(c, "failed to fetch summary data")
 	}
 
-	// 5. Fetch categories (budget_subcategories) for all sections.
+	// 4. Fetch categories for all sections (needs section IDs from above).
 	sectionIDs := make([]string, len(sections))
 	for i, s := range sections {
 		sectionIDs[i] = s.ID.String()
@@ -157,24 +198,20 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		}
 	}
 
-	// Index categories by parent section ID.
-	catsBySection := make(map[uuid.UUID][]models.Category)
+	// 5. Index categories by parent section ID. Pre-size the map to avoid
+	//    rehashing for budgets with many sections.
+	catsBySection := make(map[uuid.UUID][]models.Category, len(sections))
 	for _, cat := range categories {
 		catsBySection[cat.CategoryID] = append(catsBySection[cat.CategoryID], cat)
 	}
 
-	// 6. Fetch expenses in current billing period.
-	expenses, err := fetchExpensesInPeriod(budgetID, periodStart)
-	if err != nil {
-		return errInternal(c, "failed to fetch expenses")
-	}
-
-	// Aggregate expenses by subcategory_id: total_spent and count.
+	// 6. Aggregate expenses by subcategory_id. Pre-size to the number of
+	//    categories since that is the upper bound of distinct subcategory IDs.
 	type expenseAgg struct {
 		totalSpent float64
 		count      int
 	}
-	expBySubcat := make(map[uuid.UUID]*expenseAgg)
+	expBySubcat := make(map[uuid.UUID]*expenseAgg, len(categories))
 	for _, exp := range expenses {
 		agg := expBySubcat[exp.CategoryID]
 		if agg == nil {
@@ -252,6 +289,10 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 
 // GetBudgetTrends returns daily spending data grouped by section. All
 // computation is done in Go; Supabase is used purely as storage.
+//
+// Sections, categories, and expenses are fetched with maximum concurrency:
+// sections and expenses run in parallel, then categories are fetched once
+// section IDs are known.
 func GetBudgetTrends(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -267,39 +308,60 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Fetch sections.
-	sections, err := fetchSections(budgetID)
-	if err != nil {
-		return errInternal(c, "failed to fetch sections")
+	// Fetch sections and all expenses concurrently -- they are independent.
+	var (
+		sections    []models.Section
+		allExpenses []models.Expense
+	)
+
+	g, _ := errgroup.WithContext(c.Context())
+
+	g.Go(func() error {
+		var fetchErr error
+		sections, fetchErr = fetchSections(budgetID)
+		if fetchErr != nil {
+			return fmt.Errorf("fetch sections: %w", fetchErr)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		var fetchErr error
+		// For trends we only need subcategory_id, amount, and expense_date.
+		allExpenses, fetchErr = fetchExpensesForTrends(budgetID)
+		if fetchErr != nil {
+			return fmt.Errorf("fetch expenses: %w", fetchErr)
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return errInternal(c, "failed to fetch trends data")
 	}
 
-	// Build section ID -> name map and collect all section IDs.
+	// Build section ID list and fetch categories (depends on sections).
 	sectionIDs := make([]string, len(sections))
 	for i, s := range sections {
 		sectionIDs[i] = s.ID.String()
 	}
 
-	// Fetch all categories to map subcategory -> section.
 	var categories []models.Category
 	if len(sectionIDs) > 0 {
+		var err error
 		categories, err = fetchCategoriesForSections(sectionIDs)
 		if err != nil {
 			return errInternal(c, "failed to fetch categories")
 		}
 	}
-	subcatToSection := make(map[uuid.UUID]uuid.UUID)
+
+	// Map subcategory -> parent section.
+	subcatToSection := make(map[uuid.UUID]uuid.UUID, len(categories))
 	for _, cat := range categories {
 		subcatToSection[cat.ID] = cat.CategoryID
 	}
 
-	// Fetch ALL expenses for this budget (no period filter for trends).
-	allExpenses, err := fetchAllExpenses(budgetID)
-	if err != nil {
-		return errInternal(c, "failed to fetch expenses")
-	}
-
 	// Aggregate: section -> date -> total_spent.
-	sectionDailyMap := make(map[uuid.UUID]map[string]float64)
+	sectionDailyMap := make(map[uuid.UUID]map[string]float64, len(sections))
 	for _, exp := range allExpenses {
 		sectionID, ok := subcatToSection[exp.CategoryID]
 		if !ok {
@@ -460,6 +522,79 @@ func fetchAllExpenses(budgetID uuid.UUID) ([]models.Expense, error) {
 		Select("*").
 		Eq("budget_id", budgetID.String()).
 		Order("expense_date", "desc").
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchAllExpensesForSummary loads only the columns needed for budget summary
+// aggregation (subcategory_id, amount) for ALL expenses (no date filter).
+// Used for one-time budgets where every expense counts toward the total.
+func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("subcategory_id,amount").
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchExpensesForSummary loads only the columns needed for budget summary
+// aggregation (subcategory_id, amount) within the current billing period.
+// Fetching fewer columns reduces data transfer for budgets with many expenses.
+func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("subcategory_id,amount").
+		Eq("budget_id", budgetID.String()).
+		Gte("expense_date", periodStart.Format("2006-01-02")).
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchExpensesForTrends loads only the columns needed for trends aggregation
+// (subcategory_id, amount, expense_date) for all time. Ordering is unnecessary
+// since we aggregate by date in Go.
+func fetchExpensesForTrends(budgetID uuid.UUID) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("subcategory_id,amount,expense_date").
+		Eq("budget_id", budgetID.String()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)

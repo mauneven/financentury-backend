@@ -65,6 +65,79 @@ func getGuidedSections() []guidedSection {
 	}
 }
 
+// getAggressiveSections returns the 70/20/10 aggressive savings template.
+// Category Percent values represent the percentage of the PARENT SECTION.
+func getAggressiveSections() []guidedSection {
+	return []guidedSection{
+		{
+			Name: "Necesidades", Percent: 70, Icon: "home", SortOrder: 1,
+			Categories: []guidedCategory{
+				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
+				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
+				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
+				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
+			},
+		},
+		{
+			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 2,
+			Categories: []guidedCategory{
+				{Name: "Fondo de emergencia", Percent: 50, Icon: "landmark", SortOrder: 1},
+				{Name: "Inversión", Percent: 50, Icon: "trending", SortOrder: 2},
+			},
+		},
+		{
+			Name: "Deseos", Percent: 10, Icon: "party", SortOrder: 3,
+			Categories: []guidedCategory{
+				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 1},
+				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 2},
+			},
+		},
+	}
+}
+
+// getDebtPayoffSections returns the 60/20/20 debt payoff template.
+// Category Percent values represent the percentage of the PARENT SECTION.
+func getDebtPayoffSections() []guidedSection {
+	return []guidedSection{
+		{
+			Name: "Necesidades", Percent: 60, Icon: "home", SortOrder: 1,
+			Categories: []guidedCategory{
+				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
+				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
+				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
+				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
+			},
+		},
+		{
+			Name: "Deudas", Percent: 20, Icon: "credit-card", SortOrder: 2,
+			Categories: []guidedCategory{
+				{Name: "Tarjetas de crédito", Percent: 50, Icon: "credit-card", SortOrder: 1},
+				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
+			},
+		},
+		{
+			Name: "Ahorro/Deseos", Percent: 20, Icon: "coins", SortOrder: 3,
+			Categories: []guidedCategory{
+				{Name: "Fondo de emergencia", Percent: 40, Icon: "landmark", SortOrder: 1},
+				{Name: "Entretenimiento", Percent: 30, Icon: "clapperboard", SortOrder: 2},
+				{Name: "Salidas", Percent: 30, Icon: "party", SortOrder: 3},
+			},
+		},
+	}
+}
+
+// getSectionsForMode returns the guided template for the given mode.
+func getSectionsForMode(mode string) []guidedSection {
+	switch mode {
+	case "aggressive":
+		return getAggressiveSections()
+	case "debt-payoff":
+		return getDebtPayoffSections()
+	default:
+		return getGuidedSections()
+	}
+}
+
 // ListBudgets returns all budgets for the authenticated user (owned + collaborative).
 func ListBudgets(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
@@ -160,10 +233,11 @@ func CreateBudget(c *fiber.Ctx) error {
 	if req.Currency == "" {
 		req.Currency = "COP"
 	}
-	if req.BillingPeriodMonths <= 0 {
+	if req.BillingPeriodMonths < 0 {
 		req.BillingPeriodMonths = 1
 	}
-	if req.BillingCutoffDay <= 0 {
+	// billing_period_months == 0 means "one-time" budget (no billing cycle).
+	if req.BillingPeriodMonths > 0 && req.BillingCutoffDay <= 0 {
 		req.BillingCutoffDay = 1
 	}
 	if req.Mode == "" {
@@ -172,12 +246,12 @@ func CreateBudget(c *fiber.Ctx) error {
 
 	// Validate mode and currency.
 	if !validBudgetModes[req.Mode] {
-		return errBadRequest(c, "invalid mode, must be 'manual' or 'guided'")
+		return errBadRequest(c, "invalid mode")
 	}
 	if len(req.Currency) != maxCurrencyLength {
 		return errBadRequest(c, "invalid currency code")
 	}
-	if req.BillingCutoffDay < 1 || req.BillingCutoffDay > 31 {
+	if req.BillingPeriodMonths > 0 && (req.BillingCutoffDay < 1 || req.BillingCutoffDay > 31) {
 		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
 	}
 
@@ -220,9 +294,9 @@ func CreateBudget(c *fiber.Ctx) error {
 		return errInternal(c, "failed to create budget")
 	}
 
-	// Seed guided sections if mode is "guided".
-	if budget.Mode == "guided" {
-		if err := seedGuidedSections(budget.ID, now); err != nil {
+	// Seed guided sections for template-based modes.
+	if guidedModes[budget.Mode] {
+		if err := seedGuidedSections(budget.ID, budget.Mode, now); err != nil {
 			return errInternal(c, "failed to create guided sections")
 		}
 	}
@@ -232,9 +306,9 @@ func CreateBudget(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(budget)
 }
 
-// seedGuidedSections creates the 50/30/20 template sections and categories.
-func seedGuidedSections(budgetID uuid.UUID, now time.Time) error {
-	for _, gs := range getGuidedSections() {
+// seedGuidedSections creates template sections and categories based on the budget mode.
+func seedGuidedSections(budgetID uuid.UUID, mode string, now time.Time) error {
+	for _, gs := range getSectionsForMode(mode) {
 		sectionID := uuid.New()
 		sectionPayload := map[string]interface{}{
 			"id":                 sectionID.String(),
@@ -344,16 +418,16 @@ func UpdateBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "monthly_income exceeds maximum allowed value")
 	}
 	if req.Mode != nil && !validBudgetModes[*req.Mode] {
-		return errBadRequest(c, "invalid mode, must be 'manual' or 'guided'")
+		return errBadRequest(c, "invalid mode")
 	}
 	if req.Currency != nil && len(*req.Currency) != maxCurrencyLength {
 		return errBadRequest(c, "invalid currency code")
 	}
-	if req.BillingPeriodMonths != nil && *req.BillingPeriodMonths <= 0 {
-		return errBadRequest(c, "billing_period_months must be positive")
+	if req.BillingPeriodMonths != nil && *req.BillingPeriodMonths < 0 {
+		return errBadRequest(c, "billing_period_months must be zero or positive")
 	}
-	if req.BillingCutoffDay != nil && (*req.BillingCutoffDay < 1 || *req.BillingCutoffDay > 31) {
-		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
+	if req.BillingCutoffDay != nil && (*req.BillingCutoffDay < 0 || *req.BillingCutoffDay > 31) {
+		return errBadRequest(c, "billing_cutoff_day must be between 0 and 31")
 	}
 
 	// Fetch existing budget to verify ownership.

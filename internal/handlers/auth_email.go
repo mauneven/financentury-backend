@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -13,6 +14,75 @@ import (
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// --- Per-email login rate limiter ---
+// Prevents distributed brute-force attacks against a single account by
+// tracking failed login attempts per email address in memory.
+
+const (
+	maxLoginAttemptsPerEmail = 5               // max attempts before lockout
+	loginAttemptWindow       = 15 * time.Minute // sliding window duration
+)
+
+// loginAttemptRecord tracks failed login attempts for a single email.
+type loginAttemptRecord struct {
+	attempts  int
+	expiresAt time.Time
+}
+
+var (
+	loginAttempts   = make(map[string]*loginAttemptRecord)
+	loginAttemptsMu sync.Mutex
+)
+
+// checkEmailRateLimit returns true if the email has exceeded the allowed
+// number of login attempts within the sliding window.
+func checkEmailRateLimit(email string) bool {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+
+	rec, exists := loginAttempts[email]
+	if !exists {
+		return false
+	}
+	// Window expired — reset.
+	if time.Now().After(rec.expiresAt) {
+		delete(loginAttempts, email)
+		return false
+	}
+	return rec.attempts >= maxLoginAttemptsPerEmail
+}
+
+// recordFailedLogin increments the failed-attempt counter for an email.
+func recordFailedLogin(email string) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+
+	rec, exists := loginAttempts[email]
+	if !exists || time.Now().After(rec.expiresAt) {
+		loginAttempts[email] = &loginAttemptRecord{
+			attempts:  1,
+			expiresAt: time.Now().Add(loginAttemptWindow),
+		}
+		return
+	}
+	rec.attempts++
+}
+
+// clearLoginAttempts resets the counter on successful login.
+func clearLoginAttempts(email string) {
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	delete(loginAttempts, email)
+}
+
+// bcryptCost is the bcrypt work factor. Set to 12 (above the default of 10)
+// for a financial application to increase brute-force resistance.
+const bcryptCost = 12
+
+// maxPasswordBytes is the bcrypt truncation limit. Passwords longer than 72
+// bytes are silently truncated by bcrypt, which could lead to collisions.
+const maxPasswordBytes = 72
 
 // RegisterRequest is the expected request body for email registration.
 type RegisterRequest struct {
@@ -64,6 +134,11 @@ func Register(c *fiber.Ctx) error {
 	if len(req.Password) < 8 {
 		return errBadRequest(c, "password must be at least 8 characters")
 	}
+	// Security: reject passwords exceeding bcrypt's 72-byte input limit to
+	// prevent silent truncation and potential hash collisions.
+	if len([]byte(req.Password)) > maxPasswordBytes {
+		return errBadRequest(c, "password must not exceed 72 bytes")
+	}
 
 	// Check if email already exists.
 	checkQuery := database.NewFilter().
@@ -95,7 +170,7 @@ func Register(c *fiber.Ctx) error {
 	}
 
 	// Hash the password.
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
 	if err != nil {
 		log.Printf("[auth-email] bcrypt hash failed: %v", err)
 		return errInternal(c, "failed to process password")
@@ -164,6 +239,13 @@ func Login(c *fiber.Ctx) error {
 		return errBadRequest(c, "password is required")
 	}
 
+	// Security: per-email rate limit to prevent distributed brute-force attacks.
+	if checkEmailRateLimit(req.Email) {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error": "too many login attempts, please try again later",
+		})
+	}
+
 	// Fetch profile with password hash.
 	query := database.NewFilter().
 		Select("id,email,full_name,avatar_url,password_hash").
@@ -187,6 +269,7 @@ func Login(c *fiber.Ctx) error {
 	}
 
 	if len(profiles) == 0 {
+		recordFailedLogin(req.Email)
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "invalid email or password",
 		})
@@ -196,6 +279,7 @@ func Login(c *fiber.Ctx) error {
 
 	// If password_hash is empty, the user signed up via Google only.
 	if profile.PasswordHash == "" {
+		recordFailedLogin(req.Email)
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "invalid email or password",
 		})
@@ -203,10 +287,14 @@ func Login(c *fiber.Ctx) error {
 
 	// Verify password.
 	if err := bcrypt.CompareHashAndPassword([]byte(profile.PasswordHash), []byte(req.Password)); err != nil {
+		recordFailedLogin(req.Email)
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "invalid email or password",
 		})
 	}
+
+	// Successful login — clear failed attempt counter.
+	clearLoginAttempts(req.Email)
 
 	// Generate JWT.
 	token, err := middleware.GenerateToken(profile.ID, profile.Email)

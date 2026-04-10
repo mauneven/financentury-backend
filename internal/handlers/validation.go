@@ -32,8 +32,17 @@ const (
 
 // validBudgetModes lists the accepted budget mode strings.
 var validBudgetModes = map[string]bool{
-	"manual": true,
-	"guided": true,
+	"manual":     true,
+	"guided":     true,
+	"aggressive": true,
+	"debt-payoff": true,
+}
+
+// guidedModes lists modes that should seed template sections on creation.
+var guidedModes = map[string]bool{
+	"guided":     true,
+	"aggressive": true,
+	"debt-payoff": true,
 }
 
 // --- Common Error Helpers ---
