@@ -12,7 +12,7 @@ import (
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// guidedSection defines a section for the 50/30/20 guided mode.
+// guidedSection defines a section for a budget template mode.
 type guidedSection struct {
 	Name       string
 	Percent    float64
@@ -22,6 +22,7 @@ type guidedSection struct {
 }
 
 // guidedCategory defines a category within a guided section.
+// Percent represents the percentage of the PARENT SECTION (not the total budget).
 type guidedCategory struct {
 	Name      string
 	Percent   float64
@@ -29,78 +30,47 @@ type guidedCategory struct {
 	SortOrder int
 }
 
-// getGuidedSections returns the 50/30/20 guided template used to seed new
-// guided-mode budgets.
-// getGuidedSections returns the 50/30/20 guided template used to seed new
-// guided-mode budgets. Category Percent values represent the percentage of
-// the PARENT SECTION (not the total budget). For example, Vivienda at 56%
-// means 56% of the Necesidades section (which itself is 50% of total).
-func getGuidedSections() []guidedSection {
+// getBalancedSections returns the 50/30/10/10 balanced template.
+func getBalancedSections() []guidedSection {
 	return []guidedSection{
 		{
 			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
 			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 56, Icon: "home", SortOrder: 1},
-				{Name: "Comida", Percent: 24, Icon: "utensils", SortOrder: 2},
-				{Name: "Transporte", Percent: 12, Icon: "car", SortOrder: 3},
-				{Name: "Servicios", Percent: 8, Icon: "lightbulb", SortOrder: 4},
+				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
+				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
+				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
+				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
 			},
 		},
 		{
 			Name: "Deseos", Percent: 30, Icon: "party", SortOrder: 2,
 			Categories: []guidedCategory{
-				{Name: "Salidas", Percent: 33, Icon: "party", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 17, Icon: "clapperboard", SortOrder: 2},
-				{Name: "Ropa", Percent: 23, Icon: "shirt", SortOrder: 3},
-				{Name: "Viajes", Percent: 27, Icon: "plane", SortOrder: 4},
+				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
+				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
 			},
 		},
 		{
-			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 3,
+			Name: "Deudas", Percent: 10, Icon: "credit-card", SortOrder: 3,
 			Categories: []guidedCategory{
-				{Name: "Fondo de emergencia", Percent: 40, Icon: "landmark", SortOrder: 1},
-				{Name: "Inversión", Percent: 60, Icon: "trending", SortOrder: 2},
-			},
-		},
-	}
-}
-
-// getAggressiveSections returns the 70/20/10 aggressive savings template.
-// Category Percent values represent the percentage of the PARENT SECTION.
-func getAggressiveSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Necesidades", Percent: 70, Icon: "home", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
-				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
-				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
-				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
+				{Name: "Tarjetas", Percent: 50, Icon: "credit-card", SortOrder: 1},
+				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
 			},
 		},
 		{
-			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 2,
+			Name: "Ahorro", Percent: 10, Icon: "coins", SortOrder: 4,
 			Categories: []guidedCategory{
 				{Name: "Fondo de emergencia", Percent: 50, Icon: "landmark", SortOrder: 1},
 				{Name: "Inversión", Percent: 50, Icon: "trending", SortOrder: 2},
 			},
 		},
-		{
-			Name: "Deseos", Percent: 10, Icon: "party", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 1},
-				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 2},
-			},
-		},
 	}
 }
 
-// getDebtPayoffSections returns the 60/20/20 debt payoff template.
-// Category Percent values represent the percentage of the PARENT SECTION.
-func getDebtPayoffSections() []guidedSection {
+// getDebtFreeSections returns the 50/30/20 financially free template.
+func getDebtFreeSections() []guidedSection {
 	return []guidedSection{
 		{
-			Name: "Necesidades", Percent: 60, Icon: "home", SortOrder: 1,
+			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
 			Categories: []guidedCategory{
 				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
 				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
@@ -109,18 +79,97 @@ func getDebtPayoffSections() []guidedSection {
 			},
 		},
 		{
-			Name: "Deudas", Percent: 20, Icon: "credit-card", SortOrder: 2,
+			Name: "Deseos", Percent: 30, Icon: "party", SortOrder: 2,
 			Categories: []guidedCategory{
-				{Name: "Tarjetas de crédito", Percent: 50, Icon: "credit-card", SortOrder: 1},
-				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
+				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
+				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
 			},
 		},
 		{
-			Name: "Ahorro/Deseos", Percent: 20, Icon: "coins", SortOrder: 3,
+			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 3,
 			Categories: []guidedCategory{
-				{Name: "Fondo de emergencia", Percent: 40, Icon: "landmark", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 30, Icon: "clapperboard", SortOrder: 2},
-				{Name: "Salidas", Percent: 30, Icon: "party", SortOrder: 3},
+				{Name: "Fondo de emergencia", Percent: 50, Icon: "landmark", SortOrder: 1},
+				{Name: "Inversión", Percent: 50, Icon: "trending", SortOrder: 2},
+			},
+		},
+	}
+}
+
+// getDebtPayoffSections returns the 50/20/30 debt payoff template.
+func getDebtPayoffSections() []guidedSection {
+	return []guidedSection{
+		{
+			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
+			Categories: []guidedCategory{
+				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
+				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
+				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
+				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
+			},
+		},
+		{
+			Name: "Deseos", Percent: 20, Icon: "party", SortOrder: 2,
+			Categories: []guidedCategory{
+				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
+				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
+			},
+		},
+		{
+			Name: "Deuda", Percent: 30, Icon: "credit-card", SortOrder: 3,
+			Categories: []guidedCategory{
+				{Name: "Tarjetas", Percent: 50, Icon: "credit-card", SortOrder: 1},
+				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
+			},
+		},
+	}
+}
+
+// getTravelSections returns the 30/30/40 travel budget template.
+func getTravelSections() []guidedSection {
+	return []guidedSection{
+		{
+			Name: "Vuelos", Percent: 30, Icon: "plane", SortOrder: 1,
+			Categories: []guidedCategory{
+				{Name: "Vuelos", Percent: 100, Icon: "plane", SortOrder: 1},
+			},
+		},
+		{
+			Name: "Hospedaje", Percent: 30, Icon: "bed", SortOrder: 2,
+			Categories: []guidedCategory{
+				{Name: "Hospedaje", Percent: 100, Icon: "bed", SortOrder: 1},
+			},
+		},
+		{
+			Name: "Salidas", Percent: 40, Icon: "party", SortOrder: 3,
+			Categories: []guidedCategory{
+				{Name: "Comida", Percent: 40, Icon: "utensils", SortOrder: 1},
+				{Name: "Actividades", Percent: 35, Icon: "map-pin", SortOrder: 2},
+				{Name: "Transporte local", Percent: 25, Icon: "car", SortOrder: 3},
+			},
+		},
+	}
+}
+
+// getEventSections returns the 50/30/20 event budget template.
+func getEventSections() []guidedSection {
+	return []guidedSection{
+		{
+			Name: "Comida", Percent: 50, Icon: "utensils", SortOrder: 1,
+			Categories: []guidedCategory{
+				{Name: "Comida", Percent: 100, Icon: "utensils", SortOrder: 1},
+			},
+		},
+		{
+			Name: "Bebidas", Percent: 30, Icon: "wine", SortOrder: 2,
+			Categories: []guidedCategory{
+				{Name: "Bebidas", Percent: 100, Icon: "wine", SortOrder: 1},
+			},
+		},
+		{
+			Name: "Gestión", Percent: 20, Icon: "settings", SortOrder: 3,
+			Categories: []guidedCategory{
+				{Name: "Decoración", Percent: 40, Icon: "sparkles", SortOrder: 1},
+				{Name: "Logística", Percent: 60, Icon: "truck", SortOrder: 2},
 			},
 		},
 	}
@@ -129,12 +178,18 @@ func getDebtPayoffSections() []guidedSection {
 // getSectionsForMode returns the guided template for the given mode.
 func getSectionsForMode(mode string) []guidedSection {
 	switch mode {
-	case "aggressive":
-		return getAggressiveSections()
+	case "balanced":
+		return getBalancedSections()
+	case "debt-free":
+		return getDebtFreeSections()
 	case "debt-payoff":
 		return getDebtPayoffSections()
+	case "travel":
+		return getTravelSections()
+	case "event":
+		return getEventSections()
 	default:
-		return getGuidedSections()
+		return getBalancedSections()
 	}
 }
 
@@ -202,12 +257,34 @@ func ListBudgets(c *fiber.Ctx) error {
 	return c.JSON(budgets)
 }
 
+// maxBudgetsPerUser is the maximum number of budgets a single user can own.
+const maxBudgetsPerUser = 7
+
 // CreateBudget creates a new budget and optionally seeds guided sections.
 // On success it broadcasts a budget_created event via WebSocket.
 func CreateBudget(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
 		return errUnauthorized(c)
+	}
+
+	// Enforce per-user budget limit.
+	countQuery := database.NewFilter().
+		Select("id").
+		Eq("user_id", userID.String()).
+		Build()
+
+	countBody, countStatus, countErr := database.DB.Get("budgets", countQuery)
+	if countErr != nil || countStatus != http.StatusOK {
+		return errInternal(c, "failed to check budget count")
+	}
+
+	var existing []struct{ ID string `json:"id"` }
+	if err := json.Unmarshal(countBody, &existing); err != nil {
+		return errInternal(c, "failed to parse budget count")
+	}
+	if len(existing) >= maxBudgetsPerUser {
+		return errBadRequest(c, "budget limit reached (max 7)")
 	}
 
 	var req models.CreateBudgetRequest

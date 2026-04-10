@@ -383,56 +383,86 @@ func TestAllocationMath_CorrectFormula(t *testing.T) {
 	}
 }
 
-// ---------- Guided Sections Validation ----------
+// ---------- Template Sections Validation ----------
 
-func TestGuidedSections_CategoriesSumTo100(t *testing.T) {
-	sections := getGuidedSections()
-	for _, s := range sections {
-		var sum float64
-		for _, c := range s.Categories {
-			sum += c.Percent
-		}
-		if math.Abs(sum-100) > 0.01 {
-			t.Errorf("section %s: categories sum to %f, want 100", s.Name, sum)
-		}
+// TestAllTemplates_CategoriesSumTo100 verifies that every template's
+// sub-category percentages within each section sum to 100.
+func TestAllTemplates_CategoriesSumTo100(t *testing.T) {
+	templates := map[string][]guidedSection{
+		"balanced":   getBalancedSections(),
+		"debt-free":  getDebtFreeSections(),
+		"debt-payoff": getDebtPayoffSections(),
+		"travel":     getTravelSections(),
+		"event":      getEventSections(),
 	}
-}
-
-func TestGuidedSections_SectionsSumTo100(t *testing.T) {
-	sections := getGuidedSections()
-	var sum float64
-	for _, s := range sections {
-		sum += s.Percent
-	}
-	if sum != 100 {
-		t.Errorf("sections sum to %f, want 100", sum)
-	}
-}
-
-func TestGuidedSections_UsesLucideIcons(t *testing.T) {
-	sections := getGuidedSections()
-	for _, s := range sections {
-		if len(s.Icon) > 20 || containsEmoji(s.Icon) {
-			t.Errorf("section %s icon should be a lucide key string, got %q", s.Name, s.Icon)
-		}
-		for _, c := range s.Categories {
-			if len(c.Icon) > 20 || containsEmoji(c.Icon) {
-				t.Errorf("category %s icon should be a lucide key string, got %q", c.Name, c.Icon)
+	for name, sections := range templates {
+		for _, s := range sections {
+			var sum float64
+			for _, c := range s.Categories {
+				sum += c.Percent
+			}
+			if math.Abs(sum-100) > 0.01 {
+				t.Errorf("%s / section %s: categories sum to %f, want 100", name, s.Name, sum)
 			}
 		}
 	}
 }
 
-func TestGuidedSections_Structure(t *testing.T) {
-	sections := getGuidedSections()
+// TestAllTemplates_SectionsSumTo100 verifies that the section percentages
+// for every template sum to exactly 100.
+func TestAllTemplates_SectionsSumTo100(t *testing.T) {
+	templates := map[string][]guidedSection{
+		"balanced":   getBalancedSections(),
+		"debt-free":  getDebtFreeSections(),
+		"debt-payoff": getDebtPayoffSections(),
+		"travel":     getTravelSections(),
+		"event":      getEventSections(),
+	}
+	for name, sections := range templates {
+		var sum float64
+		for _, s := range sections {
+			sum += s.Percent
+		}
+		if sum != 100 {
+			t.Errorf("%s: sections sum to %f, want 100", name, sum)
+		}
+	}
+}
 
-	if len(sections) != 3 {
-		t.Fatalf("expected 3 sections, got %d", len(sections))
+// TestAllTemplates_UsesLucideIcons verifies all icons are short key strings.
+func TestAllTemplates_UsesLucideIcons(t *testing.T) {
+	templates := map[string][]guidedSection{
+		"balanced":   getBalancedSections(),
+		"debt-free":  getDebtFreeSections(),
+		"debt-payoff": getDebtPayoffSections(),
+		"travel":     getTravelSections(),
+		"event":      getEventSections(),
+	}
+	for name, sections := range templates {
+		for _, s := range sections {
+			if len(s.Icon) > 20 || containsEmoji(s.Icon) {
+				t.Errorf("%s / section %s icon should be a lucide key string, got %q", name, s.Name, s.Icon)
+			}
+			for _, c := range s.Categories {
+				if len(c.Icon) > 20 || containsEmoji(c.Icon) {
+					t.Errorf("%s / category %s icon should be a lucide key string, got %q", name, c.Name, c.Icon)
+				}
+			}
+		}
+	}
+}
+
+func TestBalancedSections_Structure(t *testing.T) {
+	sections := getBalancedSections()
+
+	if len(sections) != 4 {
+		t.Fatalf("expected 4 sections, got %d", len(sections))
 	}
 
 	expectedCounts := map[string]int{
 		"Necesidades": 4,
-		"Deseos":      4,
+		"Deseos":      2,
+		"Deudas":      2,
 		"Ahorro":      2,
 	}
 
@@ -448,13 +478,14 @@ func TestGuidedSections_Structure(t *testing.T) {
 	}
 }
 
-func TestGuidedSections_PercentValues(t *testing.T) {
-	sections := getGuidedSections()
+func TestBalancedSections_PercentValues(t *testing.T) {
+	sections := getBalancedSections()
 
 	expected := map[string]float64{
 		"Necesidades": 50,
 		"Deseos":      30,
-		"Ahorro":      20,
+		"Deudas":      10,
+		"Ahorro":      10,
 	}
 
 	for _, s := range sections {
