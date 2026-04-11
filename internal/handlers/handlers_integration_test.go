@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -16,18 +17,19 @@ import (
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// setupTestEnv creates a mock Supabase server, initializes the database client
-// pointing to it, sets up middleware, and returns a Fiber app ready for testing.
-// The handler function receives the mock server's mux for route customization.
+// setupTestEnv initializes the database client from TEST_DATABASE_URL, sets up
+// middleware, and returns a Fiber app ready for integration testing.
+// The setupMux parameter is ignored (kept for API compat) — tests run against
+// a real PostgreSQL database.
 func setupTestEnv(t *testing.T, setupMux func(mux *http.ServeMux)) (*fiber.App, string) {
 	t.Helper()
 
-	mux := http.NewServeMux()
-	setupMux(mux)
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
+	}
 
-	database.Init(server.URL, "test-api-key")
+	database.Init(dbURL)
 	middleware.Init("test-jwt-secret-for-handlers")
 
 	// Set up WebSocket hub for broadcast calls.

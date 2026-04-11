@@ -19,7 +19,7 @@ import (
 // ComputeBillingPeriodStart calculates the start date of the current billing
 // period given the budget's cutoff day and period length in months.
 //
-// Algorithm (ported from the Supabase RPC get_budget_summary):
+// Algorithm (ported from the the database RPC get_budget_summary):
 //  1. Clamp the cutoff day to the number of days in the current month.
 //  2. If today >= the clamped cutoff day in the current month, the candidate
 //     start is that day in the current month; otherwise go back one month
@@ -109,7 +109,7 @@ func minInt(a, b int) int {
 // ---------- GetBudgetSummary ----------
 
 // GetBudgetSummary computes and returns the full budget summary. All math is
-// done in Go; Supabase is used purely as storage via PostgREST.
+// done in Go; the database is used purely as storage via PostgREST.
 //
 // The endpoint issues three independent DB queries (sections, categories,
 // expenses) after the initial budget fetch. Sections and expenses run
@@ -144,7 +144,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	// 2. Fetch sections and expenses concurrently. These two queries are
 	//    independent -- both only need the budgetID (and periodStart for
 	//    expenses). Running them in parallel saves one full round-trip to
-	//    Supabase.
+	//    the database.
 	//
 	//    For one-time budgets (billing_period_months == 0), skip billing period
 	//    calculation and include ALL expenses.
@@ -291,7 +291,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 // ---------- GetBudgetTrends ----------
 
 // GetBudgetTrends returns daily spending data grouped by section. All
-// computation is done in Go; Supabase is used purely as storage.
+// computation is done in Go; the database is used purely as storage.
 //
 // Sections, categories, and expenses are fetched with maximum concurrency:
 // sections and expenses run in parallel, then categories are fetched once

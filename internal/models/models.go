@@ -7,7 +7,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Profile represents a user profile from the Supabase profiles table.
+// Profile represents a user profile from the profiles table.
 type Profile struct {
 	ID           uuid.UUID `json:"id"`
 	Email        string    `json:"email"`
@@ -24,6 +24,7 @@ type Budget struct {
 	ID                  uuid.UUID `json:"id"`
 	UserID              uuid.UUID `json:"user_id"`
 	Name                string    `json:"name"`
+	Icon                string    `json:"icon"`
 	MonthlyIncome       float64   `json:"monthly_income"`
 	Currency            string    `json:"currency"`
 	BillingPeriodMonths int       `json:"billing_period_months"`
@@ -125,6 +126,7 @@ type InviteInfo struct {
 // CreateBudgetRequest is the payload for creating a budget.
 type CreateBudgetRequest struct {
 	Name                string  `json:"name"`
+	Icon                string  `json:"icon"`
 	MonthlyIncome       float64 `json:"monthly_income"`
 	Currency            string  `json:"currency"`
 	BillingPeriodMonths int     `json:"billing_period_months"`
@@ -135,6 +137,7 @@ type CreateBudgetRequest struct {
 // UpdateBudgetRequest is the payload for updating a budget.
 type UpdateBudgetRequest struct {
 	Name                *string  `json:"name,omitempty"`
+	Icon                *string  `json:"icon,omitempty"`
 	MonthlyIncome       *float64 `json:"monthly_income,omitempty"`
 	Currency            *string  `json:"currency,omitempty"`
 	BillingPeriodMonths *int     `json:"billing_period_months,omitempty"`

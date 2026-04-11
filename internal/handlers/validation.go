@@ -164,7 +164,7 @@ func broadcast(budgetID string, msgType string, data interface{}) {
 // --- DB Access Helpers ---
 
 // verifyBudgetOwnership checks that the authenticated user owns the budget
-// by querying the budgets table in Supabase. Returns a non-nil error if the
+// by querying the budgets table. Returns a non-nil error if the
 // user is not the owner.
 func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
 	query := database.NewFilter().

@@ -324,6 +324,7 @@ func CreateBudget(c *fiber.Ctx) error {
 
 	// Sanitize text inputs.
 	req.Name = strings.TrimSpace(req.Name)
+	req.Icon = strings.TrimSpace(req.Icon)
 	req.Currency = strings.TrimSpace(req.Currency)
 	req.Mode = strings.TrimSpace(req.Mode)
 
@@ -347,6 +348,9 @@ func CreateBudget(c *fiber.Ctx) error {
 	}
 	if req.Mode == "" {
 		req.Mode = "manual"
+	}
+	if req.Icon == "" {
+		req.Icon = "wallet"
 	}
 
 	// Validate billing_period_months against allowed values.
@@ -376,6 +380,7 @@ func CreateBudget(c *fiber.Ctx) error {
 		ID:                  budgetID,
 		UserID:              userID,
 		Name:                req.Name,
+		Icon:                req.Icon,
 		MonthlyIncome:       req.MonthlyIncome,
 		Currency:            req.Currency,
 		BillingPeriodMonths: req.BillingPeriodMonths,
@@ -389,6 +394,7 @@ func CreateBudget(c *fiber.Ctx) error {
 		"id":                    budget.ID.String(),
 		"user_id":               budget.UserID.String(),
 		"name":                  budget.Name,
+		"icon":                  budget.Icon,
 		"monthly_income":        budget.MonthlyIncome,
 		"currency":              budget.Currency,
 		"billing_period_months": budget.BillingPeriodMonths,
@@ -523,6 +529,10 @@ func UpdateBudget(c *fiber.Ctx) error {
 		trimmed := strings.TrimSpace(*req.Name)
 		req.Name = &trimmed
 	}
+	if req.Icon != nil {
+		trimmed := strings.TrimSpace(*req.Icon)
+		req.Icon = &trimmed
+	}
 	if req.Currency != nil {
 		trimmed := strings.TrimSpace(*req.Currency)
 		req.Currency = &trimmed
@@ -581,6 +591,9 @@ func UpdateBudget(c *fiber.Ctx) error {
 	if req.Name != nil {
 		b.Name = *req.Name
 	}
+	if req.Icon != nil {
+		b.Icon = *req.Icon
+	}
 	if req.MonthlyIncome != nil {
 		b.MonthlyIncome = *req.MonthlyIncome
 	}
@@ -600,6 +613,7 @@ func UpdateBudget(c *fiber.Ctx) error {
 
 	updatePayload := map[string]interface{}{
 		"name":                  b.Name,
+		"icon":                  b.Icon,
 		"monthly_income":        b.MonthlyIncome,
 		"currency":              b.Currency,
 		"billing_period_months": b.BillingPeriodMonths,

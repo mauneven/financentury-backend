@@ -53,12 +53,11 @@ func main() {
 	handlers.InitWebSocket(hub)
 	log.Println("WebSocket hub started")
 
-	// Initialize Supabase REST API client with the service role key so that
-	// Row Level Security is bypassed -- the backend enforces its own access
-	// control in Go handler code.
-	database.Init(cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
+	// Initialize direct PostgreSQL connection pool. The database is used purely
+	// as storage -- the backend enforces its own access control in Go handlers.
+	database.Init(cfg.DatabaseURL)
 	defer database.Close()
-	log.Printf("initialized Supabase client for %s", cfg.SupabaseURL)
+	log.Println("initialized database connection pool")
 
 	// Create Fiber app.
 	app := fiber.New(fiber.Config{

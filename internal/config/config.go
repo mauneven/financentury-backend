@@ -8,30 +8,20 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	SupabaseURL            string
-	SupabaseServiceRoleKey string
-	JWTSecret              string
-	GoogleClientID         string
-	GoogleClientSecret     string
-	FrontendURL            string
-	Port                   int
-	CORSOrigin             string
+	DatabaseURL        string
+	JWTSecret          string
+	GoogleClientID     string
+	GoogleClientSecret string
+	FrontendURL        string
+	Port               int
+	CORSOrigin         string
 }
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	supabaseURL := os.Getenv("SUPABASE_URL")
-	if supabaseURL == "" {
-		return nil, fmt.Errorf("SUPABASE_URL environment variable is required")
-	}
-
-	supabaseServiceRoleKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
-	if supabaseServiceRoleKey == "" {
-		// Fall back to the legacy env var name for backward compatibility.
-		supabaseServiceRoleKey = os.Getenv("SUPABASE_ANON_KEY")
-	}
-	if supabaseServiceRoleKey == "" {
-		return nil, fmt.Errorf("SUPABASE_SERVICE_ROLE_KEY environment variable is required")
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL environment variable is required")
 	}
 
 	jwtSecret := os.Getenv("JWT_SECRET")
@@ -75,13 +65,12 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		SupabaseURL:            supabaseURL,
-		SupabaseServiceRoleKey: supabaseServiceRoleKey,
-		JWTSecret:              jwtSecret,
-		GoogleClientID:         googleClientID,
-		GoogleClientSecret:     googleClientSecret,
-		FrontendURL:            frontendURL,
-		Port:                   port,
-		CORSOrigin:             corsOrigin,
+		DatabaseURL:        databaseURL,
+		JWTSecret:          jwtSecret,
+		GoogleClientID:     googleClientID,
+		GoogleClientSecret: googleClientSecret,
+		FrontendURL:        frontendURL,
+		Port:               port,
+		CORSOrigin:         corsOrigin,
 	}, nil
 }

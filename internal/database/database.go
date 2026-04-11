@@ -1,185 +1,304 @@
-// Package database provides the Supabase REST API client used by handlers
-// to interact with the PostgreSQL database via PostgREST.
+// Package database provides a PostgreSQL client used by handlers to interact
+// with the database. Queries are executed directly via pgx — no middleware
+// (PostgREST, ORM, etc.) is required, making the database provider-agnostic.
 package database
 
 import (
-	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// maxResponseSize limits response bodies to 10 MB.
-const maxResponseSize = 10 << 20
-
-// Client is the Supabase REST API client that replaces a direct database
-// connection pool. It uses connection pooling via http.Transport for efficient
-// HTTP/1.1 and HTTP/2 connection reuse.
+// Client wraps a pgx connection pool with convenience methods that accept
+// the same query format used by the rest of the codebase (the Filter builder).
 type Client struct {
-	BaseURL    string
-	APIKey     string
-	HTTPClient *http.Client
+	Pool *pgxpool.Pool
 }
 
-// bufPool is a sync.Pool of *bytes.Buffer used to reduce allocations when
-// reading response bodies in hot paths.
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 4096))
-	},
-}
-
-// getBuf retrieves a buffer from the pool and resets it.
-func getBuf() *bytes.Buffer {
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	return buf
-}
-
-// putBuf returns a buffer to the pool.
-func putBuf(buf *bytes.Buffer) {
-	// Prevent excessively large buffers from being returned to the pool.
-	if buf.Cap() <= 1<<20 {
-		bufPool.Put(buf)
-	}
-}
-
-// DB is the global Supabase client instance.
+// DB is the global database client instance.
 var DB *Client
 
-// NewClient creates a new Supabase REST API client with an optimised
-// http.Transport that enables connection pooling and keep-alive.
-func NewClient(baseURL, apiKey string) *Client {
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:     true,
+// Init initializes the global database client from a PostgreSQL connection URL.
+func Init(databaseURL string) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		panic(fmt.Sprintf("invalid DATABASE_URL: %v", err))
 	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		panic(fmt.Sprintf("failed to connect to database: %v", err))
+	}
+	DB = &Client{Pool: pool}
+}
 
-	return &Client{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		APIKey:  apiKey,
-		HTTPClient: &http.Client{
-			Timeout:   15 * time.Second,
-			Transport: transport,
-		},
+// Close releases the connection pool.
+func Close() {
+	if DB != nil && DB.Pool != nil {
+		DB.Pool.Close()
 	}
 }
 
-// Init initializes the global Supabase client.
-func Init(baseURL, apiKey string) {
-	DB = NewClient(baseURL, apiKey)
+// ---------------------------------------------------------------------------
+// Query parser — translates the Filter-built query string into SQL clauses
+// ---------------------------------------------------------------------------
+
+type parsedQuery struct {
+	selectCols string
+	conditions []condition
+	orderCol   string
+	orderDir   string
+	limit      string
+	offset     string
 }
 
-// Close is a no-op for the HTTP client (kept for API compatibility).
-func Close() {}
-
-// doRequest executes an HTTP request with the Supabase auth headers. It uses
-// a pooled buffer to read the response body efficiently.
-func (c *Client) doRequest(method, url string, body []byte, extraHeaders map[string]string) ([]byte, int, error) {
-	var bodyReader io.Reader
-	if body != nil {
-		bodyReader = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("apikey", c.APIKey)
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	for k, v := range extraHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read into pooled buffer.
-	buf := getBuf()
-	defer putBuf(buf)
-
-	_, err = io.Copy(buf, io.LimitReader(resp.Body, maxResponseSize))
-	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Copy the buffer contents to a new slice so the buffer can be returned.
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-
-	return result, resp.StatusCode, nil
+type condition struct {
+	column   string
+	operator string // eq, neq, gt, gte, lt, lte, in
+	value    string // raw value (for "in": "(a,b,c)")
 }
 
-// Get performs a GET request on the given table with query parameters.
-// query should be a pre-built query string (e.g., "select=*&user_id=eq.abc").
+func parseQuery(query string) parsedQuery {
+	p := parsedQuery{selectCols: "*"}
+	if query == "" {
+		return p
+	}
+	for _, part := range strings.Split(query, "&") {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key, _ := url.QueryUnescape(kv[0])
+		val, _ := url.QueryUnescape(kv[1])
+
+		switch key {
+		case "select":
+			p.selectCols = val
+		case "order":
+			if dot := strings.LastIndex(val, "."); dot > 0 {
+				p.orderCol = val[:dot]
+				p.orderDir = strings.ToUpper(val[dot+1:])
+			}
+		case "limit":
+			p.limit = val
+		case "offset":
+			p.offset = val
+		default:
+			if dot := strings.Index(val, "."); dot > 0 {
+				p.conditions = append(p.conditions, condition{
+					column:   key,
+					operator: val[:dot],
+					value:    val[dot+1:],
+				})
+			}
+		}
+	}
+	return p
+}
+
+// quoteIdent quotes a SQL identifier to prevent injection.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// buildWhere generates a WHERE clause with parameterized placeholders.
+// argStart is the starting $N index.
+func (p parsedQuery) buildWhere(argStart int) (string, []interface{}) {
+	if len(p.conditions) == 0 {
+		return "", nil
+	}
+	var clauses []string
+	var args []interface{}
+	idx := argStart
+
+	for _, c := range p.conditions {
+		col := quoteIdent(c.column)
+		switch c.operator {
+		case "eq":
+			clauses = append(clauses, fmt.Sprintf("%s::text = $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "neq":
+			clauses = append(clauses, fmt.Sprintf("%s::text != $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "gt":
+			clauses = append(clauses, fmt.Sprintf("%s::text > $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "gte":
+			clauses = append(clauses, fmt.Sprintf("%s::text >= $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "lt":
+			clauses = append(clauses, fmt.Sprintf("%s::text < $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "lte":
+			clauses = append(clauses, fmt.Sprintf("%s::text <= $%d", col, idx))
+			args = append(args, c.value)
+			idx++
+		case "in":
+			inner := strings.Trim(c.value, "()")
+			vals := strings.Split(inner, ",")
+			ph := make([]string, len(vals))
+			for i, v := range vals {
+				ph[i] = fmt.Sprintf("$%d", idx)
+				args = append(args, v)
+				idx++
+			}
+			clauses = append(clauses, fmt.Sprintf("%s::text IN (%s)", col, strings.Join(ph, ",")))
+		}
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func (p parsedQuery) buildOrder() string {
+	if p.orderCol == "" {
+		return ""
+	}
+	dir := "ASC"
+	if p.orderDir == "DESC" {
+		dir = "DESC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", quoteIdent(p.orderCol), dir)
+}
+
+func (p parsedQuery) buildLimitOffset() string {
+	var parts []string
+	if p.limit != "" {
+		parts = append(parts, "LIMIT "+p.limit)
+	}
+	if p.offset != "" {
+		parts = append(parts, "OFFSET "+p.offset)
+	}
+	return strings.Join(parts, " ")
+}
+
+func selectColumns(raw string) string {
+	if raw == "" || raw == "*" {
+		return "*"
+	}
+	cols := strings.Split(raw, ",")
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = quoteIdent(strings.TrimSpace(c))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// ---------------------------------------------------------------------------
+// CRUD methods — same public API as the previous PostgREST client
+// ---------------------------------------------------------------------------
+
+// Get performs a SELECT and returns results as a JSON array.
 func (c *Client) Get(table, query string) ([]byte, int, error) {
-	u := fmt.Sprintf("%s/rest/v1/%s", c.BaseURL, table)
-	if query != "" {
-		u += "?" + query
+	p := parseQuery(query)
+	where, args := p.buildWhere(1)
+
+	inner := fmt.Sprintf("SELECT %s FROM %s %s %s %s",
+		selectColumns(p.selectCols), quoteIdent(table), where, p.buildOrder(), p.buildLimitOffset())
+
+	sql := fmt.Sprintf("SELECT COALESCE(json_agg(to_json(t)), '[]'::json) FROM (%s) t", inner)
+
+	var result json.RawMessage
+	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("query %s failed: %w", table, err)
 	}
-	return c.doRequest(http.MethodGet, u, nil, nil)
+	return result, http.StatusOK, nil
 }
 
-// Post performs a POST request to insert row(s) into a table.
-// Returns the created row(s) via Prefer: return=representation.
+// Post performs an INSERT and returns the created row(s) as a JSON array.
 func (c *Client) Post(table string, body []byte) ([]byte, int, error) {
-	u := fmt.Sprintf("%s/rest/v1/%s", c.BaseURL, table)
-	headers := map[string]string{
-		"Prefer": "return=representation",
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err)
 	}
-	return c.doRequest(http.MethodPost, u, body, headers)
+
+	cols := make([]string, 0, len(data))
+	phs := make([]string, 0, len(data))
+	args := make([]interface{}, 0, len(data))
+	i := 1
+	for k, v := range data {
+		cols = append(cols, quoteIdent(k))
+		phs = append(phs, fmt.Sprintf("$%d", i))
+		args = append(args, v)
+		i++
+	}
+
+	sql := fmt.Sprintf(
+		"WITH ins AS (INSERT INTO %s (%s) VALUES (%s) RETURNING *) SELECT json_agg(to_json(ins)) FROM ins",
+		quoteIdent(table), strings.Join(cols, ", "), strings.Join(phs, ", "))
+
+	var result json.RawMessage
+	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("insert into %s failed: %w", table, err)
+	}
+	return result, http.StatusCreated, nil
 }
 
-// Patch performs a PATCH request to update row(s) matching the query filter.
-// Returns the updated row(s) via Prefer: return=representation.
+// Patch performs an UPDATE on rows matching the query and returns them as JSON.
 func (c *Client) Patch(table, query string, body []byte) ([]byte, int, error) {
-	u := fmt.Sprintf("%s/rest/v1/%s", c.BaseURL, table)
-	if query != "" {
-		u += "?" + query
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err)
 	}
-	headers := map[string]string{
-		"Prefer": "return=representation",
+
+	sets := make([]string, 0, len(data))
+	args := make([]interface{}, 0, len(data))
+	i := 1
+	for k, v := range data {
+		sets = append(sets, fmt.Sprintf("%s = $%d", quoteIdent(k), i))
+		args = append(args, v)
+		i++
 	}
-	return c.doRequest(http.MethodPatch, u, body, headers)
+
+	p := parseQuery(query)
+	where, wArgs := p.buildWhere(i)
+	args = append(args, wArgs...)
+
+	sql := fmt.Sprintf(
+		"WITH upd AS (UPDATE %s SET %s %s RETURNING *) SELECT json_agg(to_json(upd)) FROM upd",
+		quoteIdent(table), strings.Join(sets, ", "), where)
+
+	var result json.RawMessage
+	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("update %s failed: %w", table, err)
+	}
+	return result, http.StatusOK, nil
 }
 
-// Delete performs a DELETE request on rows matching the query filter.
+// Delete removes rows matching the query.
 func (c *Client) Delete(table, query string) ([]byte, int, error) {
-	u := fmt.Sprintf("%s/rest/v1/%s", c.BaseURL, table)
-	if query != "" {
-		u += "?" + query
+	p := parseQuery(query)
+	where, args := p.buildWhere(1)
+
+	sql := fmt.Sprintf("DELETE FROM %s %s", quoteIdent(table), where)
+	if _, err := c.Pool.Exec(context.Background(), sql, args...); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("delete from %s failed: %w", table, err)
 	}
-	return c.doRequest(http.MethodDelete, u, nil, nil)
+	return nil, http.StatusNoContent, nil
 }
 
-// RPC calls a Supabase RPC function with a JSON body.
+// RPC calls a PostgreSQL function and returns the result as JSON.
 func (c *Client) RPC(functionName string, body []byte) ([]byte, int, error) {
-	u := fmt.Sprintf("%s/rest/v1/rpc/%s", c.BaseURL, functionName)
-	return c.doRequest(http.MethodPost, u, body, nil)
+	sql := fmt.Sprintf("SELECT to_json(%s($1::json))", quoteIdent(functionName))
+	var result json.RawMessage
+	if err := c.Pool.QueryRow(context.Background(), sql, string(body)).Scan(&result); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("rpc %s failed: %w", functionName, err)
+	}
+	return result, http.StatusOK, nil
 }
 
-// --- Filter Builder Helpers ---
+// ---------------------------------------------------------------------------
+// Filter builder — unchanged API, same query string format
+// ---------------------------------------------------------------------------
 
-// Filter helps build PostgREST query strings in a type-safe, chainable way.
+// Filter helps build query strings in a type-safe, chainable way.
 type Filter struct {
 	params []string
 }
@@ -195,43 +314,43 @@ func (f *Filter) Select(columns string) *Filter {
 	return f
 }
 
-// Eq adds an equality filter: column=eq.value
+// Eq adds an equality filter.
 func (f *Filter) Eq(column, value string) *Filter {
 	f.params = append(f.params, column+"=eq."+url.QueryEscape(value))
 	return f
 }
 
-// Neq adds a not-equal filter: column=neq.value
+// Neq adds a not-equal filter.
 func (f *Filter) Neq(column, value string) *Filter {
 	f.params = append(f.params, column+"=neq."+url.QueryEscape(value))
 	return f
 }
 
-// Gt adds a greater-than filter: column=gt.value
+// Gt adds a greater-than filter.
 func (f *Filter) Gt(column, value string) *Filter {
 	f.params = append(f.params, column+"=gt."+url.QueryEscape(value))
 	return f
 }
 
-// Gte adds a greater-than-or-equal filter: column=gte.value
+// Gte adds a greater-than-or-equal filter.
 func (f *Filter) Gte(column, value string) *Filter {
 	f.params = append(f.params, column+"=gte."+url.QueryEscape(value))
 	return f
 }
 
-// Lt adds a less-than filter: column=lt.value
+// Lt adds a less-than filter.
 func (f *Filter) Lt(column, value string) *Filter {
 	f.params = append(f.params, column+"=lt."+url.QueryEscape(value))
 	return f
 }
 
-// Lte adds a less-than-or-equal filter: column=lte.value
+// Lte adds a less-than-or-equal filter.
 func (f *Filter) Lte(column, value string) *Filter {
 	f.params = append(f.params, column+"=lte."+url.QueryEscape(value))
 	return f
 }
 
-// In adds an IN filter: column=in.(val1,val2,...)
+// In adds an IN filter.
 func (f *Filter) In(column string, values []string) *Filter {
 	escaped := make([]string, len(values))
 	for i, v := range values {
@@ -241,7 +360,7 @@ func (f *Filter) In(column string, values []string) *Filter {
 	return f
 }
 
-// Order sets the ordering: column.asc or column.desc
+// Order sets the ordering.
 func (f *Filter) Order(column, direction string) *Filter {
 	f.params = append(f.params, "order="+column+"."+direction)
 	return f
@@ -253,7 +372,7 @@ func (f *Filter) Limit(n int) *Filter {
 	return f
 }
 
-// Offset skips the first n rows. Used together with Limit for pagination.
+// Offset skips the first n rows.
 func (f *Filter) Offset(n int) *Filter {
 	f.params = append(f.params, fmt.Sprintf("offset=%d", n))
 	return f

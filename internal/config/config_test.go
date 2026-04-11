@@ -12,18 +12,16 @@ func setRequiredEnvVars(t *testing.T) func() {
 	t.Helper()
 
 	vars := map[string]string{
-		"SUPABASE_URL":              "https://test.supabase.co",
-		"SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
-		"JWT_SECRET":                "this-is-a-test-jwt-secret-that-is-at-least-32-characters-long",
-		"GOOGLE_CLIENT_ID":          "test-google-client-id",
-		"GOOGLE_CLIENT_SECRET":      "test-google-client-secret",
+		"DATABASE_URL":         "postgresql://user:pass@localhost:5432/testdb?sslmode=disable",
+		"JWT_SECRET":           "this-is-a-test-jwt-secret-that-is-at-least-32-characters-long",
+		"GOOGLE_CLIENT_ID":     "test-google-client-id",
+		"GOOGLE_CLIENT_SECRET": "test-google-client-secret",
 	}
 
 	originals := make(map[string]string)
 	for k := range vars {
 		originals[k] = os.Getenv(k)
 	}
-	// Also save optional vars that might be set.
 	for _, k := range []string{"FRONTEND_URL", "PORT", "CORS_ORIGIN"} {
 		originals[k] = os.Getenv(k)
 	}
@@ -31,7 +29,6 @@ func setRequiredEnvVars(t *testing.T) func() {
 	for k, v := range vars {
 		os.Setenv(k, v)
 	}
-	// Clear optional vars to test defaults.
 	os.Unsetenv("FRONTEND_URL")
 	os.Unsetenv("PORT")
 	os.Unsetenv("CORS_ORIGIN")
@@ -58,11 +55,8 @@ func TestLoad_AllRequiredVarsSet(t *testing.T) {
 		t.Fatalf("Load() failed: %v", err)
 	}
 
-	if cfg.SupabaseURL != "https://test.supabase.co" {
-		t.Errorf("SupabaseURL = %q, want %q", cfg.SupabaseURL, "https://test.supabase.co")
-	}
-	if cfg.SupabaseServiceRoleKey != "test-service-role-key" {
-		t.Errorf("SupabaseServiceRoleKey = %q, want %q", cfg.SupabaseServiceRoleKey, "test-service-role-key")
+	if cfg.DatabaseURL != "postgresql://user:pass@localhost:5432/testdb?sslmode=disable" {
+		t.Errorf("DatabaseURL = %q, want the test connection string", cfg.DatabaseURL)
 	}
 	if cfg.JWTSecret != "this-is-a-test-jwt-secret-that-is-at-least-32-characters-long" {
 		t.Errorf("JWTSecret incorrect")
@@ -163,47 +157,17 @@ func TestLoad_CustomCORSOrigin(t *testing.T) {
 
 // ==================== Load — Missing Required Vars ====================
 
-func TestLoad_MissingSupabaseURL(t *testing.T) {
+func TestLoad_MissingDatabaseURL(t *testing.T) {
 	cleanup := setRequiredEnvVars(t)
 	defer cleanup()
 
-	os.Unsetenv("SUPABASE_URL")
+	os.Unsetenv("DATABASE_URL")
 	_, err := Load()
 	if err == nil {
-		t.Fatal("Load() should fail when SUPABASE_URL is missing")
+		t.Fatal("Load() should fail when DATABASE_URL is missing")
 	}
-	if !strings.Contains(err.Error(), "SUPABASE_URL") {
-		t.Errorf("error should mention SUPABASE_URL, got: %v", err)
-	}
-}
-
-func TestLoad_MissingServiceRoleKey(t *testing.T) {
-	cleanup := setRequiredEnvVars(t)
-	defer cleanup()
-
-	os.Unsetenv("SUPABASE_SERVICE_ROLE_KEY")
-	os.Unsetenv("SUPABASE_ANON_KEY")
-	_, err := Load()
-	if err == nil {
-		t.Fatal("Load() should fail when SUPABASE_SERVICE_ROLE_KEY is missing")
-	}
-	if !strings.Contains(err.Error(), "SUPABASE_SERVICE_ROLE_KEY") {
-		t.Errorf("error should mention SUPABASE_SERVICE_ROLE_KEY, got: %v", err)
-	}
-}
-
-func TestLoad_FallbackToAnonKey(t *testing.T) {
-	cleanup := setRequiredEnvVars(t)
-	defer cleanup()
-
-	os.Unsetenv("SUPABASE_SERVICE_ROLE_KEY")
-	os.Setenv("SUPABASE_ANON_KEY", "legacy-anon-key")
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() should succeed with SUPABASE_ANON_KEY fallback: %v", err)
-	}
-	if cfg.SupabaseServiceRoleKey != "legacy-anon-key" {
-		t.Errorf("SupabaseServiceRoleKey = %q, want %q", cfg.SupabaseServiceRoleKey, "legacy-anon-key")
+	if !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Errorf("error should mention DATABASE_URL, got: %v", err)
 	}
 }
 
@@ -225,7 +189,7 @@ func TestLoad_JWTSecretTooShort(t *testing.T) {
 	cleanup := setRequiredEnvVars(t)
 	defer cleanup()
 
-	os.Setenv("JWT_SECRET", "short-secret") // less than 32 chars
+	os.Setenv("JWT_SECRET", "short-secret")
 	_, err := Load()
 	if err == nil {
 		t.Fatal("Load() should fail when JWT_SECRET is too short")

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -14,31 +15,17 @@ import (
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
-// setupCRUDEnv is a shared setup that configures a mock Supabase responding
-// with owner-verified budgets for all CRUD tests.
+// setupCRUDEnv initializes the database from TEST_DATABASE_URL for CRUD tests.
+// The extraMux parameter is ignored (kept for API compat).
 func setupCRUDEnv(t *testing.T, extraMux func(mux *http.ServeMux)) (*fiber.App, string) {
 	t.Helper()
 
-	mux := http.NewServeMux()
-
-	// Default: budgets owned by our test user.
-	mux.HandleFunc("/rest/v1/budgets", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[{"id":"22222222-2222-2222-2222-222222222222","user_id":"11111111-1111-1111-1111-111111111111"}]`))
-	})
-	mux.HandleFunc("/rest/v1/budget_collaborators", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[]`))
-	})
-
-	if extraMux != nil {
-		extraMux(mux)
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping CRUD integration test")
 	}
 
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	database.Init(server.URL, "test-api-key")
+	database.Init(dbURL)
 	middleware.Init("test-jwt-secret-crud")
 
 	hub := ws.NewHub()
