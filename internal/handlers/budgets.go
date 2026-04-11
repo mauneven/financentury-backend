@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -321,6 +322,11 @@ func CreateBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid request body")
 	}
 
+	// Sanitize text inputs.
+	req.Name = strings.TrimSpace(req.Name)
+	req.Currency = strings.TrimSpace(req.Currency)
+	req.Mode = strings.TrimSpace(req.Mode)
+
 	// Validate required fields.
 	if req.Name == "" {
 		return errBadRequest(c, "name is required")
@@ -339,23 +345,25 @@ func CreateBudget(c *fiber.Ctx) error {
 	if req.Currency == "" {
 		req.Currency = "COP"
 	}
-	if req.BillingPeriodMonths < 0 {
-		req.BillingPeriodMonths = 1
+	if req.Mode == "" {
+		req.Mode = "manual"
+	}
+
+	// Validate billing_period_months against allowed values.
+	if !validBillingPeriodMonths[req.BillingPeriodMonths] {
+		return errBadRequest(c, "billing_period_months must be one of: 0, 1, 3, 6, 12")
 	}
 	// billing_period_months == 0 means "one-time" budget (no billing cycle).
 	if req.BillingPeriodMonths > 0 && req.BillingCutoffDay <= 0 {
 		req.BillingCutoffDay = 1
-	}
-	if req.Mode == "" {
-		req.Mode = "manual"
 	}
 
 	// Validate mode and currency.
 	if !validBudgetModes[req.Mode] {
 		return errBadRequest(c, "invalid mode")
 	}
-	if len(req.Currency) != maxCurrencyLength {
-		return errBadRequest(c, "invalid currency code")
+	if !isValidCurrencyCode(req.Currency) {
+		return errBadRequest(c, "invalid currency code (must be 3 uppercase letters)")
 	}
 	if req.BillingPeriodMonths > 0 && (req.BillingCutoffDay < 1 || req.BillingCutoffDay > 31) {
 		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
@@ -510,6 +518,20 @@ func UpdateBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid request body")
 	}
 
+	// Sanitize text inputs.
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		req.Name = &trimmed
+	}
+	if req.Currency != nil {
+		trimmed := strings.TrimSpace(*req.Currency)
+		req.Currency = &trimmed
+	}
+	if req.Mode != nil {
+		trimmed := strings.TrimSpace(*req.Mode)
+		req.Mode = &trimmed
+	}
+
 	// Validate optional fields.
 	if req.Name != nil && *req.Name == "" {
 		return errBadRequest(c, "name cannot be empty")
@@ -526,14 +548,14 @@ func UpdateBudget(c *fiber.Ctx) error {
 	if req.Mode != nil && !validBudgetModes[*req.Mode] {
 		return errBadRequest(c, "invalid mode")
 	}
-	if req.Currency != nil && len(*req.Currency) != maxCurrencyLength {
-		return errBadRequest(c, "invalid currency code")
+	if req.Currency != nil && !isValidCurrencyCode(*req.Currency) {
+		return errBadRequest(c, "invalid currency code (must be 3 uppercase letters)")
 	}
-	if req.BillingPeriodMonths != nil && *req.BillingPeriodMonths < 0 {
-		return errBadRequest(c, "billing_period_months must be zero or positive")
+	if req.BillingPeriodMonths != nil && !validBillingPeriodMonths[*req.BillingPeriodMonths] {
+		return errBadRequest(c, "billing_period_months must be one of: 0, 1, 3, 6, 12")
 	}
-	if req.BillingCutoffDay != nil && (*req.BillingCutoffDay < 0 || *req.BillingCutoffDay > 31) {
-		return errBadRequest(c, "billing_cutoff_day must be between 0 and 31")
+	if req.BillingCutoffDay != nil && (*req.BillingCutoffDay < 1 || *req.BillingCutoffDay > 31) {
+		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
 	}
 
 	// Fetch existing budget to verify ownership.

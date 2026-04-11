@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -109,6 +110,11 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 	now := time.Now().UTC()
 	budgetID := uuid.New()
 
+	// Sanitize text inputs.
+	mb.Name = strings.TrimSpace(mb.Name)
+	mb.Currency = strings.TrimSpace(mb.Currency)
+	mb.Mode = strings.TrimSpace(mb.Mode)
+
 	// Validate budget fields.
 	if mb.Name == "" {
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "budget name is required")
@@ -133,7 +139,7 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 	if mb.Currency == "" {
 		mb.Currency = "COP"
 	}
-	if mb.BillingPeriodMonths <= 0 {
+	if !validBillingPeriodMonths[mb.BillingPeriodMonths] {
 		mb.BillingPeriodMonths = 1
 	}
 	if mb.Mode == "" {
@@ -142,8 +148,8 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 	if !validBudgetModes[mb.Mode] {
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid mode")
 	}
-	if len(mb.Currency) != maxCurrencyLength {
-		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid currency code")
+	if !isValidCurrencyCode(mb.Currency) {
+		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid currency code (must be 3 uppercase letters)")
 	}
 
 	// Create the budget.
@@ -278,6 +284,8 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 
 // validateMigrateSection checks migration section fields.
 func validateMigrateSection(ms MigrateSection) error {
+	ms.Name = strings.TrimSpace(ms.Name)
+	ms.Icon = strings.TrimSpace(ms.Icon)
 	if ms.Name == "" || len(ms.Name) > maxNameLength {
 		return fiber.NewError(fiber.StatusBadRequest, "section name is required and must not exceed 200 characters")
 	}
@@ -295,6 +303,8 @@ func validateMigrateSection(ms MigrateSection) error {
 
 // validateMigrateCategory checks migration category fields.
 func validateMigrateCategory(mc MigrateCategory) error {
+	mc.Name = strings.TrimSpace(mc.Name)
+	mc.Icon = strings.TrimSpace(mc.Icon)
 	if mc.Name == "" || len(mc.Name) > maxNameLength {
 		return fiber.NewError(fiber.StatusBadRequest, "category name is required and must not exceed 200 characters")
 	}
@@ -309,6 +319,8 @@ func validateMigrateCategory(mc MigrateCategory) error {
 
 // validateMigrateExpense checks migration expense fields.
 func validateMigrateExpense(me MigrateExpense) error {
+	me.Description = strings.TrimSpace(me.Description)
+	me.ExpenseDate = strings.TrimSpace(me.ExpenseDate)
 	if me.Amount <= 0 {
 		return fiber.NewError(fiber.StatusBadRequest, "expense amount must be positive")
 	}
@@ -320,6 +332,9 @@ func validateMigrateExpense(me MigrateExpense) error {
 	}
 	if me.ExpenseDate != "" && !isValidDate(me.ExpenseDate) {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid expense date format, use YYYY-MM-DD")
+	}
+	if me.ExpenseDate != "" && isDateTooFarInFuture(me.ExpenseDate) {
+		return fiber.NewError(fiber.StatusBadRequest, "expense date cannot be more than 1 year in the future")
 	}
 	return nil
 }

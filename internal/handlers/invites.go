@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -86,7 +87,7 @@ func CreateInvite(c *fiber.Ctx) error {
 
 // GetInviteInfo returns public invite preview info (no auth required).
 func GetInviteInfo(c *fiber.Ctx) error {
-	token := c.Params("token")
+	token := strings.TrimSpace(c.Params("token"))
 	if token == "" {
 		return errBadRequest(c, "invite token is required")
 	}
@@ -174,7 +175,7 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errUnauthorized(c)
 	}
 
-	token := c.Params("token")
+	token := strings.TrimSpace(c.Params("token"))
 	if token == "" {
 		return errBadRequest(c, "invite token is required")
 	}

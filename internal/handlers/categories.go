@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -34,6 +35,10 @@ func CreateCategory(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return errBadRequest(c, "invalid request body")
 	}
+
+	// Sanitize text inputs.
+	req.Name = strings.TrimSpace(req.Name)
+	req.Icon = strings.TrimSpace(req.Icon)
 
 	if req.Name == "" {
 		return errBadRequest(c, "name is required")
@@ -160,6 +165,16 @@ func UpdateCategory(c *fiber.Ctx) error {
 	var req models.UpdateCategoryRequest
 	if err := c.BodyParser(&req); err != nil {
 		return errBadRequest(c, "invalid request body")
+	}
+
+	// Sanitize text inputs.
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		req.Name = &trimmed
+	}
+	if req.Icon != nil {
+		trimmed := strings.TrimSpace(*req.Icon)
+		req.Icon = &trimmed
 	}
 
 	// Validate optional fields.

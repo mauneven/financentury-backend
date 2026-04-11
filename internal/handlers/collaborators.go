@@ -104,6 +104,11 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 		return errForbidden(c, "only the budget owner can remove collaborators")
 	}
 
+	// Prevent the owner from removing themselves as a collaborator.
+	if targetUserID == userID {
+		return errBadRequest(c, "cannot remove yourself as the budget owner")
+	}
+
 	// Verify the collaborator exists.
 	checkQuery := database.NewFilter().
 		Select("id").

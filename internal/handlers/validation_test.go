@@ -3,6 +3,7 @@ package handlers
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // ==================== isValidDate ====================
@@ -437,6 +438,122 @@ func TestMarshalJSON_InvalidInput(t *testing.T) {
 	_, err := marshalJSON(ch)
 	if err == nil {
 		t.Error("marshalJSON(channel) should return an error")
+	}
+}
+
+// ==================== isValidCurrencyCode ====================
+
+func TestIsValidCurrencyCode_Valid(t *testing.T) {
+	valid := []string{"COP", "USD", "EUR", "GBP", "JPY", "BRL", "ARS", "MXN"}
+	for _, c := range valid {
+		if !isValidCurrencyCode(c) {
+			t.Errorf("isValidCurrencyCode(%q) = false, want true", c)
+		}
+	}
+}
+
+func TestIsValidCurrencyCode_Invalid(t *testing.T) {
+	invalid := []string{
+		"",      // empty
+		"US",    // too short
+		"EURO",  // too long
+		"usd",   // lowercase
+		"Usd",   // mixed case
+		"123",   // digits
+		"U$D",   // special chars
+		"   ",   // spaces
+		"AB ",   // trailing space
+	}
+	for _, c := range invalid {
+		if isValidCurrencyCode(c) {
+			t.Errorf("isValidCurrencyCode(%q) = true, want false", c)
+		}
+	}
+}
+
+// ==================== validBillingPeriodMonths ====================
+
+func TestValidBillingPeriodMonths_Accepted(t *testing.T) {
+	accepted := []int{0, 1, 3, 6, 12}
+	for _, v := range accepted {
+		if !validBillingPeriodMonths[v] {
+			t.Errorf("billing_period_months %d should be accepted", v)
+		}
+	}
+}
+
+func TestValidBillingPeriodMonths_Rejected(t *testing.T) {
+	rejected := []int{-1, 2, 4, 5, 7, 8, 9, 10, 11, 13, 24, 100}
+	for _, v := range rejected {
+		if validBillingPeriodMonths[v] {
+			t.Errorf("billing_period_months %d should be rejected", v)
+		}
+	}
+}
+
+// ==================== isDateTooFarInFuture ====================
+
+func TestIsDateTooFarInFuture_Today(t *testing.T) {
+	today := time.Now().UTC().Format("2006-01-02")
+	if isDateTooFarInFuture(today) {
+		t.Errorf("today's date should not be too far in the future")
+	}
+}
+
+func TestIsDateTooFarInFuture_Tomorrow(t *testing.T) {
+	tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02")
+	if isDateTooFarInFuture(tomorrow) {
+		t.Errorf("tomorrow should not be too far in the future")
+	}
+}
+
+func TestIsDateTooFarInFuture_Past(t *testing.T) {
+	past := time.Now().UTC().AddDate(-1, 0, 0).Format("2006-01-02")
+	if isDateTooFarInFuture(past) {
+		t.Errorf("a past date should not be flagged as too far in the future")
+	}
+}
+
+func TestIsDateTooFarInFuture_JustWithinLimit(t *testing.T) {
+	// 364 days from now should be within the limit.
+	withinLimit := time.Now().UTC().AddDate(0, 0, maxFutureDateDays-1).Format("2006-01-02")
+	if isDateTooFarInFuture(withinLimit) {
+		t.Errorf("date %d days from now should be within the 1-year limit", maxFutureDateDays-1)
+	}
+}
+
+func TestIsDateTooFarInFuture_BeyondLimit(t *testing.T) {
+	// 366+ days from now should exceed the limit.
+	beyondLimit := time.Now().UTC().AddDate(0, 0, maxFutureDateDays+1).Format("2006-01-02")
+	if !isDateTooFarInFuture(beyondLimit) {
+		t.Errorf("date %d days from now should exceed the 1-year limit", maxFutureDateDays+1)
+	}
+}
+
+func TestIsDateTooFarInFuture_InvalidDate(t *testing.T) {
+	// Invalid dates should return false (caught by isValidDate separately).
+	if isDateTooFarInFuture("not-a-date") {
+		t.Errorf("invalid date string should not be flagged as too far in the future")
+	}
+}
+
+// ==================== trimName ====================
+
+func TestTrimName_LeadingTrailingSpaces(t *testing.T) {
+	if got := trimName("  hello  "); got != "hello" {
+		t.Errorf("trimName(\"  hello  \") = %q, want \"hello\"", got)
+	}
+}
+
+func TestTrimName_Empty(t *testing.T) {
+	if got := trimName("   "); got != "" {
+		t.Errorf("trimName(\"   \") = %q, want empty string", got)
+	}
+}
+
+func TestTrimName_NoTrimNeeded(t *testing.T) {
+	if got := trimName("test"); got != "test" {
+		t.Errorf("trimName(\"test\") = %q, want \"test\"", got)
 	}
 }
 

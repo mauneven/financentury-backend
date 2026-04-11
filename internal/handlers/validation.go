@@ -3,7 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -48,6 +50,46 @@ var guidedModes = map[string]bool{
 	"debt-payoff": true,
 	"travel":     true,
 	"event":      true,
+}
+
+// validBillingPeriodMonths lists the accepted billing period values.
+// 0 = one-time budget (no billing cycle), 1/3/6/12 = recurring.
+var validBillingPeriodMonths = map[int]bool{
+	0: true, 1: true, 3: true, 6: true, 12: true,
+}
+
+// maxFutureDateDays is the maximum number of days an expense date can be in
+// the future before it's rejected as likely a mistake.
+const maxFutureDateDays = 365
+
+// isValidCurrencyCode checks whether s is a valid 3-letter uppercase ISO-style
+// currency code (e.g. "USD", "EUR", "COP").
+func isValidCurrencyCode(s string) bool {
+	if len(s) != maxCurrencyLength {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsUpper(r) || !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isDateTooFarInFuture returns true if the given YYYY-MM-DD date string is
+// more than maxFutureDateDays from today.
+func isDateTooFarInFuture(dateStr string) bool {
+	t, err := time.Parse(dateFormat, dateStr)
+	if err != nil {
+		return false // invalid date will be caught by isValidDate
+	}
+	maxDate := time.Now().UTC().AddDate(0, 0, maxFutureDateDays)
+	return t.After(maxDate)
+}
+
+// trimName trims whitespace from a name string.
+func trimName(s string) string {
+	return strings.TrimSpace(s)
 }
 
 // --- Common Error Helpers ---

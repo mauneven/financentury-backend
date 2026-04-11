@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -99,6 +100,10 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid request body")
 	}
 
+	// Sanitize text inputs.
+	req.Description = strings.TrimSpace(req.Description)
+	req.ExpenseDate = strings.TrimSpace(req.ExpenseDate)
+
 	// Validate required fields.
 	if req.CategoryID == uuid.Nil {
 		return errBadRequest(c, "category_id is required")
@@ -117,6 +122,9 @@ func CreateExpense(c *fiber.Ctx) error {
 	}
 	if !isValidDate(req.ExpenseDate) {
 		return errBadRequest(c, "invalid date format, use YYYY-MM-DD")
+	}
+	if isDateTooFarInFuture(req.ExpenseDate) {
+		return errBadRequest(c, "expense_date cannot be more than 1 year in the future")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
@@ -193,6 +201,16 @@ func UpdateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid request body")
 	}
 
+	// Sanitize text inputs.
+	if req.Description != nil {
+		trimmed := strings.TrimSpace(*req.Description)
+		req.Description = &trimmed
+	}
+	if req.ExpenseDate != nil {
+		trimmed := strings.TrimSpace(*req.ExpenseDate)
+		req.ExpenseDate = &trimmed
+	}
+
 	// Validate optional fields.
 	if req.Amount != nil && *req.Amount <= 0 {
 		return errBadRequest(c, "amount must be positive")
@@ -209,6 +227,9 @@ func UpdateExpense(c *fiber.Ctx) error {
 		}
 		if !isValidDate(*req.ExpenseDate) {
 			return errBadRequest(c, "invalid date format, use YYYY-MM-DD")
+		}
+		if isDateTooFarInFuture(*req.ExpenseDate) {
+			return errBadRequest(c, "expense_date cannot be more than 1 year in the future")
 		}
 	}
 
