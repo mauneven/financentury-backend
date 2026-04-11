@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -363,4 +364,101 @@ func Me(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(profiles[0])
+}
+
+// DeleteAccount permanently removes the authenticated user and all their data.
+// This includes all owned budgets, sections, categories, expenses, invites,
+// collaborator records, and the profile itself. Executes in a single transaction.
+func DeleteAccount(c *fiber.Ctx) error {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
+	}
+
+	uid := userID.String()
+	ctx := context.Background()
+
+	tx, err := database.DB.Pool.Begin(ctx)
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Collect all budget IDs owned by this user.
+	rows, err := tx.Query(ctx, "SELECT id FROM budgets WHERE user_id = $1", uid)
+	if err != nil {
+		return errInternal(c, "failed to fetch budgets")
+	}
+	var budgetIDs []string
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr == nil {
+			budgetIDs = append(budgetIDs, id)
+		}
+	}
+	rows.Close()
+
+	if len(budgetIDs) > 0 {
+		// Delete expenses for all owned budgets.
+		if _, err = tx.Exec(ctx, "DELETE FROM budget_expenses WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
+			return errInternal(c, "failed to delete expenses")
+		}
+
+		// Collect section IDs to delete nested subcategories.
+		secRows, err := tx.Query(ctx, "SELECT id FROM budget_categories WHERE budget_id = ANY($1::uuid[])", budgetIDs)
+		if err != nil {
+			return errInternal(c, "failed to fetch sections")
+		}
+		var sectionIDs []string
+		for secRows.Next() {
+			var id string
+			if scanErr := secRows.Scan(&id); scanErr == nil {
+				sectionIDs = append(sectionIDs, id)
+			}
+		}
+		secRows.Close()
+
+		if len(sectionIDs) > 0 {
+			if _, err = tx.Exec(ctx, "DELETE FROM budget_subcategories WHERE category_id = ANY($1::uuid[])", sectionIDs); err != nil {
+				return errInternal(c, "failed to delete subcategories")
+			}
+		}
+
+		if _, err = tx.Exec(ctx, "DELETE FROM budget_categories WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
+			return errInternal(c, "failed to delete sections")
+		}
+
+		if _, err = tx.Exec(ctx, "DELETE FROM budget_invites WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
+			return errInternal(c, "failed to delete budget invites")
+		}
+
+		if _, err = tx.Exec(ctx, "DELETE FROM budget_collaborators WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
+			return errInternal(c, "failed to delete budget collaborators")
+		}
+
+		if _, err = tx.Exec(ctx, "DELETE FROM budgets WHERE user_id = $1", uid); err != nil {
+			return errInternal(c, "failed to delete budgets")
+		}
+	}
+
+	// Remove user as collaborator on other people's budgets.
+	if _, err = tx.Exec(ctx, "DELETE FROM budget_collaborators WHERE user_id = $1", uid); err != nil {
+		return errInternal(c, "failed to remove collaborations")
+	}
+
+	// Delete any invites the user created on budgets they don't own.
+	if _, err = tx.Exec(ctx, "DELETE FROM budget_invites WHERE created_by = $1", uid); err != nil {
+		return errInternal(c, "failed to delete invites")
+	}
+
+	// Finally, delete the profile itself.
+	if _, err = tx.Exec(ctx, "DELETE FROM profiles WHERE id = $1", uid); err != nil {
+		return errInternal(c, "failed to delete profile")
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return errInternal(c, "failed to commit account deletion")
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
 }

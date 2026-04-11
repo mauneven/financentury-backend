@@ -29,6 +29,7 @@ func Setup(app *fiber.App) {
 
 	// Auth routes (protected -- requires valid JWT).
 	protected.Get("/auth/me", handlers.Me)
+	protected.Delete("/auth/account", handlers.DeleteAccount)
 
 	// Migration route with strict rate limiting since it is a heavy operation.
 	protected.Post("/migrate", middleware.MigrateRateLimiter(), handlers.Migrate)
