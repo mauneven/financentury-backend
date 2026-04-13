@@ -366,6 +366,56 @@ func Me(c *fiber.Ctx) error {
 	return c.JSON(profiles[0])
 }
 
+// UpdateProfile updates the authenticated user's profile (currently only name).
+func UpdateProfile(c *fiber.Ctx) error {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
+	}
+
+	var req struct {
+		FullName string `json:"full_name"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return errBadRequest(c, "invalid request body")
+	}
+
+	req.FullName = strings.TrimSpace(req.FullName)
+	if req.FullName == "" {
+		return errBadRequest(c, "name cannot be empty")
+	}
+	if len(req.FullName) > 100 {
+		return errBadRequest(c, "name too long (max 100 characters)")
+	}
+
+	ctx := context.Background()
+	_, err := database.DB.Pool.Exec(ctx,
+		"UPDATE profiles SET full_name = $1, updated_at = NOW() WHERE id = $2",
+		req.FullName, userID.String(),
+	)
+	if err != nil {
+		return errInternal(c, "failed to update profile")
+	}
+
+	// Return updated profile.
+	query := database.NewFilter().
+		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		Eq("id", userID.String()).
+		Build()
+
+	body, statusCode, err := database.DB.Get("profiles", query)
+	if err != nil || statusCode != http.StatusOK {
+		return errInternal(c, "failed to fetch updated profile")
+	}
+
+	var profiles []models.Profile
+	if err := json.Unmarshal(body, &profiles); err != nil || len(profiles) == 0 {
+		return errInternal(c, "failed to parse updated profile")
+	}
+
+	return c.JSON(profiles[0])
+}
+
 // DeleteAccount permanently removes the authenticated user and all their data.
 // This includes all owned budgets, sections, categories, expenses, invites,
 // collaborator records, and the profile itself. Executes in a single transaction.
