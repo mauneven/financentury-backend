@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,28 @@ import (
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
+
+// expenseRetentionCutoff returns the cutoff date (12 months ago) as a
+// YYYY-MM-DD string. Expenses with expense_date before this value are eligible
+// for automatic deletion.
+func expenseRetentionCutoff() string {
+	return time.Now().UTC().AddDate(-1, 0, 0).Format("2006-01-02")
+}
+
+// pruneOldExpenses deletes expenses older than 12 months for the given budget.
+// Errors are logged but not returned — this is a best-effort cleanup that must
+// not block or fail the calling request.
+func pruneOldExpenses(budgetID uuid.UUID) {
+	cutoff := expenseRetentionCutoff()
+	query := database.NewFilter().
+		Eq("budget_id", budgetID.String()).
+		Lt("expense_date", cutoff).
+		Build()
+	_, _, err := database.DB.Delete("budget_expenses", query)
+	if err != nil {
+		log.Printf("[expenses] prune old expenses for budget %s: %v", budgetID, err)
+	}
+}
 
 // parsePaginationParams extracts limit and offset from query params with
 // sensible defaults (limit=100, offset=0) and a hard ceiling (limit<=500).
@@ -55,11 +78,15 @@ func ListExpenses(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	// Delete expenses older than 12 months before returning results.
+	pruneOldExpenses(budgetID)
+
 	limit, offset := parsePaginationParams(c)
 
 	query := database.NewFilter().
 		Select("id,budget_id,subcategory_id,amount,description,expense_date,created_by,created_at,updated_at").
 		Eq("budget_id", budgetID.String()).
+		Gte("expense_date", expenseRetentionCutoff()).
 		Order("expense_date", "desc").
 		Limit(limit).
 		Offset(offset).

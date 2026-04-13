@@ -549,6 +549,7 @@ func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
 		Select("subcategory_id,amount").
 		Eq("budget_id", budgetID.String()).
+		Gte("expense_date", expenseRetentionCutoff()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)
@@ -598,6 +599,7 @@ func fetchExpensesForTrends(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
 		Select("subcategory_id,amount,expense_date").
 		Eq("budget_id", budgetID.String()).
+		Gte("expense_date", expenseRetentionCutoff()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)
