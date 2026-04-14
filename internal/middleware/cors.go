@@ -20,7 +20,7 @@ func CORS(origin string) fiber.Handler {
 	return cors.New(cors.Config{
 		AllowOrigins:     origin,
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
+		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Timezone",
 		AllowCredentials: true,
 		MaxAge:           3600, // 1 hour -- reduce from 24h to limit stale policy risk.
 	})

@@ -106,6 +106,20 @@ func minInt(a, b int) int {
 	return b
 }
 
+// resolveUserToday returns the current date in the user's timezone.
+// It reads the IANA timezone name from the X-Timezone header (e.g.
+// "America/Bogota"). Falls back to UTC when the header is missing or
+// contains an unrecognised timezone.
+func resolveUserToday(c *fiber.Ctx) time.Time {
+	tz := c.Get("X-Timezone")
+	if tz != "" {
+		if loc, err := time.LoadLocation(tz); err == nil {
+			return time.Now().In(loc)
+		}
+	}
+	return time.Now().UTC()
+}
+
 // ---------- GetBudgetSummary ----------
 
 // GetBudgetSummary computes and returns the full budget summary. All math is
@@ -148,6 +162,12 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	//
 	//    For one-time budgets (billing_period_months == 0), skip billing period
 	//    calculation and include ALL expenses.
+
+	// Resolve the user's timezone from the X-Timezone header so that
+	// billing-period boundaries align with the user's local calendar day.
+	// Falls back to UTC when the header is missing or invalid.
+	userToday := resolveUserToday(c)
+
 	var (
 		sections []models.Section
 		expenses []models.Expense
@@ -170,8 +190,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 			// One-time budget: all expenses count toward the total.
 			expenses, fetchErr = fetchAllExpensesForSummary(budgetID)
 		} else {
-			today := time.Now().UTC()
-			periodStart := ComputeBillingPeriodStart(today, budget.BillingCutoffDay, budget.BillingPeriodMonths)
+			periodStart := ComputeBillingPeriodStart(userToday, budget.BillingCutoffDay, budget.BillingPeriodMonths)
 			expenses, fetchErr = fetchExpensesForSummary(budgetID, periodStart)
 		}
 		if fetchErr != nil {
@@ -228,7 +247,16 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	// this total; summing them would only equal monthly_income when 100% is
 	// allocated and would be wrong otherwise.
 	totalBudget := roundAmount(budget.MonthlyIncome)
+
+	// Compute total_spent from ALL expenses in this billing period, regardless
+	// of whether they are linked to a current category. This ensures the
+	// top-level total always reflects actual spending even if some expenses
+	// are orphaned (their category was deleted or re-created).
 	var totalSpent float64
+	for _, exp := range expenses {
+		totalSpent += exp.Amount
+	}
+	totalSpent = roundAmount(totalSpent)
 
 	sectionSummaries := make([]models.SectionSummary, 0, len(sections))
 	for _, section := range sections {
@@ -266,7 +294,6 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		}
 
 		sectionSpent = roundAmount(sectionSpent)
-		totalSpent += sectionSpent
 
 		sectionSummaries = append(sectionSummaries, models.SectionSummary{
 			Section:         section,
@@ -275,8 +302,6 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 			TotalSpent:      sectionSpent,
 		})
 	}
-
-	totalSpent = roundAmount(totalSpent)
 
 	resp := models.BudgetSummary{
 		Budget:      *budget,
