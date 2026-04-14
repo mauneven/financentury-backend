@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ type guidedCategory struct {
 func getBalancedSections() []guidedSection {
 	return []guidedSection{
 		{
-			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
+			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
 			Categories: []guidedCategory{
 				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
 				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
@@ -72,7 +73,7 @@ func getBalancedSections() []guidedSection {
 func getDebtFreeSections() []guidedSection {
 	return []guidedSection{
 		{
-			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
+			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
 			Categories: []guidedCategory{
 				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
 				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
@@ -101,7 +102,7 @@ func getDebtFreeSections() []guidedSection {
 func getDebtPayoffSections() []guidedSection {
 	return []guidedSection{
 		{
-			Name: "Necesidades", Percent: 50, Icon: "home", SortOrder: 1,
+			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
 			Categories: []guidedCategory{
 				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
 				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
@@ -287,8 +288,62 @@ func ListBudgets(c *fiber.Ctx) error {
 	return c.JSON(budgets)
 }
 
-// maxBudgetsPerUser is the maximum number of budgets a single user can own.
+// maxBudgetsPerUser is the maximum number of budgets a user can access
+// (owned + collaborated combined).
 const maxBudgetsPerUser = 7
+
+// enforceUserBudgetLimit checks that the user hasn't reached the budget cap.
+// Returns an error with message "limit" when the cap is hit, or a generic
+// error on internal failures. Returns nil when under the limit.
+func enforceUserBudgetLimit(userID uuid.UUID) error {
+	uid := userID.String()
+
+	var ownedCount, collabCount int
+
+	g := new(errgroup.Group)
+
+	g.Go(func() error {
+		q := database.NewFilter().
+			Select("id").
+			Eq("user_id", uid).
+			Build()
+		body, status, err := database.DB.Get("budgets", q)
+		if err != nil || status != http.StatusOK {
+			return fiber.ErrInternalServerError
+		}
+		var rows []struct{ ID string `json:"id"` }
+		if err := json.Unmarshal(body, &rows); err != nil {
+			return fiber.ErrInternalServerError
+		}
+		ownedCount = len(rows)
+		return nil
+	})
+
+	g.Go(func() error {
+		q := database.NewFilter().
+			Select("id").
+			Eq("user_id", uid).
+			Build()
+		body, status, err := database.DB.Get("budget_collaborators", q)
+		if err != nil || status != http.StatusOK {
+			// Non-fatal: user may have no collaborations.
+			return nil
+		}
+		var rows []struct{ ID string `json:"id"` }
+		_ = json.Unmarshal(body, &rows)
+		collabCount = len(rows)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if ownedCount+collabCount >= maxBudgetsPerUser {
+		return fmt.Errorf("limit")
+	}
+	return nil
+}
 
 // CreateBudget creates a new budget and optionally seeds guided sections.
 // On success it broadcasts a budget_created event via WebSocket.
@@ -298,23 +353,12 @@ func CreateBudget(c *fiber.Ctx) error {
 		return errUnauthorized(c)
 	}
 
-	// Enforce per-user budget limit.
-	countQuery := database.NewFilter().
-		Select("id").
-		Eq("user_id", userID.String()).
-		Build()
-
-	countBody, countStatus, countErr := database.DB.Get("budgets", countQuery)
-	if countErr != nil || countStatus != http.StatusOK {
+	// Enforce per-user budget limit (owned + collaborated budgets both count).
+	if err := enforceUserBudgetLimit(userID); err != nil {
+		if err.Error() == "limit" {
+			return errBadRequest(c, "budget limit reached (max 7)")
+		}
 		return errInternal(c, "failed to check budget count")
-	}
-
-	var existing []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(countBody, &existing); err != nil {
-		return errInternal(c, "failed to parse budget count")
-	}
-	if len(existing) >= maxBudgetsPerUser {
-		return errBadRequest(c, "budget limit reached (max 7)")
 	}
 
 	var req models.CreateBudgetRequest

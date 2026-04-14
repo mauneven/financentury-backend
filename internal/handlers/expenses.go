@@ -109,6 +109,9 @@ func ListExpenses(c *fiber.Ctx) error {
 	return c.JSON(expenses)
 }
 
+// maxExpensesPerBudget is the maximum number of expenses allowed in a single budget.
+const maxExpensesPerBudget = 3000
+
 // CreateExpense creates a new expense for a budget.
 // On success it broadcasts an expense_created event via WebSocket.
 func CreateExpense(c *fiber.Ctx) error {
@@ -120,6 +123,25 @@ func CreateExpense(c *fiber.Ctx) error {
 	budgetID, ok := parseUUIDParam(c, "id")
 	if !ok {
 		return errBadRequest(c, "invalid budget ID")
+	}
+
+	// Enforce per-budget expense limit.
+	countQuery := database.NewFilter().
+		Select("id").
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	countBody, countStatus, countErr := database.DB.Get("budget_expenses", countQuery)
+	if countErr != nil || countStatus != http.StatusOK {
+		return errInternal(c, "failed to check expense count")
+	}
+
+	var existingExpenses []struct{ ID string `json:"id"` }
+	if err := json.Unmarshal(countBody, &existingExpenses); err != nil {
+		return errInternal(c, "failed to parse expense count")
+	}
+	if len(existingExpenses) >= maxExpensesPerBudget {
+		return errBadRequest(c, "expense limit reached (max 3000 per budget)")
 	}
 
 	var req models.CreateExpenseRequest

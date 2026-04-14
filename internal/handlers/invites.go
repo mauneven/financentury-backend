@@ -229,6 +229,14 @@ func AcceptInvite(c *fiber.Ctx) error {
 		}
 	}
 
+	// Enforce per-user budget limit before adding a new collaboration.
+	if err := enforceUserBudgetLimit(userID); err != nil {
+		if err.Error() == "limit" {
+			return errBadRequest(c, "budget limit reached (max 7)")
+		}
+		return errInternal(c, "failed to check budget count")
+	}
+
 	// Prevent duplicate collaborator.
 	collabCheckQuery := database.NewFilter().
 		Select("id").
