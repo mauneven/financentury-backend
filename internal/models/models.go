@@ -208,12 +208,20 @@ type SummaryCategoryView struct {
 	CreatedAt         time.Time `json:"created_at"`
 }
 
+// UserSpending represents one user's spending within a budget, section, or category.
+type UserSpending struct {
+	UserID  uuid.UUID `json:"user_id"`
+	Profile *Profile  `json:"profile,omitempty"`
+	Amount  float64   `json:"amount"`
+}
+
 // CategorySummary contains a category with its spending totals.
 type CategorySummary struct {
 	Category        SummaryCategoryView `json:"category"`
 	AllocatedAmount float64             `json:"allocated_amount"`
 	TotalSpent      float64             `json:"total_spent"`
 	ExpenseCount    int                 `json:"expense_count"`
+	SpendingByUser  []UserSpending      `json:"spending_by_user,omitempty"`
 }
 
 // SectionSummary contains a section with category summaries.
@@ -222,14 +230,16 @@ type SectionSummary struct {
 	Categories      []CategorySummary `json:"categories"`
 	AllocatedAmount float64           `json:"allocated_amount"`
 	TotalSpent      float64           `json:"total_spent"`
+	SpendingByUser  []UserSpending    `json:"spending_by_user,omitempty"`
 }
 
 // BudgetSummary is the full budget summary response.
 type BudgetSummary struct {
-	Budget      Budget           `json:"budget"`
-	Sections    []SectionSummary `json:"sections"`
-	TotalBudget float64          `json:"total_budget"`
-	TotalSpent  float64          `json:"total_spent"`
+	Budget         Budget           `json:"budget"`
+	Sections       []SectionSummary `json:"sections"`
+	TotalBudget    float64          `json:"total_budget"`
+	TotalSpent     float64          `json:"total_spent"`
+	SpendingByUser []UserSpending   `json:"spending_by_user,omitempty"`
 }
 
 // MonthlyTrend represents spending for a single month.

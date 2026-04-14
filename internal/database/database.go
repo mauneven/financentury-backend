@@ -168,15 +168,20 @@ func (p parsedQuery) buildOrder() string {
 	return fmt.Sprintf("ORDER BY %s %s", quoteIdent(p.orderCol), dir)
 }
 
-func (p parsedQuery) buildLimitOffset() string {
+func (p parsedQuery) buildLimitOffset(argStart int) (string, []interface{}) {
 	var parts []string
+	var args []interface{}
+	idx := argStart
 	if p.limit != "" {
-		parts = append(parts, "LIMIT "+p.limit)
+		parts = append(parts, fmt.Sprintf("LIMIT $%d", idx))
+		args = append(args, p.limit)
+		idx++
 	}
 	if p.offset != "" {
-		parts = append(parts, "OFFSET "+p.offset)
+		parts = append(parts, fmt.Sprintf("OFFSET $%d", idx))
+		args = append(args, p.offset)
 	}
-	return strings.Join(parts, " ")
+	return strings.Join(parts, " "), args
 }
 
 func selectColumns(raw string) string {
@@ -199,9 +204,11 @@ func selectColumns(raw string) string {
 func (c *Client) Get(table, query string) ([]byte, int, error) {
 	p := parseQuery(query)
 	where, args := p.buildWhere(1)
+	limitOffset, loArgs := p.buildLimitOffset(len(args) + 1)
+	args = append(args, loArgs...)
 
 	inner := fmt.Sprintf("SELECT %s FROM %s %s %s %s",
-		selectColumns(p.selectCols), quoteIdent(table), where, p.buildOrder(), p.buildLimitOffset())
+		selectColumns(p.selectCols), quoteIdent(table), where, p.buildOrder(), limitOffset)
 
 	sql := fmt.Sprintf("SELECT COALESCE(json_agg(to_json(t)), '[]'::json) FROM (%s) t", inner)
 

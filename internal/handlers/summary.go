@@ -224,34 +224,86 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		catsBySection[cat.CategoryID] = append(catsBySection[cat.CategoryID], cat)
 	}
 
-	// 6. Aggregate expenses by category_id. Pre-size to the number of
-	//    categories since that is the upper bound of distinct category IDs.
+	// 6. Aggregate expenses by category_id AND by user at each level.
 	type expenseAgg struct {
 		totalSpent float64
 		count      int
+		byUser     map[uuid.UUID]float64
 	}
 	expBySubcat := make(map[uuid.UUID]*expenseAgg, len(categories))
+	budgetByUser := make(map[uuid.UUID]float64)
+	allUserIDs := make(map[uuid.UUID]struct{})
+
 	for _, exp := range expenses {
 		agg := expBySubcat[exp.CategoryID]
 		if agg == nil {
-			agg = &expenseAgg{}
+			agg = &expenseAgg{byUser: make(map[uuid.UUID]float64)}
 			expBySubcat[exp.CategoryID] = agg
 		}
 		agg.totalSpent += exp.Amount
 		agg.count++
+
+		// Per-user aggregation — only when created_by is set.
+		if exp.CreatedBy != nil {
+			uid := *exp.CreatedBy
+			agg.byUser[uid] += exp.Amount
+			budgetByUser[uid] += exp.Amount
+			allUserIDs[uid] = struct{}{}
+		}
+	}
+
+	// 6b. Batch-fetch profiles for all users who have expenses.
+	//     Only do this when there are multiple spenders (shared budget).
+	profileMap := make(map[uuid.UUID]*models.Profile)
+	if len(allUserIDs) > 1 {
+		userIDStrs := make([]string, 0, len(allUserIDs))
+		for uid := range allUserIDs {
+			userIDStrs = append(userIDStrs, uid.String())
+		}
+		profileQuery := database.NewFilter().
+			Select("id,email,full_name,avatar_url,created_at,updated_at").
+			In("id", userIDStrs).
+			Build()
+		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+		if profileErr == nil && profileStatus == http.StatusOK {
+			var profiles []models.Profile
+			if err := json.Unmarshal(profileBody, &profiles); err == nil {
+				for i := range profiles {
+					profileMap[profiles[i].ID] = &profiles[i]
+				}
+			}
+		}
+	}
+
+	// Helper: build sorted UserSpending slice from a per-user map.
+	buildUserSpending := func(byUser map[uuid.UUID]float64) []models.UserSpending {
+		if len(byUser) <= 1 {
+			return nil // skip for solo budgets
+		}
+		result := make([]models.UserSpending, 0, len(byUser))
+		for uid, amount := range byUser {
+			result = append(result, models.UserSpending{
+				UserID:  uid,
+				Profile: profileMap[uid],
+				Amount:  roundAmount(amount),
+			})
+		}
+		// Sort descending by amount for consistent ordering.
+		for i := 1; i < len(result); i++ {
+			key := result[i]
+			j := i - 1
+			for j >= 0 && result[j].Amount < key.Amount {
+				result[j+1] = result[j]
+				j--
+			}
+			result[j+1] = key
+		}
+		return result
 	}
 
 	// 7. Build the response.
-	// total_budget is ALWAYS the budget's monthly_income – it is the true
-	// budget amount the user configured.  Section allocations are portions of
-	// this total; summing them would only equal monthly_income when 100% is
-	// allocated and would be wrong otherwise.
 	totalBudget := roundAmount(budget.MonthlyIncome)
 
-	// Compute total_spent from ALL expenses in this billing period, regardless
-	// of whether they are linked to a current category. This ensures the
-	// top-level total always reflects actual spending even if some expenses
-	// are orphaned (their category was deleted or re-created).
 	var totalSpent float64
 	for _, exp := range expenses {
 		totalSpent += exp.Amount
@@ -265,15 +317,22 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		cats := catsBySection[section.ID]
 		catSummaries := make([]models.CategorySummary, 0, len(cats))
 		var sectionSpent float64
+		sectionByUser := make(map[uuid.UUID]float64)
 
 		for _, cat := range cats {
 			catAllocated := roundAmount(sectionAllocated * cat.AllocationPercent / 100)
 
 			var catSpent float64
 			var catCount int
+			var catUserSpending []models.UserSpending
 			if agg, ok := expBySubcat[cat.ID]; ok {
 				catSpent = roundAmount(agg.totalSpent)
 				catCount = agg.count
+				catUserSpending = buildUserSpending(agg.byUser)
+				// Roll up to section level.
+				for uid, amt := range agg.byUser {
+					sectionByUser[uid] += amt
+				}
 			}
 			sectionSpent += catSpent
 
@@ -290,6 +349,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 				AllocatedAmount: catAllocated,
 				TotalSpent:      catSpent,
 				ExpenseCount:    catCount,
+				SpendingByUser:  catUserSpending,
 			})
 		}
 
@@ -300,14 +360,16 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 			Categories:      catSummaries,
 			AllocatedAmount: sectionAllocated,
 			TotalSpent:      sectionSpent,
+			SpendingByUser:  buildUserSpending(sectionByUser),
 		})
 	}
 
 	resp := models.BudgetSummary{
-		Budget:      *budget,
-		Sections:    sectionSummaries,
-		TotalBudget: totalBudget,
-		TotalSpent:  totalSpent,
+		Budget:         *budget,
+		Sections:       sectionSummaries,
+		TotalBudget:    totalBudget,
+		TotalSpent:     totalSpent,
+		SpendingByUser: buildUserSpending(budgetByUser),
 	}
 
 	return c.JSON(resp)
@@ -572,7 +634,7 @@ func fetchAllExpenses(budgetID uuid.UUID) ([]models.Expense, error) {
 // Used for one-time budgets where every expense counts toward the total.
 func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount").
+		Select("subcategory_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", expenseRetentionCutoff()).
 		Build()
@@ -597,7 +659,7 @@ func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 // Fetching fewer columns reduces data transfer for budgets with many expenses.
 func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount").
+		Select("subcategory_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", periodStart.Format("2006-01-02")).
 		Build()
