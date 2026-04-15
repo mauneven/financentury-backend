@@ -249,6 +249,8 @@ func Register(c *fiber.Ctx) error {
 		return errInternal(c, "failed to generate token")
 	}
 
+	CreateSession(profileID, token, c)
+
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"token": token,
 		"user": fiber.Map{
@@ -338,6 +340,8 @@ func Login(c *fiber.Ctx) error {
 	if err != nil {
 		return errInternal(c, "failed to generate token")
 	}
+
+	CreateSession(profile.ID, token, c)
 
 	return c.JSON(fiber.Map{
 		"token": token,

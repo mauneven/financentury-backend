@@ -32,6 +32,11 @@ func Setup(app *fiber.App) {
 	protected.Patch("/auth/profile", handlers.UpdateProfile)
 	protected.Delete("/auth/account", handlers.DeleteAccount)
 
+	// Session routes.
+	protected.Get("/auth/sessions", handlers.ListSessions)
+	protected.Delete("/auth/sessions/:sessionId", handlers.RevokeSession)
+	protected.Post("/auth/sign-out", handlers.SignOut)
+
 	// Migration route with strict rate limiting since it is a heavy operation.
 	protected.Post("/migrate", middleware.MigrateRateLimiter(), handlers.Migrate)
 

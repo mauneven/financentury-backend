@@ -202,6 +202,8 @@ func GoogleLogin(c *fiber.Ctx) error {
 		return errInternal(c, "failed to generate token")
 	}
 
+	CreateSession(profile.ID, token, c)
+
 	return c.JSON(fiber.Map{
 		"token": token,
 		"user": fiber.Map{
@@ -499,6 +501,11 @@ func DeleteAccount(c *fiber.Ctx) error {
 	// Delete any invites the user created on budgets they don't own.
 	if _, err = tx.Exec(ctx, "DELETE FROM budget_invites WHERE created_by = $1", uid); err != nil {
 		return errInternal(c, "failed to delete invites")
+	}
+
+	// Delete sessions.
+	if _, err = tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", uid); err != nil {
+		return errInternal(c, "failed to delete sessions")
 	}
 
 	// Finally, delete the profile itself.

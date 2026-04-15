@@ -1,12 +1,16 @@
 package middleware
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/the-financial-workspace/backend/internal/database"
 )
 
 // Claims represents the JWT claims issued by the backend.
@@ -65,6 +69,37 @@ func Protected() fiber.Handler {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "invalid user id in token",
 			})
+		}
+
+		// Store token hash for session tracking and revocation check.
+		h := sha256.Sum256([]byte(tokenStr))
+		tokenHash := hex.EncodeToString(h[:])
+		c.Locals("token_hash", tokenHash)
+
+		// Check if this token's session has been revoked. Also update
+		// last_active_at lazily (fire-and-forget if stale > 5 min).
+		if database.DB != nil {
+			var revokedAt *time.Time
+			var lastActive time.Time
+			var sessionID string
+			err := database.DB.Pool.QueryRow(context.Background(),
+				`SELECT id, revoked_at, last_active_at FROM user_sessions WHERE token_hash = $1`,
+				tokenHash,
+			).Scan(&sessionID, &revokedAt, &lastActive)
+			if err == nil {
+				if revokedAt != nil {
+					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+						"error": "session has been revoked",
+					})
+				}
+				if time.Since(lastActive) > 5*time.Minute {
+					go func() {
+						_, _ = database.DB.Pool.Exec(context.Background(),
+							`UPDATE user_sessions SET last_active_at = NOW() WHERE id = $1`, sessionID)
+					}()
+				}
+			}
+			// err != nil means no session row — backward compatible, allow.
 		}
 
 		c.Locals("user_id", userID)
