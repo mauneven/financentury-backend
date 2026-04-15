@@ -72,6 +72,13 @@ func Setup(app *fiber.App) {
 	budgets.Put("/:id/expenses/:expenseId", handlers.UpdateExpense)
 	budgets.Delete("/:id/expenses/:expenseId", handlers.DeleteExpense)
 
+	// Budget link routes.
+	budgets.Get("/:id/links", handlers.ListLinks)
+	budgets.Post("/:id/links", handlers.CreateLink)
+	budgets.Patch("/:id/links/:linkId", handlers.UpdateLink)
+	budgets.Delete("/:id/links/:linkId", handlers.DeleteLink)
+	budgets.Get("/:id/linkable", handlers.GetLinkableBudgets)
+
 	// Summary, Trends & Budget Resume routes.
 	budgets.Get("/:id/summary", handlers.GetBudgetSummary)
 	budgets.Get("/:id/trends", handlers.GetBudgetTrends)

@@ -29,6 +29,9 @@ const (
 	MessageTypeExpenseDeleted  = "expense_deleted"
 	MessageTypeCollabAdded     = "collaborator_added"
 	MessageTypeCollabRemoved   = "collaborator_removed"
+	MessageTypeLinkCreated     = "link_created"
+	MessageTypeLinkUpdated     = "link_updated"
+	MessageTypeLinkDeleted     = "link_deleted"
 )
 
 // pingIntervalDuration is how often the server sends a ping to keep the connection alive.

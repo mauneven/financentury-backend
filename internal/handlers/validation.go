@@ -161,6 +161,18 @@ func broadcast(budgetID string, msgType string, data interface{}) {
 	})
 }
 
+// broadcastToLinkedTargets fans out a WS notification to all budgets that
+// have links from the given source budget. Best-effort: failures are logged.
+func broadcastToLinkedTargets(sourceBudgetID uuid.UUID, msgType string, data interface{}) {
+	targetIDs, err := fetchTargetBudgetIDs(sourceBudgetID)
+	if err != nil || len(targetIDs) == 0 {
+		return
+	}
+	for _, tid := range targetIDs {
+		broadcast(tid, msgType, data)
+	}
+}
+
 // --- DB Access Helpers ---
 
 // verifyBudgetOwnership checks that the authenticated user owns the budget

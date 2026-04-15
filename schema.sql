@@ -147,3 +147,25 @@ CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_h
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
 
 ALTER TABLE user_sessions DISABLE ROW LEVEL SECURITY;
+
+-- ─── budget_links ───────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS budget_links (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_budget_id   UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
+    target_budget_id   UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
+    source_section_id  UUID NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
+    source_category_id UUID REFERENCES budget_subcategories(id) ON DELETE CASCADE,
+    filter_mode        TEXT NOT NULL DEFAULT 'all',
+    created_by         UUID NOT NULL REFERENCES profiles(id),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_filter_mode CHECK (filter_mode IN ('all', 'mine')),
+    CONSTRAINT chk_different_budgets CHECK (source_budget_id != target_budget_id),
+    UNIQUE(target_budget_id, source_section_id, source_category_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_budget_links_source_budget ON budget_links(source_budget_id);
+CREATE INDEX IF NOT EXISTS idx_budget_links_target_budget ON budget_links(target_budget_id);
+CREATE INDEX IF NOT EXISTS idx_budget_links_source_section ON budget_links(source_section_id);
+
+ALTER TABLE budget_links DISABLE ROW LEVEL SECURITY;

@@ -224,6 +224,7 @@ func CreateExpense(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeExpenseCreated, expense)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeExpenseCreated, expense)
 
 	return c.Status(fiber.StatusCreated).JSON(expense)
 }
@@ -349,6 +350,7 @@ func UpdateExpense(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeExpenseUpdated, exp)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeExpenseUpdated, exp)
 
 	return c.JSON(exp)
 }
@@ -406,6 +408,7 @@ func DeleteExpense(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeExpenseDeleted, map[string]string{"id": eid})
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeExpenseDeleted, map[string]string{"id": eid})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

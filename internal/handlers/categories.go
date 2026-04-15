@@ -118,6 +118,7 @@ func CreateCategory(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryCreated, cat)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryCreated, cat)
 
 	return c.Status(fiber.StatusCreated).JSON(cat)
 }
@@ -267,6 +268,7 @@ func UpdateCategory(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryUpdated, cat)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryUpdated, cat)
 
 	return c.JSON(cat)
 }
@@ -335,6 +337,7 @@ func DeleteCategory(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryDeleted, map[string]string{"id": cid})
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryDeleted, map[string]string{"id": cid})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

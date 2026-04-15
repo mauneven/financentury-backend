@@ -206,6 +206,7 @@ func CreateSection(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeSectionCreated, section)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeSectionCreated, section)
 
 	return c.Status(fiber.StatusCreated).JSON(section)
 }
@@ -348,6 +349,7 @@ func UpdateSection(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeSectionUpdated, section)
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeSectionUpdated, section)
 
 	return c.JSON(section)
 }
@@ -430,6 +432,7 @@ func DeleteSection(c *fiber.Ctx) error {
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeSectionDeleted, map[string]string{"id": sid})
+	broadcastToLinkedTargets(budgetID, ws.MessageTypeSectionDeleted, map[string]string{"id": sid})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
@@ -81,6 +83,11 @@ func WebSocketHandler() fiber.Handler {
 			UserID: userID,
 		}
 
+		// Populate budget subscriptions so the hub delivers relevant messages.
+		if budgetIDs, err := fetchUserBudgetIDs(userID); err == nil {
+			client.BudgetIDs = budgetIDs
+		}
+
 		wsHub.Register(client)
 		defer wsHub.Unregister(client)
 
@@ -118,6 +125,36 @@ func WebSocketHandler() fiber.Handler {
 
 		close(done)
 	})
+}
+
+// fetchUserBudgetIDs returns a map of all budget IDs the user has access to
+// (owned + collaborated). Used to populate WS client subscriptions.
+func fetchUserBudgetIDs(userID string) (map[string]bool, error) {
+	if database.DB == nil || database.DB.Pool == nil {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rows, err := database.DB.Pool.Query(ctx, `
+		SELECT id::text FROM budgets WHERE user_id = $1
+		UNION
+		SELECT budget_id::text FROM budget_collaborators WHERE user_id = $1
+	`, userID)
+	if err != nil {
+		log.Printf("[ws] failed to fetch budget IDs for user %s: %v", userID, err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids[id] = true
+		}
+	}
+	return ids, nil
 }
 
 // parseWSToken validates a JWT token string and returns the user ID claim.

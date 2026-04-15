@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -368,9 +369,16 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		})
 	}
 
+	// 8. Fetch and aggregate linked sections from other budgets.
+	linkedSummaries := buildLinkedSections(budgetID, userID, userToday, profileMap, buildUserSpending)
+	for _, ls := range linkedSummaries {
+		totalSpent = roundAmount(totalSpent + ls.TotalSpent)
+	}
+
 	resp := models.BudgetSummary{
 		Budget:         *budget,
 		Sections:       sectionSummaries,
+		LinkedSections: linkedSummaries,
 		TotalBudget:    totalBudget,
 		TotalSpent:     totalSpent,
 		SpendingByUser: buildUserSpending(budgetByUser),
@@ -658,6 +666,191 @@ func GetBudgetResume(c *fiber.Ctx) error {
 		BudgetID: budgetID,
 		Periods:  result,
 	})
+}
+
+// ---------- Linked sections helper ----------
+
+// buildLinkedSections fetches and aggregates linked sections for a target budget.
+// It reuses the same fetchSections/fetchCategoriesForSections/fetch*Expenses helpers.
+func buildLinkedSections(
+	targetBudgetID, userID uuid.UUID,
+	userToday time.Time,
+	profileMap map[uuid.UUID]*models.Profile,
+	buildUserSpending func(map[uuid.UUID]float64) []models.UserSpending,
+) []models.LinkedSectionSummary {
+	if database.DB == nil || database.DB.Pool == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Fetch all links for this target budget.
+	rows, err := database.DB.Pool.Query(ctx, `
+		SELECT id, source_budget_id, target_budget_id, source_section_id,
+		       source_category_id, filter_mode, created_by, created_at
+		FROM budget_links WHERE target_budget_id = $1
+	`, targetBudgetID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var links []models.BudgetLink
+	for rows.Next() {
+		var l models.BudgetLink
+		if err := rows.Scan(&l.ID, &l.SourceBudgetID, &l.TargetBudgetID,
+			&l.SourceSectionID, &l.SourceCategoryID, &l.FilterMode,
+			&l.CreatedBy, &l.CreatedAt); err != nil {
+			continue
+		}
+		links = append(links, l)
+	}
+	if len(links) == 0 {
+		return nil
+	}
+
+	// Group links by source budget and cache fetched budgets.
+	budgetCache := make(map[uuid.UUID]*models.Budget)
+	result := make([]models.LinkedSectionSummary, 0, len(links))
+
+	for _, link := range links {
+		// Fetch source budget (cached).
+		srcBudget, ok := budgetCache[link.SourceBudgetID]
+		if !ok {
+			fetched, fetchErr := fetchBudget(link.SourceBudgetID)
+			if fetchErr != nil || fetched == nil {
+				continue
+			}
+			budgetCache[link.SourceBudgetID] = fetched
+			srcBudget = fetched
+		}
+
+		// Fetch the linked section.
+		allSections, err := fetchSections(link.SourceBudgetID)
+		if err != nil {
+			continue
+		}
+		var section *models.Section
+		for i := range allSections {
+			if allSections[i].ID == link.SourceSectionID {
+				section = &allSections[i]
+				break
+			}
+		}
+		if section == nil {
+			continue
+		}
+
+		// Fetch categories for this section.
+		cats, err := fetchCategoriesForSections([]string{section.ID.String()})
+		if err != nil {
+			continue
+		}
+
+		// If single-category link, filter to only that category.
+		if link.SourceCategoryID != nil {
+			filtered := make([]models.Category, 0, 1)
+			for _, c := range cats {
+				if c.ID == *link.SourceCategoryID {
+					filtered = append(filtered, c)
+					break
+				}
+			}
+			cats = filtered
+		}
+
+		// Fetch expenses for the source budget's current billing period.
+		var expenses []models.Expense
+		if srcBudget.BillingPeriodMonths == 0 {
+			expenses, _ = fetchAllExpensesNoRetention(link.SourceBudgetID)
+		} else {
+			periodStart := ComputeBillingPeriodStart(userToday, srcBudget.BillingCutoffDay, srcBudget.BillingPeriodMonths)
+			expenses, _ = fetchExpensesForSummary(link.SourceBudgetID, periodStart)
+		}
+
+		// Build a set of category IDs in this link.
+		catIDSet := make(map[uuid.UUID]bool, len(cats))
+		for _, c := range cats {
+			catIDSet[c.ID] = true
+		}
+
+		// Filter expenses to linked categories + apply filter_mode.
+		type expAgg struct {
+			totalSpent float64
+			count      int
+			byUser     map[uuid.UUID]float64
+		}
+		expBySubcat := make(map[uuid.UUID]*expAgg, len(cats))
+		var linkTotalSpent float64
+		linkByUser := make(map[uuid.UUID]float64)
+
+		for _, exp := range expenses {
+			if !catIDSet[exp.CategoryID] {
+				continue
+			}
+			// Apply filter mode.
+			if link.FilterMode == "mine" && (exp.CreatedBy == nil || *exp.CreatedBy != userID) {
+				continue
+			}
+
+			agg := expBySubcat[exp.CategoryID]
+			if agg == nil {
+				agg = &expAgg{byUser: make(map[uuid.UUID]float64)}
+				expBySubcat[exp.CategoryID] = agg
+			}
+			agg.totalSpent += exp.Amount
+			agg.count++
+			linkTotalSpent += exp.Amount
+
+			if exp.CreatedBy != nil {
+				uid := *exp.CreatedBy
+				agg.byUser[uid] += exp.Amount
+				linkByUser[uid] += exp.Amount
+			}
+		}
+
+		// Build category summaries.
+		sectionAllocated := roundAmount(srcBudget.MonthlyIncome * section.AllocationPercent / 100)
+		catSummaries := make([]models.CategorySummary, 0, len(cats))
+		for _, cat := range cats {
+			catAllocated := roundAmount(sectionAllocated * cat.AllocationPercent / 100)
+			var catSpent float64
+			var catCount int
+			var catUserSpending []models.UserSpending
+			if agg, ok := expBySubcat[cat.ID]; ok {
+				catSpent = roundAmount(agg.totalSpent)
+				catCount = agg.count
+				catUserSpending = buildUserSpending(agg.byUser)
+			}
+			catSummaries = append(catSummaries, models.CategorySummary{
+				Category: models.SummaryCategoryView{
+					ID:                cat.ID,
+					SectionID:         cat.CategoryID,
+					Name:              cat.Name,
+					AllocationPercent: cat.AllocationPercent,
+					Icon:              cat.Icon,
+					SortOrder:         cat.SortOrder,
+					CreatedAt:         cat.CreatedAt,
+				},
+				AllocatedAmount: catAllocated,
+				TotalSpent:      catSpent,
+				ExpenseCount:    catCount,
+				SpendingByUser:  catUserSpending,
+			})
+		}
+
+		result = append(result, models.LinkedSectionSummary{
+			Link:           link,
+			SourceBudget:   *srcBudget,
+			Section:        *section,
+			Categories:     catSummaries,
+			TotalSpent:     roundAmount(linkTotalSpent),
+			SpendingByUser: buildUserSpending(linkByUser),
+		})
+	}
+
+	return result
 }
 
 // ---------- Data-fetching helpers ----------

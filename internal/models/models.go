@@ -120,6 +120,18 @@ type InviteInfo struct {
 	IsUsed      bool   `json:"is_used"`
 }
 
+// BudgetLink represents a cross-budget link from a source section/category to a target budget.
+type BudgetLink struct {
+	ID               uuid.UUID  `json:"id"`
+	SourceBudgetID   uuid.UUID  `json:"source_budget_id"`
+	TargetBudgetID   uuid.UUID  `json:"target_budget_id"`
+	SourceSectionID  uuid.UUID  `json:"source_section_id"`
+	SourceCategoryID *uuid.UUID `json:"source_category_id,omitempty"`
+	FilterMode       string     `json:"filter_mode"`
+	CreatedBy        uuid.UUID  `json:"created_by"`
+	CreatedAt        time.Time  `json:"created_at"`
+}
+
 // --- Request/Response DTOs ---
 
 // CreateBudgetRequest is the payload for creating a budget.
@@ -232,13 +244,24 @@ type SectionSummary struct {
 	SpendingByUser  []UserSpending    `json:"spending_by_user,omitempty"`
 }
 
+// LinkedSectionSummary is a section summary for linked content in a target budget.
+type LinkedSectionSummary struct {
+	Link           BudgetLink        `json:"link"`
+	SourceBudget   Budget            `json:"source_budget"`
+	Section        Section           `json:"section"`
+	Categories     []CategorySummary `json:"categories"`
+	TotalSpent     float64           `json:"total_spent"`
+	SpendingByUser []UserSpending    `json:"spending_by_user,omitempty"`
+}
+
 // BudgetSummary is the full budget summary response.
 type BudgetSummary struct {
-	Budget         Budget           `json:"budget"`
-	Sections       []SectionSummary `json:"sections"`
-	TotalBudget    float64          `json:"total_budget"`
-	TotalSpent     float64          `json:"total_spent"`
-	SpendingByUser []UserSpending   `json:"spending_by_user,omitempty"`
+	Budget         Budget                 `json:"budget"`
+	Sections       []SectionSummary       `json:"sections"`
+	LinkedSections []LinkedSectionSummary `json:"linked_sections,omitempty"`
+	TotalBudget    float64                `json:"total_budget"`
+	TotalSpent     float64                `json:"total_spent"`
+	SpendingByUser []UserSpending         `json:"spending_by_user,omitempty"`
 }
 
 // MonthlyTrend represents spending for a single month.
