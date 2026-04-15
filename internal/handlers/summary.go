@@ -190,8 +190,9 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	g.Go(func() error {
 		var fetchErr error
 		if budget.BillingPeriodMonths == 0 {
-			// One-time budget: all expenses count toward the total.
-			expenses, fetchErr = fetchAllExpensesForSummary(budgetID)
+			// One-time budget: all expenses count toward the total,
+			// without the 12-month retention cutoff.
+			expenses, fetchErr = fetchAllExpensesNoRetention(budgetID)
 		} else {
 			periodStart := ComputeBillingPeriodStart(userToday, budget.BillingCutoffDay, budget.BillingPeriodMonths)
 			expenses, fetchErr = fetchExpensesForSummary(budgetID, periodStart)
@@ -539,7 +540,7 @@ func GetBillingHistory(c *fiber.Ctx) error {
 
 	// For one-time budgets, return a single period from creation to now.
 	if budget.BillingPeriodMonths == 0 {
-		allExpenses, err := fetchAllExpensesForSummary(budgetID)
+		allExpenses, err := fetchAllExpensesNoRetention(budgetID)
 		if err != nil {
 			return errInternal(c, "failed to fetch expenses")
 		}
@@ -595,7 +596,15 @@ func GetBillingHistory(c *fiber.Ctx) error {
 	// Past periods
 	prevStart := currentStart
 	for i := 0; i < maxPeriods; i++ {
+		lastStart := prevStart
 		prevStart = shiftMonths(prevStart, -periodMonths, cutoffDay)
+		// Guard against duplicate periods: if shiftMonths didn't actually
+		// move backward (can happen when cutoff day > 28 and month clamping
+		// causes the date to stay the same), break to avoid infinite loops
+		// and duplicate entries.
+		if !prevStart.Before(lastStart) {
+			break
+		}
 		prevEnd := shiftMonths(prevStart, periodMonths, cutoffDay)
 		// Don't go before the budget was created
 		if prevStart.Before(budget.CreatedAt.Truncate(24 * time.Hour)) {
@@ -785,13 +794,38 @@ func fetchAllExpenses(budgetID uuid.UUID) ([]models.Expense, error) {
 }
 
 // fetchAllExpensesForSummary loads only the columns needed for budget summary
-// aggregation (category_id, amount) for ALL expenses (no date filter).
-// Used for one-time budgets where every expense counts toward the total.
+// aggregation (category_id, amount) for expenses within the retention window
+// (12 months). Used for recurring budgets.
 func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
 		Select("subcategory_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", expenseRetentionCutoff()).
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchAllExpensesNoRetention loads only the columns needed for budget summary
+// aggregation (category_id, amount) for ALL expenses without applying the
+// 12-month retention cutoff. Used for one-time budgets where every expense
+// counts toward the total regardless of age.
+func fetchAllExpensesNoRetention(budgetID uuid.UUID) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("subcategory_id,amount,created_by").
+		Eq("budget_id", budgetID.String()).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)

@@ -73,6 +73,14 @@ func Migrate(c *fiber.Ctx) error {
 		return errUnauthorized(c)
 	}
 
+	// Enforce per-user budget limit before creating any new budgets.
+	if err := enforceUserBudgetLimit(userID); err != nil {
+		if err.Error() == "limit" {
+			return c.Status(fiber.StatusConflict).JSON(models.ErrorResponse{Error: "budget limit reached (max 7)"})
+		}
+		return errInternal(c, "failed to check budget count")
+	}
+
 	var req MigrateRequest
 	if err := c.BodyParser(&req); err != nil {
 		return errBadRequest(c, "invalid request body")

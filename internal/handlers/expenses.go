@@ -125,6 +125,11 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
+	// Verify access before any queries to prevent unauthenticated probing.
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
+	}
+
 	// Enforce per-budget expense limit.
 	countQuery := database.NewFilter().
 		Select("id").
@@ -174,10 +179,6 @@ func CreateExpense(c *fiber.Ctx) error {
 	}
 	if isDateTooFarInFuture(req.ExpenseDate) {
 		return errBadRequest(c, "expense_date cannot be more than 1 year in the future")
-	}
-
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
 	}
 
 	// Verify category belongs to this budget.

@@ -75,8 +75,11 @@ func main() {
 			}
 			return c.Status(code).JSON(fiber.Map{"error": msg})
 		},
-		AppName:   "Financial Workspace API",
-		BodyLimit: 4 * 1024 * 1024, // 4MB (increased for migration payloads)
+		AppName:                 "Financial Workspace API",
+		BodyLimit:               4 * 1024 * 1024, // 4MB (increased for migration payloads)
+		EnableTrustedProxyCheck: true,
+		TrustedProxies:          []string{"0.0.0.0/0"},
+		ProxyHeader:             "X-Forwarded-For",
 	})
 
 	// Global middleware.
