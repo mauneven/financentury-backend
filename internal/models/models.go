@@ -264,8 +264,8 @@ type TrendsResponse struct {
 	Sections []SectionTrend `json:"categories"`
 }
 
-// MonthlyResumePeriod represents the resume for a single completed billing period.
-type MonthlyResumePeriod struct {
+// BudgetResumePeriod represents the resume for a single billing period.
+type BudgetResumePeriod struct {
 	PeriodStart string  `json:"period_start"`
 	PeriodEnd   string  `json:"period_end"`
 	Income      float64 `json:"income"`
@@ -273,11 +273,13 @@ type MonthlyResumePeriod struct {
 	Balance     float64 `json:"balance"`
 }
 
-// MonthlyResumeResponse is the monthly resume endpoint response.
-// Contains only completed billing periods that have expense data.
-type MonthlyResumeResponse struct {
-	BudgetID uuid.UUID             `json:"budget_id"`
-	Periods  []MonthlyResumePeriod `json:"periods"`
+// BudgetResumeResponse is the budget resume endpoint response.
+// For recurring budgets: completed periods with expense data.
+// For one-time budgets: a single period from creation to now.
+type BudgetResumeResponse struct {
+	BudgetID uuid.UUID            `json:"budget_id"`
+	OneTime  bool                 `json:"one_time"`
+	Periods  []BudgetResumePeriod `json:"periods"`
 }
 
 // ErrorResponse is a standard error response.

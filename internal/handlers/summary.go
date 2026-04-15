@@ -511,13 +511,12 @@ func sortMonthlyTrends(trends []models.MonthlyTrend) {
 	}
 }
 
-// ---------- GetMonthlyResume ----------
+// ---------- GetBudgetResume ----------
 
-// GetMonthlyResume returns a resume of completed billing periods (up to 12
-// months back). Only periods that have ended AND contain at least one expense
-// are included. The current (in-progress) period is never shown. For one-time
-// budgets (billing_period_months == 0) there are no completed periods.
-func GetMonthlyResume(c *fiber.Ctx) error {
+// GetBudgetResume returns the budget resume. For recurring budgets it returns
+// completed billing periods (up to 12 months back) that contain expense data.
+// For one-time budgets it returns a single period from creation to now.
+func GetBudgetResume(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
 		return errUnauthorized(c)
@@ -537,24 +536,49 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 		return errInternal(c, "failed to fetch budget")
 	}
 
-	// One-time budgets have no recurring periods to resume.
+	userToday := resolveUserToday(c)
+
+	// One-time budgets: single period from creation to now.
 	if budget.BillingPeriodMonths == 0 {
-		return c.JSON(models.MonthlyResumeResponse{
+		allExpenses, err := fetchAllExpensesNoRetention(budgetID)
+		if err != nil {
+			return errInternal(c, "failed to fetch expenses")
+		}
+
+		// Only return the period if there are expenses.
+		var periods []models.BudgetResumePeriod
+		if len(allExpenses) > 0 {
+			var totalSpent float64
+			for _, exp := range allExpenses {
+				totalSpent += exp.Amount
+			}
+			totalSpent = roundAmount(totalSpent)
+			periods = []models.BudgetResumePeriod{{
+				PeriodStart: budget.CreatedAt.Format("2006-01-02"),
+				PeriodEnd:   userToday.Format("2006-01-02"),
+				Income:      roundAmount(budget.MonthlyIncome),
+				TotalSpent:  totalSpent,
+				Balance:     roundAmount(budget.MonthlyIncome - totalSpent),
+			}}
+		} else {
+			periods = []models.BudgetResumePeriod{}
+		}
+
+		return c.JSON(models.BudgetResumeResponse{
 			BudgetID: budgetID,
-			Periods:  []models.MonthlyResumePeriod{},
+			OneTime:  true,
+			Periods:  periods,
 		})
 	}
 
-	userToday := resolveUserToday(c)
-
+	// Recurring budget: completed periods going back up to 12 months.
 	periodMonths := budget.BillingPeriodMonths
 	cutoffDay := budget.BillingCutoffDay
 	income := budget.MonthlyIncome
 
-	// Current period start — this period is still in progress, so we skip it.
+	// Current period start — still in progress, skip it.
 	currentStart := ComputeBillingPeriodStart(userToday, cutoffDay, periodMonths)
 
-	// Build list of PAST (completed) periods going back from the one before current.
 	maxPeriods := 12 / periodMonths
 	if maxPeriods < 1 {
 		maxPeriods = 1
@@ -574,7 +598,6 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 			break
 		}
 		prevEnd := shiftMonths(prevStart, periodMonths, cutoffDay)
-		// Don't go before the budget was created.
 		if prevStart.Before(budget.CreatedAt.Truncate(24 * time.Hour)) {
 			break
 		}
@@ -582,21 +605,18 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 	}
 
 	if len(periods) == 0 {
-		return c.JSON(models.MonthlyResumeResponse{
+		return c.JSON(models.BudgetResumeResponse{
 			BudgetID: budgetID,
-			Periods:  []models.MonthlyResumePeriod{},
+			Periods:  []models.BudgetResumePeriod{},
 		})
 	}
 
-	// Fetch expenses from oldest period start up to the current period start
-	// (excludes current period expenses).
 	oldestStart := periods[len(periods)-1].start
 	allExpenses, err := fetchExpensesInDateRange(budgetID, oldestStart, currentStart)
 	if err != nil {
 		return errInternal(c, "failed to fetch expenses")
 	}
 
-	// Group expenses into periods.
 	type periodAgg struct {
 		totalSpent float64
 		hasData    bool
@@ -617,8 +637,7 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 		}
 	}
 
-	// Build response — only include periods that have expense data.
-	result := make([]models.MonthlyResumePeriod, 0, len(periods))
+	result := make([]models.BudgetResumePeriod, 0, len(periods))
 	for i, p := range periods {
 		if !periodData[i].hasData {
 			continue
@@ -626,7 +645,7 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 		spent := roundAmount(periodData[i].totalSpent)
 		bal := roundAmount(income - spent)
 		endDisplay := p.end.AddDate(0, 0, -1)
-		result = append(result, models.MonthlyResumePeriod{
+		result = append(result, models.BudgetResumePeriod{
 			PeriodStart: p.start.Format("2006-01-02"),
 			PeriodEnd:   endDisplay.Format("2006-01-02"),
 			Income:      roundAmount(income),
@@ -635,7 +654,7 @@ func GetMonthlyResume(c *fiber.Ctx) error {
 		})
 	}
 
-	return c.JSON(models.MonthlyResumeResponse{
+	return c.JSON(models.BudgetResumeResponse{
 		BudgetID: budgetID,
 		Periods:  result,
 	})
