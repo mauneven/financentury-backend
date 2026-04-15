@@ -265,7 +265,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 			userIDStrs = append(userIDStrs, uid.String())
 		}
 		profileQuery := database.NewFilter().
-			Select("id,email,full_name,avatar_url,created_at,updated_at").
+			Select("id,email,full_name,created_at,updated_at").
 			In("id", userIDStrs).
 			Build()
 		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)

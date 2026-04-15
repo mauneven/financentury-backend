@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS profiles (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email         TEXT NOT NULL UNIQUE,
     full_name     TEXT NOT NULL DEFAULT '',
-    avatar_url    TEXT NOT NULL DEFAULT '',
     password_hash TEXT NOT NULL DEFAULT '',
     auth_provider TEXT NOT NULL DEFAULT '',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),

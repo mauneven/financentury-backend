@@ -215,7 +215,7 @@ func TestBcryptHashUniqueness(t *testing.T) {
 // --- profileWithPassword struct test ---
 
 func TestProfileWithPasswordUnmarshal(t *testing.T) {
-	raw := `{"id":"550e8400-e29b-41d4-a716-446655440000","email":"test@example.com","full_name":"Test User","avatar_url":"https://example.com/pic.jpg","password_hash":"$2a$10$somehash"}`
+	raw := `{"id":"550e8400-e29b-41d4-a716-446655440000","email":"test@example.com","full_name":"Test User","password_hash":"$2a$10$somehash"}`
 	var p profileWithPassword
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
 		t.Fatalf("failed to unmarshal profileWithPassword: %v", err)

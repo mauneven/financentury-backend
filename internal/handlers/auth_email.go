@@ -125,7 +125,6 @@ type profileWithPassword struct {
 	ID           uuid.UUID `json:"id"`
 	Email        string    `json:"email"`
 	FullName     string    `json:"full_name"`
-	AvatarURL    string    `json:"avatar_url"`
 	PasswordHash string    `json:"password_hash"`
 }
 
@@ -223,7 +222,6 @@ func Register(c *fiber.Ctx) error {
 		"full_name":     req.Name,
 		"password_hash": string(hash),
 		"auth_provider": "email",
-		"avatar_url":    "",
 		"created_at":    now.Format(time.RFC3339Nano),
 		"updated_at":    now.Format(time.RFC3339Nano),
 	}
@@ -257,7 +255,6 @@ func Register(c *fiber.Ctx) error {
 			"id":         profileID,
 			"email":      req.Email,
 			"full_name":  req.Name,
-			"avatar_url": "",
 		},
 	})
 }
@@ -287,7 +284,7 @@ func Login(c *fiber.Ctx) error {
 
 	// Fetch profile with password hash.
 	query := database.NewFilter().
-		Select("id,email,full_name,avatar_url,password_hash").
+		Select("id,email,full_name,password_hash").
 		Eq("email", req.Email).
 		Build()
 
@@ -349,7 +346,6 @@ func Login(c *fiber.Ctx) error {
 			"id":         profile.ID,
 			"email":      profile.Email,
 			"full_name":  profile.FullName,
-			"avatar_url": profile.AvatarURL,
 		},
 	})
 }

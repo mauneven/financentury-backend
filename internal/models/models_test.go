@@ -573,7 +573,6 @@ func TestProfile_PasswordHashOmitted(t *testing.T) {
 		ID:           uuid.New(),
 		Email:        "test@example.com",
 		FullName:     "Test User",
-		AvatarURL:    "https://example.com/pic.jpg",
 		PasswordHash: "secret_hash_value",
 		AuthProvider: "email",
 		CreatedAt:    "2026-01-01T00:00:00Z",

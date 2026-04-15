@@ -393,7 +393,7 @@ func TestDeleteBudget_Success(t *testing.T) {
 // ==================== Me endpoint ====================
 
 func TestMe_Success(t *testing.T) {
-	profileJSON := `[{"id":"11111111-1111-1111-1111-111111111111","email":"test@example.com","full_name":"Test User","avatar_url":"","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]`
+	profileJSON := `[{"id":"11111111-1111-1111-1111-111111111111","email":"test@example.com","full_name":"Test User","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]`
 
 	app, token := setupTestEnv(t, func(mux *http.ServeMux) {
 		mux.HandleFunc("/rest/v1/profiles", func(w http.ResponseWriter, r *http.Request) {

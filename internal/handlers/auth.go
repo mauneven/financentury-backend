@@ -210,7 +210,6 @@ func GoogleLogin(c *fiber.Ctx) error {
 			"id":         profile.ID,
 			"email":      profile.Email,
 			"full_name":  profile.FullName,
-			"avatar_url": profile.AvatarURL,
 		},
 	})
 }
@@ -219,7 +218,7 @@ func GoogleLogin(c *fiber.Ctx) error {
 // creates a new one.
 func upsertProfile(userInfo googleUserInfo) (models.Profile, error) {
 	query := database.NewFilter().
-		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		Select("id,email,full_name,created_at,updated_at").
 		Eq("email", userInfo.Email).
 		Build()
 
@@ -243,24 +242,6 @@ func upsertProfile(userInfo googleUserInfo) (models.Profile, error) {
 	if len(profiles) > 0 {
 		profile := profiles[0]
 
-		// Update name and avatar.
-		now := time.Now().UTC()
-		updatePayload := map[string]interface{}{
-			"full_name":  userInfo.Name,
-			"avatar_url": userInfo.Picture,
-			"updated_at": now.Format(time.RFC3339Nano),
-		}
-		updateBytes, err := marshalJSON(updatePayload)
-		if err == nil {
-			patchQuery := database.NewFilter().Eq("id", profile.ID.String()).Build()
-			_, patchStatus, patchErr := database.DB.Patch("profiles", patchQuery, updateBytes)
-			if patchErr != nil || patchStatus != http.StatusOK {
-				log.Printf("[auth] PATCH profiles failed: status=%d err=%v", patchStatus, patchErr)
-			}
-		}
-
-		profile.FullName = userInfo.Name
-		profile.AvatarURL = userInfo.Picture
 		return profile, nil
 	}
 
@@ -277,7 +258,6 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 		"id":            profileID.String(),
 		"email":         userInfo.Email,
 		"full_name":     userInfo.Name,
-		"avatar_url":    userInfo.Picture,
 		"auth_provider": "google",
 		"created_at":    now.Format(time.RFC3339Nano),
 		"updated_at":    now.Format(time.RFC3339Nano),
@@ -300,7 +280,7 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 		// Race condition: another request may have created the profile.
 		// Try to fetch by email.
 		query := database.NewFilter().
-			Select("id,email,full_name,avatar_url,created_at,updated_at").
+			Select("id,email,full_name,created_at,updated_at").
 			Eq("email", userInfo.Email).
 			Build()
 
@@ -330,7 +310,6 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 			ID:        profileID,
 			Email:     userInfo.Email,
 			FullName:  userInfo.Name,
-			AvatarURL: userInfo.Picture,
 			CreatedAt: now.Format(time.RFC3339Nano),
 			UpdatedAt: now.Format(time.RFC3339Nano),
 		}, nil
@@ -347,7 +326,7 @@ func Me(c *fiber.Ctx) error {
 	}
 
 	query := database.NewFilter().
-		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		Select("id,email,full_name,created_at,updated_at").
 		Eq("id", userID.String()).
 		Build()
 
@@ -401,7 +380,7 @@ func UpdateProfile(c *fiber.Ctx) error {
 
 	// Return updated profile.
 	query := database.NewFilter().
-		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		Select("id,email,full_name,created_at,updated_at").
 		Eq("id", userID.String()).
 		Build()
 
