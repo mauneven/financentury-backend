@@ -33,6 +33,45 @@ func InitInvites(url string) {
 	frontendURL = url
 }
 
+// ListInvites returns all invites for a budget (owner only).
+func ListInvites(c *fiber.Ctx) error {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
+	}
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
+	}
+
+	query := database.NewFilter().
+		Select("*").
+		Eq("budget_id", budgetID.String()).
+		Order("created_at", "desc").
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_invites", query)
+	if err != nil || statusCode != http.StatusOK {
+		return errInternal(c, "failed to fetch invites")
+	}
+
+	var invites []models.Invite
+	if err := json.Unmarshal(body, &invites); err != nil {
+		return errInternal(c, "failed to parse invites")
+	}
+
+	if invites == nil {
+		invites = make([]models.Invite, 0)
+	}
+
+	return c.JSON(invites)
+}
+
 // CreateInvite generates a new invite link for a budget (owner only).
 func CreateInvite(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)

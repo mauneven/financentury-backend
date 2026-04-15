@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -27,6 +28,26 @@ func ListCollaborators(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	// Fetch the budget to get the owner user_id.
+	budgetQuery := database.NewFilter().
+		Select("user_id").
+		Eq("id", budgetID.String()).
+		Build()
+
+	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
+	if budgetErr != nil || budgetStatus != http.StatusOK {
+		return errInternal(c, "failed to fetch budget")
+	}
+
+	var budgetRows []struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.Unmarshal(budgetBody, &budgetRows); err != nil || len(budgetRows) == 0 {
+		return errNotFound(c, "budget not found")
+	}
+
+	ownerID := budgetRows[0].UserID
+
 	query := database.NewFilter().
 		Select("*").
 		Eq("budget_id", budgetID.String()).
@@ -47,37 +68,47 @@ func ListCollaborators(c *fiber.Ctx) error {
 		collaborators = make([]models.Collaborator, 0)
 	}
 
-	// Batch-fetch all collaborator profiles in a single query instead of N+1.
-	if len(collaborators) > 0 {
-		userIDs := make([]string, len(collaborators))
-		for i, collab := range collaborators {
-			userIDs[i] = collab.UserID.String()
-		}
+	// Prepend the budget owner as a synthetic collaborator entry.
+	ownerUUID, _ := uuid.Parse(ownerID)
+	ownerEntry := models.Collaborator{
+		ID:       ownerUUID,
+		BudgetID: budgetID,
+		UserID:   ownerUUID,
+		Role:     "owner",
+		AddedAt:  "",
+	}
+	result := make([]models.Collaborator, 0, 1+len(collaborators))
+	result = append(result, ownerEntry)
+	result = append(result, collaborators...)
 
-		profileQuery := database.NewFilter().
-			Select("id,email,full_name,avatar_url,created_at,updated_at").
-			In("id", userIDs).
-			Build()
+	// Batch-fetch all profiles (owner + collaborators) in a single query.
+	userIDs := make([]string, len(result))
+	for i, collab := range result {
+		userIDs[i] = collab.UserID.String()
+	}
 
-		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
-		if profileErr == nil && profileStatus == http.StatusOK {
-			var profiles []models.Profile
-			if err := json.Unmarshal(profileBody, &profiles); err == nil {
-				// Index profiles by ID for O(1) lookup.
-				profileMap := make(map[string]*models.Profile, len(profiles))
-				for i := range profiles {
-					profileMap[profiles[i].ID.String()] = &profiles[i]
-				}
-				for i := range collaborators {
-					if p, ok := profileMap[collaborators[i].UserID.String()]; ok {
-						collaborators[i].Profile = p
-					}
+	profileQuery := database.NewFilter().
+		Select("id,email,full_name,avatar_url,created_at,updated_at").
+		In("id", userIDs).
+		Build()
+
+	profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+	if profileErr == nil && profileStatus == http.StatusOK {
+		var profiles []models.Profile
+		if err := json.Unmarshal(profileBody, &profiles); err == nil {
+			profileMap := make(map[string]*models.Profile, len(profiles))
+			for i := range profiles {
+				profileMap[profiles[i].ID.String()] = &profiles[i]
+			}
+			for i := range result {
+				if p, ok := profileMap[result[i].UserID.String()]; ok {
+					result[i].Profile = p
 				}
 			}
 		}
 	}
 
-	return c.JSON(collaborators)
+	return c.JSON(result)
 }
 
 // RemoveCollaborator removes a collaborator from a budget. Only the budget

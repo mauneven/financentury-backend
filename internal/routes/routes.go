@@ -47,6 +47,7 @@ func Setup(app *fiber.App) {
 	budgets.Delete("/:id", handlers.DeleteBudget)
 
 	// Invite and collaborator routes.
+	budgets.Get("/:id/invites", handlers.ListInvites)
 	budgets.Post("/:id/invite", handlers.CreateInvite)
 	budgets.Get("/:id/collaborators", handlers.ListCollaborators)
 	budgets.Delete("/:id/collaborators/:userId", handlers.RemoveCollaborator)
