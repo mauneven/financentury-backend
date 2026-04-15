@@ -510,6 +510,158 @@ func sortMonthlyTrends(trends []models.MonthlyTrend) {
 	}
 }
 
+// ---------- GetBillingHistory ----------
+
+// GetBillingHistory returns the balance for the current billing period and a
+// history of past billing periods (up to 12 months back). For one-time budgets
+// (billing_period_months == 0), it returns a single period from creation to now.
+func GetBillingHistory(c *fiber.Ctx) error {
+	userID, ok := requireUserID(c)
+	if !ok {
+		return errUnauthorized(c)
+	}
+
+	budgetID, ok := parseUUIDParam(c, "id")
+	if !ok {
+		return errBadRequest(c, "invalid budget ID")
+	}
+
+	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
+	}
+
+	budget, err := fetchBudget(budgetID)
+	if err != nil || budget == nil {
+		return errInternal(c, "failed to fetch budget")
+	}
+
+	userToday := resolveUserToday(c)
+
+	// For one-time budgets, return a single period from creation to now.
+	if budget.BillingPeriodMonths == 0 {
+		allExpenses, err := fetchAllExpensesForSummary(budgetID)
+		if err != nil {
+			return errInternal(c, "failed to fetch expenses")
+		}
+		var totalSpent float64
+		for _, exp := range allExpenses {
+			totalSpent += exp.Amount
+		}
+		totalSpent = roundAmount(totalSpent)
+		balance := roundAmount(budget.MonthlyIncome - totalSpent)
+
+		current := &models.BillingPeriodBalance{
+			PeriodStart: budget.CreatedAt.Format("2006-01-02"),
+			PeriodEnd:   userToday.Format("2006-01-02"),
+			Income:      roundAmount(budget.MonthlyIncome),
+			TotalSpent:  totalSpent,
+			Balance:     balance,
+		}
+
+		return c.JSON(models.BillingHistoryResponse{
+			BudgetID: budgetID,
+			Current:  current,
+			History:  []models.BillingPeriodBalance{},
+		})
+	}
+
+	// Recurring budget: compute periods going back up to 12 months.
+	periodMonths := budget.BillingPeriodMonths
+	cutoffDay := budget.BillingCutoffDay
+	income := budget.MonthlyIncome
+
+	// Current period start
+	currentStart := ComputeBillingPeriodStart(userToday, cutoffDay, periodMonths)
+	currentEnd := shiftMonths(currentStart, periodMonths, cutoffDay)
+	// currentEnd is the start of the *next* period; the current period ends the day before.
+	currentEndDisplay := currentEnd.AddDate(0, 0, -1)
+
+	// Build list of periods going back from current. Max ~12 periods for monthly,
+	// fewer for quarterly/semi-annual/annual.
+	maxPeriods := 12 / periodMonths
+	if maxPeriods < 1 {
+		maxPeriods = 1
+	}
+	// +1 for the current period
+	type periodRange struct {
+		start time.Time
+		end   time.Time // exclusive (start of next period)
+	}
+	periods := make([]periodRange, 0, maxPeriods+1)
+
+	// Current period
+	periods = append(periods, periodRange{start: currentStart, end: currentEnd})
+
+	// Past periods
+	prevStart := currentStart
+	for i := 0; i < maxPeriods; i++ {
+		prevStart = shiftMonths(prevStart, -periodMonths, cutoffDay)
+		prevEnd := shiftMonths(prevStart, periodMonths, cutoffDay)
+		// Don't go before the budget was created
+		if prevStart.Before(budget.CreatedAt.Truncate(24 * time.Hour)) {
+			break
+		}
+		periods = append(periods, periodRange{start: prevStart, end: prevEnd})
+	}
+
+	// Fetch all expenses within the full range (oldest period start to now).
+	oldestStart := periods[len(periods)-1].start
+	allExpenses, err := fetchExpensesInDateRange(budgetID, oldestStart, userToday.AddDate(0, 0, 1))
+	if err != nil {
+		return errInternal(c, "failed to fetch expenses")
+	}
+
+	// Group expenses into periods.
+	type periodAgg struct {
+		totalSpent float64
+	}
+	periodData := make([]periodAgg, len(periods))
+
+	for _, exp := range allExpenses {
+		expDate, parseErr := time.Parse("2006-01-02", exp.ExpenseDate)
+		if parseErr != nil {
+			continue
+		}
+		for i, p := range periods {
+			if !expDate.Before(p.start) && expDate.Before(p.end) {
+				periodData[i].totalSpent += exp.Amount
+				break
+			}
+		}
+	}
+
+	// Build response.
+	var current *models.BillingPeriodBalance
+	history := make([]models.BillingPeriodBalance, 0, len(periods)-1)
+
+	for i, p := range periods {
+		spent := roundAmount(periodData[i].totalSpent)
+		bal := roundAmount(income - spent)
+		endDisplay := p.end.AddDate(0, 0, -1)
+		if i == 0 {
+			endDisplay = currentEndDisplay
+		}
+		entry := models.BillingPeriodBalance{
+			PeriodStart: p.start.Format("2006-01-02"),
+			PeriodEnd:   endDisplay.Format("2006-01-02"),
+			Income:      roundAmount(income),
+			TotalSpent:  spent,
+			Balance:     bal,
+		}
+		if i == 0 {
+			current = &entry
+		} else {
+			history = append(history, entry)
+		}
+	}
+
+	return c.JSON(models.BillingHistoryResponse{
+		BudgetID: budgetID,
+		Current:  current,
+		History:  history,
+	})
+}
+
 // ---------- Data-fetching helpers ----------
 
 // fetchBudget loads a single budget by ID. Returns nil if not found.
@@ -665,6 +817,31 @@ func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]model
 		Select("subcategory_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", periodStart.Format("2006-01-02")).
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchExpensesInDateRange loads expenses for a budget where expense_date is
+// between start (inclusive) and end (exclusive).
+func fetchExpensesInDateRange(budgetID uuid.UUID, start, end time.Time) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("subcategory_id,amount,expense_date").
+		Eq("budget_id", budgetID.String()).
+		Gte("expense_date", start.Format("2006-01-02")).
+		Lt("expense_date", end.Format("2006-01-02")).
 		Build()
 
 	body, statusCode, err := database.DB.Get("budget_expenses", query)

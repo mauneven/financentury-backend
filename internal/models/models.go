@@ -264,6 +264,22 @@ type TrendsResponse struct {
 	Sections []SectionTrend `json:"categories"`
 }
 
+// BillingPeriodBalance represents the balance for a single billing period.
+type BillingPeriodBalance struct {
+	PeriodStart string  `json:"period_start"`
+	PeriodEnd   string  `json:"period_end"`
+	Income      float64 `json:"income"`
+	TotalSpent  float64 `json:"total_spent"`
+	Balance     float64 `json:"balance"`
+}
+
+// BillingHistoryResponse is the billing history endpoint response.
+type BillingHistoryResponse struct {
+	BudgetID uuid.UUID              `json:"budget_id"`
+	Current  *BillingPeriodBalance  `json:"current"`
+	History  []BillingPeriodBalance `json:"history"`
+}
+
 // ErrorResponse is a standard error response.
 type ErrorResponse struct {
 	Error string `json:"error"`
