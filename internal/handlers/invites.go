@@ -27,6 +27,31 @@ const inviteTokenBytes = 32
 // inviteExpiry is how long an invite link remains valid.
 const inviteExpiry = 7 * 24 * time.Hour
 
+// maxCollaboratorsPerBudget is the cap on collaborators (excluding the owner).
+const maxCollaboratorsPerBudget = 5
+
+// countBudgetCollaborators returns the current number of collaborators for a budget.
+func countBudgetCollaborators(budgetID uuid.UUID) (int, error) {
+	query := database.NewFilter().
+		Select("id").
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	body, statusCode, err := database.DB.Get("budget_collaborators", query)
+	if err != nil || statusCode != http.StatusOK {
+		return 0, err
+	}
+
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return 0, err
+	}
+
+	return len(rows), nil
+}
+
 // InitInvites configures the invites handler with the frontend URL used to
 // construct invite links.
 func InitInvites(url string) {
@@ -86,6 +111,17 @@ func CreateInvite(c *fiber.Ctx) error {
 
 	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
+	}
+
+	// Enforce max collaborators per budget.
+	count, err := countBudgetCollaborators(budgetID)
+	if err != nil {
+		return errInternal(c, "failed to check collaborator count")
+	}
+	if count >= maxCollaboratorsPerBudget {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "collaborator limit reached (max 5)",
+		})
 	}
 
 	// Generate a unique invite token.
@@ -274,6 +310,17 @@ func AcceptInvite(c *fiber.Ctx) error {
 			return errBadRequest(c, "budget limit reached (max 7)")
 		}
 		return errInternal(c, "failed to check budget count")
+	}
+
+	// Enforce max collaborators per budget.
+	collabCount, countErr := countBudgetCollaborators(invite.BudgetID)
+	if countErr != nil {
+		return errInternal(c, "failed to check collaborator count")
+	}
+	if collabCount >= maxCollaboratorsPerBudget {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "collaborator limit reached (max 5)",
+		})
 	}
 
 	// Prevent duplicate collaborator.
