@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -460,7 +461,7 @@ func CreateBudget(c *fiber.Ctx) error {
 
 	// Seed guided sections for template-based modes.
 	if guidedModes[budget.Mode] {
-		if err := seedGuidedSections(budget.ID, budget.Mode, now); err != nil {
+		if err := seedGuidedSections(budget.ID, budget.Mode, budget.MonthlyIncome, now); err != nil {
 			return errInternal(c, "failed to create guided sections")
 		}
 	}
@@ -471,17 +472,19 @@ func CreateBudget(c *fiber.Ctx) error {
 }
 
 // seedGuidedSections creates template sections and categories based on the budget mode.
-func seedGuidedSections(budgetID uuid.UUID, mode string, now time.Time) error {
+// Template percentages are converted to absolute values using the budget's income.
+func seedGuidedSections(budgetID uuid.UUID, mode string, monthlyIncome float64, now time.Time) error {
 	for _, gs := range getSectionsForMode(mode) {
+		sectionValue := math.Round(gs.Percent / 100 * monthlyIncome)
 		sectionID := uuid.New()
 		sectionPayload := map[string]interface{}{
-			"id":                 sectionID.String(),
-			"budget_id":          budgetID.String(),
-			"name":               gs.Name,
-			"allocation_percent": gs.Percent,
-			"icon":               gs.Icon,
-			"sort_order":         gs.SortOrder,
-			"created_at":         now.Format(time.RFC3339Nano),
+			"id":               sectionID.String(),
+			"budget_id":        budgetID.String(),
+			"name":             gs.Name,
+			"allocation_value": sectionValue,
+			"icon":             gs.Icon,
+			"sort_order":       gs.SortOrder,
+			"created_at":       now.Format(time.RFC3339Nano),
 		}
 		sectionBytes, err := marshalJSON(sectionPayload)
 		if err != nil {
@@ -493,15 +496,16 @@ func seedGuidedSections(budgetID uuid.UUID, mode string, now time.Time) error {
 		}
 
 		for _, gc := range gs.Categories {
+			catValue := math.Round(gc.Percent / 100 * sectionValue)
 			catID := uuid.New()
 			catPayload := map[string]interface{}{
-				"id":                 catID.String(),
-				"category_id":        sectionID.String(),
-				"name":               gc.Name,
-				"allocation_percent": gc.Percent,
-				"icon":               gc.Icon,
-				"sort_order":         gc.SortOrder,
-				"created_at":         now.Format(time.RFC3339Nano),
+				"id":               catID.String(),
+				"category_id":      sectionID.String(),
+				"name":             gc.Name,
+				"allocation_value": catValue,
+				"icon":             gc.Icon,
+				"sort_order":       gc.SortOrder,
+				"created_at":       now.Format(time.RFC3339Nano),
 			}
 			catBytes, err := marshalJSON(catPayload)
 			if err != nil {

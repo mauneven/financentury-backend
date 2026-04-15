@@ -49,19 +49,34 @@ func CreateCategory(c *fiber.Ctx) error {
 	if len(req.Icon) > maxIconLength {
 		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
-	if req.AllocationPercent < 0 || req.AllocationPercent > 100 {
-		return errBadRequest(c, "allocation_percent must be between 0 and 100")
+	if req.AllocationValue < 0 {
+		return errBadRequest(c, "allocation_value must be positive")
 	}
 
 	if err := verifySectionOwnership(budgetID, sectionID, userID); err != nil {
 		return errNotFound(c, "section not found")
 	}
 
-	// Validate that total category allocation won't exceed 100% of the section.
-	// Category allocation_percent values are percentages of the section (0-100),
-	// so their sum must not exceed 100.
+	// Fetch the parent section to get its allocation_value for validation.
+	sectionQuery := database.NewFilter().
+		Select("allocation_value").
+		Eq("id", sectionID.String()).
+		Build()
+	sectionBody, sectionStatus, sectionErr := database.DB.Get("budget_categories", sectionQuery)
+	if sectionErr != nil || sectionStatus != http.StatusOK {
+		return errInternal(c, "failed to fetch parent section")
+	}
+	var parentSections []struct {
+		AllocationValue float64 `json:"allocation_value"`
+	}
+	if err := json.Unmarshal(sectionBody, &parentSections); err != nil || len(parentSections) == 0 {
+		return errInternal(c, "failed to parse parent section")
+	}
+	sectionAlloc := parentSections[0].AllocationValue
+
+	// Validate that total category allocation won't exceed section's value.
 	existingCatQuery := database.NewFilter().
-		Select("allocation_percent").
+		Select("allocation_value").
 		Eq("category_id", sectionID.String()).
 		Build()
 
@@ -71,7 +86,7 @@ func CreateCategory(c *fiber.Ctx) error {
 	}
 
 	var existingCats []struct {
-		AllocationPercent float64 `json:"allocation_percent"`
+		AllocationValue float64 `json:"allocation_value"`
 	}
 	if err := json.Unmarshal(existingCatBody, &existingCats); err != nil {
 		return errInternal(c, "failed to parse existing category allocations")
@@ -79,10 +94,10 @@ func CreateCategory(c *fiber.Ctx) error {
 
 	var totalCatAllocation float64
 	for _, ec := range existingCats {
-		totalCatAllocation += ec.AllocationPercent
+		totalCatAllocation += ec.AllocationValue
 	}
-	if totalCatAllocation+req.AllocationPercent > 100 {
-		return errBadRequest(c, "total category allocation would exceed 100% of section")
+	if totalCatAllocation+req.AllocationValue > sectionAlloc {
+		return errBadRequest(c, "total category allocation would exceed section budget")
 	}
 
 	now := time.Now().UTC()
@@ -92,7 +107,7 @@ func CreateCategory(c *fiber.Ctx) error {
 		ID:                catID,
 		CategoryID:        sectionID,
 		Name:              req.Name,
-		AllocationPercent: req.AllocationPercent,
+		AllocationValue: req.AllocationValue,
 		Icon:              req.Icon,
 		SortOrder:         req.SortOrder,
 		CreatedAt:         now,
@@ -102,7 +117,7 @@ func CreateCategory(c *fiber.Ctx) error {
 		"id":                 catID.String(),
 		"category_id":        sectionID.String(),
 		"name":               req.Name,
-		"allocation_percent": req.AllocationPercent,
+		"allocation_value": req.AllocationValue,
 		"icon":               req.Icon,
 		"sort_order":         req.SortOrder,
 		"created_at":         now.Format(time.RFC3339Nano),
@@ -171,8 +186,8 @@ func UpdateCategory(c *fiber.Ctx) error {
 	if req.Icon != nil && len(*req.Icon) > maxIconLength {
 		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
-	if req.AllocationPercent != nil && (*req.AllocationPercent < 0 || *req.AllocationPercent > 100) {
-		return errBadRequest(c, "allocation_percent must be between 0 and 100")
+	if req.AllocationValue != nil && *req.AllocationValue < 0 {
+		return errBadRequest(c, "allocation_value must be positive")
 	}
 
 	if err := verifySectionOwnership(budgetID, sectionID, userID); err != nil {
@@ -198,12 +213,27 @@ func UpdateCategory(c *fiber.Ctx) error {
 
 	cat := cats[0]
 
-	// Validate that updated total category allocation won't exceed 100% of the section.
-	// Category allocation_percent values are percentages of the section (0-100),
-	// so their sum must not exceed 100.
-	if req.AllocationPercent != nil {
+	// Validate that updated total category allocation won't exceed section's value.
+	if req.AllocationValue != nil {
+		// Fetch parent section's allocation_value.
+		secQuery := database.NewFilter().
+			Select("allocation_value").
+			Eq("id", sectionID.String()).
+			Build()
+		secBody, secStatus, secErr := database.DB.Get("budget_categories", secQuery)
+		if secErr != nil || secStatus != http.StatusOK {
+			return errInternal(c, "failed to fetch parent section")
+		}
+		var parentSecs []struct {
+			AllocationValue float64 `json:"allocation_value"`
+		}
+		if err := json.Unmarshal(secBody, &parentSecs); err != nil || len(parentSecs) == 0 {
+			return errInternal(c, "failed to parse parent section")
+		}
+		sectionAlloc := parentSecs[0].AllocationValue
+
 		allCatQuery := database.NewFilter().
-			Select("id,allocation_percent").
+			Select("id,allocation_value").
 			Eq("category_id", sectionID.String()).
 			Build()
 
@@ -213,8 +243,8 @@ func UpdateCategory(c *fiber.Ctx) error {
 		}
 
 		var allCats []struct {
-			ID                string  `json:"id"`
-			AllocationPercent float64 `json:"allocation_percent"`
+			ID              string  `json:"id"`
+			AllocationValue float64 `json:"allocation_value"`
 		}
 		if err := json.Unmarshal(allCatBody, &allCats); err != nil {
 			return errInternal(c, "failed to parse existing category allocations")
@@ -225,10 +255,10 @@ func UpdateCategory(c *fiber.Ctx) error {
 			if ac.ID == catID.String() {
 				continue // exclude the category being updated
 			}
-			totalCatAlloc += ac.AllocationPercent
+			totalCatAlloc += ac.AllocationValue
 		}
-		if totalCatAlloc+*req.AllocationPercent > 100 {
-			return errBadRequest(c, "total category allocation would exceed 100% of section")
+		if totalCatAlloc+*req.AllocationValue > sectionAlloc {
+			return errBadRequest(c, "total category allocation would exceed section budget")
 		}
 	}
 
@@ -236,8 +266,8 @@ func UpdateCategory(c *fiber.Ctx) error {
 	if req.Name != nil {
 		cat.Name = *req.Name
 	}
-	if req.AllocationPercent != nil {
-		cat.AllocationPercent = *req.AllocationPercent
+	if req.AllocationValue != nil {
+		cat.AllocationValue = *req.AllocationValue
 	}
 	if req.Icon != nil {
 		cat.Icon = *req.Icon
@@ -248,7 +278,7 @@ func UpdateCategory(c *fiber.Ctx) error {
 
 	updatePayload := map[string]interface{}{
 		"name":               cat.Name,
-		"allocation_percent": cat.AllocationPercent,
+		"allocation_value": cat.AllocationValue,
 		"icon":               cat.Icon,
 		"sort_order":         cat.SortOrder,
 	}

@@ -317,7 +317,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 
 	sectionSummaries := make([]models.SectionSummary, 0, len(sections))
 	for _, section := range sections {
-		sectionAllocated := roundAmount(budget.MonthlyIncome * section.AllocationPercent / 100)
+		sectionAllocated := roundAmount(section.AllocationValue)
 
 		cats := catsBySection[section.ID]
 		catSummaries := make([]models.CategorySummary, 0, len(cats))
@@ -325,7 +325,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		sectionByUser := make(map[uuid.UUID]float64)
 
 		for _, cat := range cats {
-			catAllocated := roundAmount(sectionAllocated * cat.AllocationPercent / 100)
+			catAllocated := roundAmount(cat.AllocationValue)
 
 			var catSpent float64
 			var catCount int
@@ -346,7 +346,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 					ID:                cat.ID,
 					SectionID:         cat.CategoryID,
 					Name:              cat.Name,
-					AllocationPercent: cat.AllocationPercent,
+					AllocationValue: cat.AllocationValue,
 					Icon:              cat.Icon,
 					SortOrder:         cat.SortOrder,
 					CreatedAt:         cat.CreatedAt,
@@ -811,10 +811,9 @@ func buildLinkedSections(
 		}
 
 		// Build category summaries.
-		sectionAllocated := roundAmount(srcBudget.MonthlyIncome * section.AllocationPercent / 100)
 		catSummaries := make([]models.CategorySummary, 0, len(cats))
 		for _, cat := range cats {
-			catAllocated := roundAmount(sectionAllocated * cat.AllocationPercent / 100)
+			catAllocated := roundAmount(cat.AllocationValue)
 			var catSpent float64
 			var catCount int
 			var catUserSpending []models.UserSpending
@@ -828,7 +827,7 @@ func buildLinkedSections(
 					ID:                cat.ID,
 					SectionID:         cat.CategoryID,
 					Name:              cat.Name,
-					AllocationPercent: cat.AllocationPercent,
+					AllocationValue: cat.AllocationValue,
 					Icon:              cat.Icon,
 					SortOrder:         cat.SortOrder,
 					CreatedAt:         cat.CreatedAt,

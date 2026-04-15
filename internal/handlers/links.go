@@ -370,7 +370,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 
 	// Fetch sections for all budgets.
 	sectionRows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, budget_id, name, allocation_percent, icon, sort_order, created_at
+		SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
 		FROM budget_categories
 		WHERE budget_id = ANY($1)
 		ORDER BY sort_order, created_at
@@ -385,7 +385,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 
 	for sectionRows.Next() {
 		var s models.Section
-		if err := sectionRows.Scan(&s.ID, &s.BudgetID, &s.Name, &s.AllocationPercent,
+		if err := sectionRows.Scan(&s.ID, &s.BudgetID, &s.Name, &s.AllocationValue,
 			&s.Icon, &s.SortOrder, &s.CreatedAt); err != nil {
 			continue
 		}
@@ -405,7 +405,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 	// Fetch categories for all sections.
 	if len(sectionIDs) > 0 {
 		catRows, err := database.DB.Pool.Query(ctx, `
-			SELECT id, category_id, name, allocation_percent, icon, sort_order, created_at
+			SELECT id, category_id, name, allocation_value, icon, sort_order, created_at
 			FROM budget_subcategories
 			WHERE category_id = ANY($1)
 			ORDER BY sort_order, created_at
@@ -415,7 +415,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 			for catRows.Next() {
 				var cat models.Category
 				if err := catRows.Scan(&cat.ID, &cat.CategoryID, &cat.Name,
-					&cat.AllocationPercent, &cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
+					&cat.AllocationValue, &cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
 					continue
 				}
 				idx, ok := sectionIdx[cat.CategoryID]

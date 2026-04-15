@@ -38,7 +38,7 @@ type Section struct {
 	ID                uuid.UUID `json:"id"`
 	BudgetID          uuid.UUID `json:"budget_id"`
 	Name              string    `json:"name"`
-	AllocationPercent float64   `json:"allocation_percent"`
+	AllocationValue float64   `json:"allocation_value"`
 	Icon              string    `json:"icon"`
 	SortOrder         int       `json:"sort_order"`
 	CreatedAt         time.Time `json:"created_at"`
@@ -49,7 +49,7 @@ type Category struct {
 	ID                uuid.UUID `json:"id"`
 	CategoryID        uuid.UUID `json:"category_id"`
 	Name              string    `json:"name"`
-	AllocationPercent float64   `json:"allocation_percent"`
+	AllocationValue float64   `json:"allocation_value"`
 	Icon              string    `json:"icon"`
 	SortOrder         int       `json:"sort_order"`
 	CreatedAt         time.Time `json:"created_at"`
@@ -159,7 +159,7 @@ type UpdateBudgetRequest struct {
 // CreateSectionRequest is the payload for creating a section.
 type CreateSectionRequest struct {
 	Name              string  `json:"name"`
-	AllocationPercent float64 `json:"allocation_percent"`
+	AllocationValue float64 `json:"allocation_value"`
 	Icon              string  `json:"icon"`
 	SortOrder         int     `json:"sort_order"`
 }
@@ -167,7 +167,7 @@ type CreateSectionRequest struct {
 // UpdateSectionRequest is the payload for updating a section.
 type UpdateSectionRequest struct {
 	Name              *string  `json:"name,omitempty"`
-	AllocationPercent *float64 `json:"allocation_percent,omitempty"`
+	AllocationValue *float64 `json:"allocation_value,omitempty"`
 	Icon              *string  `json:"icon,omitempty"`
 	SortOrder         *int     `json:"sort_order,omitempty"`
 }
@@ -175,7 +175,7 @@ type UpdateSectionRequest struct {
 // CreateCategoryRequest is the payload for creating a category.
 type CreateCategoryRequest struct {
 	Name              string  `json:"name"`
-	AllocationPercent float64 `json:"allocation_percent"`
+	AllocationValue float64 `json:"allocation_value"`
 	Icon              string  `json:"icon"`
 	SortOrder         int     `json:"sort_order"`
 }
@@ -183,7 +183,7 @@ type CreateCategoryRequest struct {
 // UpdateCategoryRequest is the payload for updating a category.
 type UpdateCategoryRequest struct {
 	Name              *string  `json:"name,omitempty"`
-	AllocationPercent *float64 `json:"allocation_percent,omitempty"`
+	AllocationValue *float64 `json:"allocation_value,omitempty"`
 	Icon              *string  `json:"icon,omitempty"`
 	SortOrder         *int     `json:"sort_order,omitempty"`
 }
@@ -213,7 +213,7 @@ type SummaryCategoryView struct {
 	ID                uuid.UUID `json:"id"`
 	SectionID         uuid.UUID `json:"section_id"`
 	Name              string    `json:"name"`
-	AllocationPercent float64   `json:"allocation_percent"`
+	AllocationValue float64   `json:"allocation_value"`
 	Icon              string    `json:"icon"`
 	SortOrder         int       `json:"sort_order"`
 	CreatedAt         time.Time `json:"created_at"`

@@ -41,7 +41,7 @@ type MigrateBudget struct {
 // MigrateSection represents a section to migrate.
 type MigrateSection struct {
 	Name              string            `json:"name"`
-	AllocationPercent float64           `json:"allocation_percent"`
+	AllocationValue float64           `json:"allocation_value"`
 	Icon              string            `json:"icon"`
 	SortOrder         int               `json:"sort_order"`
 	LocalID           string            `json:"local_id"`
@@ -51,7 +51,7 @@ type MigrateSection struct {
 // MigrateCategory represents a category to migrate.
 type MigrateCategory struct {
 	Name              string  `json:"name"`
-	AllocationPercent float64 `json:"allocation_percent"`
+	AllocationValue float64 `json:"allocation_value"`
 	Icon              string  `json:"icon"`
 	SortOrder         int     `json:"sort_order"`
 	LocalID           string  `json:"local_id"`
@@ -195,7 +195,7 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 			"id":                 sectionID.String(),
 			"budget_id":          budgetID.String(),
 			"name":               ms.Name,
-			"allocation_percent": ms.AllocationPercent,
+			"allocation_value": ms.AllocationValue,
 			"icon":               ms.Icon,
 			"sort_order":         ms.SortOrder,
 			"created_at":         now.Format(time.RFC3339Nano),
@@ -224,7 +224,7 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 				"id":                 catID.String(),
 				"category_id":        sectionID.String(),
 				"name":               mc.Name,
-				"allocation_percent": mc.AllocationPercent,
+				"allocation_value": mc.AllocationValue,
 				"icon":               mc.Icon,
 				"sort_order":         mc.SortOrder,
 				"created_at":         now.Format(time.RFC3339Nano),
@@ -300,8 +300,8 @@ func validateMigrateSection(ms MigrateSection) error {
 	if len(ms.Icon) > maxIconLength {
 		return fiber.NewError(fiber.StatusBadRequest, "section icon too long (max 50 characters)")
 	}
-	if ms.AllocationPercent < 0 || ms.AllocationPercent > 100 {
-		return fiber.NewError(fiber.StatusBadRequest, "section allocation_percent must be between 0 and 100")
+	if ms.AllocationValue < 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "section allocation_value must be positive")
 	}
 	if len(ms.Categories) > maxMigrateCategoriesPerGroup {
 		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("too many categories per section (max %d)", maxMigrateCategoriesPerGroup))
@@ -319,8 +319,8 @@ func validateMigrateCategory(mc MigrateCategory) error {
 	if len(mc.Icon) > maxIconLength {
 		return fiber.NewError(fiber.StatusBadRequest, "category icon too long (max 50 characters)")
 	}
-	if mc.AllocationPercent < 0 || mc.AllocationPercent > 100 {
-		return fiber.NewError(fiber.StatusBadRequest, "category allocation_percent must be between 0 and 100")
+	if mc.AllocationValue < 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "category allocation_value must be positive")
 	}
 	return nil
 }

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS budget_categories (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     budget_id         UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
     name              TEXT NOT NULL,
-    allocation_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+    allocation_value DOUBLE PRECISION NOT NULL DEFAULT 0,
     icon              TEXT NOT NULL DEFAULT '',
     sort_order        INTEGER NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS budget_subcategories (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     category_id       UUID NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
     name              TEXT NOT NULL,
-    allocation_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+    allocation_value DOUBLE PRECISION NOT NULL DEFAULT 0,
     icon              TEXT NOT NULL DEFAULT '',
     sort_order        INTEGER NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()

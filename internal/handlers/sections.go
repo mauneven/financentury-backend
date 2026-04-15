@@ -139,17 +139,27 @@ func CreateSection(c *fiber.Ctx) error {
 	if len(req.Icon) > maxIconLength {
 		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
-	if req.AllocationPercent < 0 || req.AllocationPercent > 100 {
-		return errBadRequest(c, "allocation_percent must be between 0 and 100")
+	if req.AllocationValue < 0 {
+		return errBadRequest(c, "allocation_value must be positive")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Validate that total allocation across all sections won't exceed 100%.
+	// Fetch budget to get monthly_income for validation.
+	budget, err := fetchBudget(budgetID)
+	if err != nil || budget == nil {
+		return errInternal(c, "failed to fetch budget")
+	}
+
+	if req.AllocationValue > budget.MonthlyIncome {
+		return errBadRequest(c, "allocation_value exceeds budget income")
+	}
+
+	// Validate that total allocation across all sections won't exceed income.
 	existingQuery := database.NewFilter().
-		Select("allocation_percent").
+		Select("allocation_value").
 		Eq("budget_id", budgetID.String()).
 		Build()
 
@@ -159,7 +169,7 @@ func CreateSection(c *fiber.Ctx) error {
 	}
 
 	var existingSections []struct {
-		AllocationPercent float64 `json:"allocation_percent"`
+		AllocationValue float64 `json:"allocation_value"`
 	}
 	if err := json.Unmarshal(existingBody, &existingSections); err != nil {
 		return errInternal(c, "failed to parse existing allocations")
@@ -167,10 +177,10 @@ func CreateSection(c *fiber.Ctx) error {
 
 	var totalAllocation float64
 	for _, s := range existingSections {
-		totalAllocation += s.AllocationPercent
+		totalAllocation += s.AllocationValue
 	}
-	if totalAllocation+req.AllocationPercent > 100 {
-		return errBadRequest(c, "total allocation would exceed 100%")
+	if totalAllocation+req.AllocationValue > budget.MonthlyIncome {
+		return errBadRequest(c, "total allocation would exceed budget income")
 	}
 
 	now := time.Now().UTC()
@@ -180,7 +190,7 @@ func CreateSection(c *fiber.Ctx) error {
 		ID:                sectionID,
 		BudgetID:          budgetID,
 		Name:              req.Name,
-		AllocationPercent: req.AllocationPercent,
+		AllocationValue: req.AllocationValue,
 		Icon:              req.Icon,
 		SortOrder:         req.SortOrder,
 		CreatedAt:         now,
@@ -190,7 +200,7 @@ func CreateSection(c *fiber.Ctx) error {
 		"id":                 sectionID.String(),
 		"budget_id":          budgetID.String(),
 		"name":               req.Name,
-		"allocation_percent": req.AllocationPercent,
+		"allocation_value": req.AllocationValue,
 		"icon":               req.Icon,
 		"sort_order":         req.SortOrder,
 		"created_at":         now.Format(time.RFC3339Nano),
@@ -254,8 +264,8 @@ func UpdateSection(c *fiber.Ctx) error {
 	if req.Icon != nil && len(*req.Icon) > maxIconLength {
 		return errBadRequest(c, "icon too long (max 50 characters)")
 	}
-	if req.AllocationPercent != nil && (*req.AllocationPercent < 0 || *req.AllocationPercent > 100) {
-		return errBadRequest(c, "allocation_percent must be between 0 and 100")
+	if req.AllocationValue != nil && *req.AllocationValue < 0 {
+		return errBadRequest(c, "allocation_value must be positive")
 	}
 
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
@@ -281,10 +291,15 @@ func UpdateSection(c *fiber.Ctx) error {
 
 	section := sections[0]
 
-	// Validate that updated total allocation across all sections won't exceed 100%.
-	if req.AllocationPercent != nil {
+	// Validate that updated total allocation across all sections won't exceed budget income.
+	if req.AllocationValue != nil {
+		budget, budgetErr := fetchBudget(budgetID)
+		if budgetErr != nil || budget == nil {
+			return errInternal(c, "failed to fetch budget")
+		}
+
 		allQuery := database.NewFilter().
-			Select("id,allocation_percent").
+			Select("id,allocation_value").
 			Eq("budget_id", budgetID.String()).
 			Build()
 
@@ -294,8 +309,8 @@ func UpdateSection(c *fiber.Ctx) error {
 		}
 
 		var allSections []struct {
-			ID                string  `json:"id"`
-			AllocationPercent float64 `json:"allocation_percent"`
+			ID              string  `json:"id"`
+			AllocationValue float64 `json:"allocation_value"`
 		}
 		if err := json.Unmarshal(allBody, &allSections); err != nil {
 			return errInternal(c, "failed to parse existing allocations")
@@ -306,10 +321,10 @@ func UpdateSection(c *fiber.Ctx) error {
 			if s.ID == sectionID.String() {
 				continue // exclude the section being updated
 			}
-			totalAllocation += s.AllocationPercent
+			totalAllocation += s.AllocationValue
 		}
-		if totalAllocation+*req.AllocationPercent > 100 {
-			return errBadRequest(c, "total allocation would exceed 100%")
+		if totalAllocation+*req.AllocationValue > budget.MonthlyIncome {
+			return errBadRequest(c, "total allocation would exceed budget income")
 		}
 	}
 
@@ -317,8 +332,8 @@ func UpdateSection(c *fiber.Ctx) error {
 	if req.Name != nil {
 		section.Name = *req.Name
 	}
-	if req.AllocationPercent != nil {
-		section.AllocationPercent = *req.AllocationPercent
+	if req.AllocationValue != nil {
+		section.AllocationValue = *req.AllocationValue
 	}
 	if req.Icon != nil {
 		section.Icon = *req.Icon
@@ -329,7 +344,7 @@ func UpdateSection(c *fiber.Ctx) error {
 
 	updatePayload := map[string]interface{}{
 		"name":               section.Name,
-		"allocation_percent": section.AllocationPercent,
+		"allocation_value": section.AllocationValue,
 		"icon":               section.Icon,
 		"sort_order":         section.SortOrder,
 	}
