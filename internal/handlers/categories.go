@@ -57,26 +57,9 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errNotFound(c, "section not found")
 	}
 
-	// Validate that total category allocation won't exceed the section's allocation.
-	sectionQuery := database.NewFilter().
-		Select("allocation_percent").
-		Eq("id", sectionID.String()).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	sectionBody, sectionStatus, sectionErr := database.DB.Get("budget_categories", sectionQuery)
-	if sectionErr != nil || sectionStatus != http.StatusOK {
-		return errInternal(c, "failed to fetch section allocation")
-	}
-
-	var parentSections []struct {
-		AllocationPercent float64 `json:"allocation_percent"`
-	}
-	if err := json.Unmarshal(sectionBody, &parentSections); err != nil || len(parentSections) == 0 {
-		return errInternal(c, "failed to parse section allocation")
-	}
-	sectionAllocation := parentSections[0].AllocationPercent
-
+	// Validate that total category allocation won't exceed 100% of the section.
+	// Category allocation_percent values are percentages of the section (0-100),
+	// so their sum must not exceed 100.
 	existingCatQuery := database.NewFilter().
 		Select("allocation_percent").
 		Eq("category_id", sectionID.String()).
@@ -98,8 +81,8 @@ func CreateCategory(c *fiber.Ctx) error {
 	for _, ec := range existingCats {
 		totalCatAllocation += ec.AllocationPercent
 	}
-	if totalCatAllocation+req.AllocationPercent > sectionAllocation {
-		return errBadRequest(c, "total category allocation would exceed section allocation")
+	if totalCatAllocation+req.AllocationPercent > 100 {
+		return errBadRequest(c, "total category allocation would exceed 100% of section")
 	}
 
 	now := time.Now().UTC()
@@ -214,27 +197,10 @@ func UpdateCategory(c *fiber.Ctx) error {
 
 	cat := cats[0]
 
-	// Validate that updated total category allocation won't exceed the section's allocation.
+	// Validate that updated total category allocation won't exceed 100% of the section.
+	// Category allocation_percent values are percentages of the section (0-100),
+	// so their sum must not exceed 100.
 	if req.AllocationPercent != nil {
-		secQuery := database.NewFilter().
-			Select("allocation_percent").
-			Eq("id", sectionID.String()).
-			Eq("budget_id", budgetID.String()).
-			Build()
-
-		secBody, secStatus, secErr := database.DB.Get("budget_categories", secQuery)
-		if secErr != nil || secStatus != http.StatusOK {
-			return errInternal(c, "failed to fetch section allocation")
-		}
-
-		var parentSecs []struct {
-			AllocationPercent float64 `json:"allocation_percent"`
-		}
-		if err := json.Unmarshal(secBody, &parentSecs); err != nil || len(parentSecs) == 0 {
-			return errInternal(c, "failed to parse section allocation")
-		}
-		secAllocation := parentSecs[0].AllocationPercent
-
 		allCatQuery := database.NewFilter().
 			Select("id,allocation_percent").
 			Eq("category_id", sectionID.String()).
@@ -260,8 +226,8 @@ func UpdateCategory(c *fiber.Ctx) error {
 			}
 			totalCatAlloc += ac.AllocationPercent
 		}
-		if totalCatAlloc+*req.AllocationPercent > secAllocation {
-			return errBadRequest(c, "total category allocation would exceed section allocation")
+		if totalCatAlloc+*req.AllocationPercent > 100 {
+			return errBadRequest(c, "total category allocation would exceed 100% of section")
 		}
 	}
 

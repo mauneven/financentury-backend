@@ -511,12 +511,13 @@ func sortMonthlyTrends(trends []models.MonthlyTrend) {
 	}
 }
 
-// ---------- GetBillingHistory ----------
+// ---------- GetMonthlyResume ----------
 
-// GetBillingHistory returns the balance for the current billing period and a
-// history of past billing periods (up to 12 months back). For one-time budgets
-// (billing_period_months == 0), it returns a single period from creation to now.
-func GetBillingHistory(c *fiber.Ctx) error {
+// GetMonthlyResume returns a resume of completed billing periods (up to 12
+// months back). Only periods that have ended AND contain at least one expense
+// are included. The current (in-progress) period is never shown. For one-time
+// budgets (billing_period_months == 0) there are no completed periods.
+func GetMonthlyResume(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
 		return errUnauthorized(c)
@@ -536,86 +537,61 @@ func GetBillingHistory(c *fiber.Ctx) error {
 		return errInternal(c, "failed to fetch budget")
 	}
 
-	userToday := resolveUserToday(c)
-
-	// For one-time budgets, return a single period from creation to now.
+	// One-time budgets have no recurring periods to resume.
 	if budget.BillingPeriodMonths == 0 {
-		allExpenses, err := fetchAllExpensesNoRetention(budgetID)
-		if err != nil {
-			return errInternal(c, "failed to fetch expenses")
-		}
-		var totalSpent float64
-		for _, exp := range allExpenses {
-			totalSpent += exp.Amount
-		}
-		totalSpent = roundAmount(totalSpent)
-		balance := roundAmount(budget.MonthlyIncome - totalSpent)
-
-		current := &models.BillingPeriodBalance{
-			PeriodStart: budget.CreatedAt.Format("2006-01-02"),
-			PeriodEnd:   userToday.Format("2006-01-02"),
-			Income:      roundAmount(budget.MonthlyIncome),
-			TotalSpent:  totalSpent,
-			Balance:     balance,
-		}
-
-		return c.JSON(models.BillingHistoryResponse{
+		return c.JSON(models.MonthlyResumeResponse{
 			BudgetID: budgetID,
-			Current:  current,
-			History:  []models.BillingPeriodBalance{},
+			Periods:  []models.MonthlyResumePeriod{},
 		})
 	}
 
-	// Recurring budget: compute periods going back up to 12 months.
+	userToday := resolveUserToday(c)
+
 	periodMonths := budget.BillingPeriodMonths
 	cutoffDay := budget.BillingCutoffDay
 	income := budget.MonthlyIncome
 
-	// Current period start
+	// Current period start — this period is still in progress, so we skip it.
 	currentStart := ComputeBillingPeriodStart(userToday, cutoffDay, periodMonths)
-	currentEnd := shiftMonths(currentStart, periodMonths, cutoffDay)
-	// currentEnd is the start of the *next* period; the current period ends the day before.
-	currentEndDisplay := currentEnd.AddDate(0, 0, -1)
 
-	// Build list of periods going back from current. Max ~12 periods for monthly,
-	// fewer for quarterly/semi-annual/annual.
+	// Build list of PAST (completed) periods going back from the one before current.
 	maxPeriods := 12 / periodMonths
 	if maxPeriods < 1 {
 		maxPeriods = 1
 	}
-	// +1 for the current period
+
 	type periodRange struct {
 		start time.Time
 		end   time.Time // exclusive (start of next period)
 	}
-	periods := make([]periodRange, 0, maxPeriods+1)
+	periods := make([]periodRange, 0, maxPeriods)
 
-	// Current period
-	periods = append(periods, periodRange{start: currentStart, end: currentEnd})
-
-	// Past periods
 	prevStart := currentStart
 	for i := 0; i < maxPeriods; i++ {
 		lastStart := prevStart
 		prevStart = shiftMonths(prevStart, -periodMonths, cutoffDay)
-		// Guard against duplicate periods: if shiftMonths didn't actually
-		// move backward (can happen when cutoff day > 28 and month clamping
-		// causes the date to stay the same), break to avoid infinite loops
-		// and duplicate entries.
 		if !prevStart.Before(lastStart) {
 			break
 		}
 		prevEnd := shiftMonths(prevStart, periodMonths, cutoffDay)
-		// Don't go before the budget was created
+		// Don't go before the budget was created.
 		if prevStart.Before(budget.CreatedAt.Truncate(24 * time.Hour)) {
 			break
 		}
 		periods = append(periods, periodRange{start: prevStart, end: prevEnd})
 	}
 
-	// Fetch all expenses within the full range (oldest period start to now).
+	if len(periods) == 0 {
+		return c.JSON(models.MonthlyResumeResponse{
+			BudgetID: budgetID,
+			Periods:  []models.MonthlyResumePeriod{},
+		})
+	}
+
+	// Fetch expenses from oldest period start up to the current period start
+	// (excludes current period expenses).
 	oldestStart := periods[len(periods)-1].start
-	allExpenses, err := fetchExpensesInDateRange(budgetID, oldestStart, userToday.AddDate(0, 0, 1))
+	allExpenses, err := fetchExpensesInDateRange(budgetID, oldestStart, currentStart)
 	if err != nil {
 		return errInternal(c, "failed to fetch expenses")
 	}
@@ -623,6 +599,7 @@ func GetBillingHistory(c *fiber.Ctx) error {
 	// Group expenses into periods.
 	type periodAgg struct {
 		totalSpent float64
+		hasData    bool
 	}
 	periodData := make([]periodAgg, len(periods))
 
@@ -634,40 +611,33 @@ func GetBillingHistory(c *fiber.Ctx) error {
 		for i, p := range periods {
 			if !expDate.Before(p.start) && expDate.Before(p.end) {
 				periodData[i].totalSpent += exp.Amount
+				periodData[i].hasData = true
 				break
 			}
 		}
 	}
 
-	// Build response.
-	var current *models.BillingPeriodBalance
-	history := make([]models.BillingPeriodBalance, 0, len(periods)-1)
-
+	// Build response — only include periods that have expense data.
+	result := make([]models.MonthlyResumePeriod, 0, len(periods))
 	for i, p := range periods {
+		if !periodData[i].hasData {
+			continue
+		}
 		spent := roundAmount(periodData[i].totalSpent)
 		bal := roundAmount(income - spent)
 		endDisplay := p.end.AddDate(0, 0, -1)
-		if i == 0 {
-			endDisplay = currentEndDisplay
-		}
-		entry := models.BillingPeriodBalance{
+		result = append(result, models.MonthlyResumePeriod{
 			PeriodStart: p.start.Format("2006-01-02"),
 			PeriodEnd:   endDisplay.Format("2006-01-02"),
 			Income:      roundAmount(income),
 			TotalSpent:  spent,
 			Balance:     bal,
-		}
-		if i == 0 {
-			current = &entry
-		} else {
-			history = append(history, entry)
-		}
+		})
 	}
 
-	return c.JSON(models.BillingHistoryResponse{
+	return c.JSON(models.MonthlyResumeResponse{
 		BudgetID: budgetID,
-		Current:  current,
-		History:  history,
+		Periods:  result,
 	})
 }
 

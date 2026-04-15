@@ -264,8 +264,8 @@ type TrendsResponse struct {
 	Sections []SectionTrend `json:"categories"`
 }
 
-// BillingPeriodBalance represents the balance for a single billing period.
-type BillingPeriodBalance struct {
+// MonthlyResumePeriod represents the resume for a single completed billing period.
+type MonthlyResumePeriod struct {
 	PeriodStart string  `json:"period_start"`
 	PeriodEnd   string  `json:"period_end"`
 	Income      float64 `json:"income"`
@@ -273,11 +273,11 @@ type BillingPeriodBalance struct {
 	Balance     float64 `json:"balance"`
 }
 
-// BillingHistoryResponse is the billing history endpoint response.
-type BillingHistoryResponse struct {
-	BudgetID uuid.UUID              `json:"budget_id"`
-	Current  *BillingPeriodBalance  `json:"current"`
-	History  []BillingPeriodBalance `json:"history"`
+// MonthlyResumeResponse is the monthly resume endpoint response.
+// Contains only completed billing periods that have expense data.
+type MonthlyResumeResponse struct {
+	BudgetID uuid.UUID             `json:"budget_id"`
+	Periods  []MonthlyResumePeriod `json:"periods"`
 }
 
 // ErrorResponse is a standard error response.
