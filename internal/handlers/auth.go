@@ -317,7 +317,8 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 	return created[0], nil
 }
 
-// Me returns the authenticated user's profile from the profiles table.
+// Me returns the authenticated user's profile from the profiles table,
+// including their display order preferences to avoid a separate GET.
 // This endpoint must be behind the Protected middleware.
 func Me(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
@@ -344,7 +345,34 @@ func Me(c *fiber.Ctx) error {
 		return errNotFound(c, "profile not found")
 	}
 
-	return c.JSON(profiles[0])
+	// Fetch display orders (best-effort — don't fail auth if table is empty or missing).
+	type orderEntry struct {
+		ScopeKey   string          `json:"scope_key"`
+		OrderedIDs json.RawMessage `json:"ordered_ids"`
+	}
+	var orders []orderEntry
+	rows, qErr := database.DB.Pool.Query(context.Background(),
+		`SELECT scope_key, ordered_ids FROM display_orders WHERE user_id = $1`, userID)
+	if qErr == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var o orderEntry
+			if scanErr := rows.Scan(&o.ScopeKey, &o.OrderedIDs); scanErr == nil {
+				orders = append(orders, o)
+			}
+		}
+	}
+	if orders == nil {
+		orders = []orderEntry{}
+	}
+
+	p := profiles[0]
+	return c.JSON(fiber.Map{
+		"id":             p.ID,
+		"email":          p.Email,
+		"full_name":      p.FullName,
+		"display_orders": orders,
+	})
 }
 
 // UpdateProfile updates the authenticated user's profile (currently only name).

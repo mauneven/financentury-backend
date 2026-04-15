@@ -121,12 +121,16 @@ type InviteInfo struct {
 }
 
 // BudgetLink represents a cross-budget link from a source section/category to a target budget.
+// For section-level links, TargetSectionID is nil (the whole section appears in the target budget).
+// For category-level links, TargetSectionID points to the section in the target budget where
+// the linked category should appear.
 type BudgetLink struct {
 	ID               uuid.UUID  `json:"id"`
 	SourceBudgetID   uuid.UUID  `json:"source_budget_id"`
 	TargetBudgetID   uuid.UUID  `json:"target_budget_id"`
 	SourceSectionID  uuid.UUID  `json:"source_section_id"`
 	SourceCategoryID *uuid.UUID `json:"source_category_id,omitempty"`
+	TargetSectionID  *uuid.UUID `json:"target_section_id,omitempty"`
 	FilterMode       string     `json:"filter_mode"`
 	CreatedBy        uuid.UUID  `json:"created_by"`
 	CreatedAt        time.Time  `json:"created_at"`
@@ -318,6 +322,21 @@ type Session struct {
 	LastActiveAt time.Time  `json:"last_active_at"`
 	ExpiresAt    time.Time  `json:"-"`
 	RevokedAt    *time.Time `json:"-"`
+}
+
+// DisplayOrder stores per-user visual ordering for a given scope.
+type DisplayOrder struct {
+	ID         uuid.UUID       `json:"id"`
+	UserID     uuid.UUID       `json:"user_id"`
+	ScopeKey   string          `json:"scope_key"`
+	OrderedIDs json.RawMessage `json:"ordered_ids"`
+	UpdatedAt  time.Time       `json:"updated_at"`
+}
+
+// SaveDisplayOrderRequest is the payload for saving a display order.
+type SaveDisplayOrderRequest struct {
+	ScopeKey   string   `json:"scope_key"`
+	OrderedIDs []string `json:"ordered_ids"`
 }
 
 // ErrorResponse is a standard error response.

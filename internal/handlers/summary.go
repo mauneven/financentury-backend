@@ -688,7 +688,7 @@ func buildLinkedSections(
 	// Fetch all links for this target budget.
 	rows, err := database.DB.Pool.Query(ctx, `
 		SELECT id, source_budget_id, target_budget_id, source_section_id,
-		       source_category_id, filter_mode, created_by, created_at
+		       source_category_id, target_section_id, filter_mode, created_by, created_at
 		FROM budget_links WHERE target_budget_id = $1
 	`, targetBudgetID)
 	if err != nil {
@@ -700,8 +700,8 @@ func buildLinkedSections(
 	for rows.Next() {
 		var l models.BudgetLink
 		if err := rows.Scan(&l.ID, &l.SourceBudgetID, &l.TargetBudgetID,
-			&l.SourceSectionID, &l.SourceCategoryID, &l.FilterMode,
-			&l.CreatedBy, &l.CreatedAt); err != nil {
+			&l.SourceSectionID, &l.SourceCategoryID, &l.TargetSectionID,
+			&l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
 			continue
 		}
 		links = append(links, l)

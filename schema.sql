@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS budget_links (
     target_budget_id   UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
     source_section_id  UUID NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
     source_category_id UUID REFERENCES budget_subcategories(id) ON DELETE CASCADE,
+    target_section_id  UUID REFERENCES budget_categories(id) ON DELETE CASCADE,
     filter_mode        TEXT NOT NULL DEFAULT 'all',
     created_by         UUID NOT NULL REFERENCES profiles(id),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -169,3 +170,18 @@ CREATE INDEX IF NOT EXISTS idx_budget_links_target_budget ON budget_links(target
 CREATE INDEX IF NOT EXISTS idx_budget_links_source_section ON budget_links(source_section_id);
 
 ALTER TABLE budget_links DISABLE ROW LEVEL SECURITY;
+
+-- ─── display_orders (per-user visual ordering) ─────────────────────────────
+
+CREATE TABLE IF NOT EXISTS display_orders (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    scope_key   TEXT NOT NULL,
+    ordered_ids JSONB NOT NULL DEFAULT '[]',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(user_id, scope_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_display_orders_user_id ON display_orders(user_id);
+
+ALTER TABLE display_orders DISABLE ROW LEVEL SECURITY;

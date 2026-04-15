@@ -35,7 +35,7 @@ func ListLinks(c *fiber.Ctx) error {
 
 	rows, err := database.DB.Pool.Query(ctx, `
 		SELECT id, source_budget_id, target_budget_id, source_section_id,
-		       source_category_id, filter_mode, created_by, created_at
+		       source_category_id, target_section_id, filter_mode, created_by, created_at
 		FROM budget_links
 		WHERE target_budget_id = $1
 		ORDER BY created_at
@@ -49,8 +49,8 @@ func ListLinks(c *fiber.Ctx) error {
 	for rows.Next() {
 		var l models.BudgetLink
 		if err := rows.Scan(&l.ID, &l.SourceBudgetID, &l.TargetBudgetID,
-			&l.SourceSectionID, &l.SourceCategoryID, &l.FilterMode,
-			&l.CreatedBy, &l.CreatedAt); err != nil {
+			&l.SourceSectionID, &l.SourceCategoryID, &l.TargetSectionID,
+			&l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
 			return errInternal(c, "failed to parse link")
 		}
 		links = append(links, l)
@@ -75,6 +75,7 @@ func CreateLink(c *fiber.Ctx) error {
 		SourceBudgetID   uuid.UUID  `json:"source_budget_id"`
 		SourceSectionID  uuid.UUID  `json:"source_section_id"`
 		SourceCategoryID *uuid.UUID `json:"source_category_id,omitempty"`
+		TargetSectionID  *uuid.UUID `json:"target_section_id,omitempty"`
 		FilterMode       string     `json:"filter_mode"`
 	}
 	if err := c.BodyParser(&req); err != nil {
@@ -136,6 +137,18 @@ func CreateLink(c *fiber.Ctx) error {
 		if err != nil || !catExists {
 			return errNotFound(c, "source category not found in source section")
 		}
+
+		// Category links require target_section_id (which section in target budget to place it in).
+		if req.TargetSectionID == nil {
+			return errBadRequest(c, "target_section_id is required for category links")
+		}
+		var targetSectionExists bool
+		err = database.DB.Pool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)",
+			*req.TargetSectionID, budgetID).Scan(&targetSectionExists)
+		if err != nil || !targetSectionExists {
+			return errNotFound(c, "target section not found in target budget")
+		}
 	}
 
 	// Check mutual exclusivity: full-section link and single-category links can't coexist.
@@ -174,14 +187,14 @@ func CreateLink(c *fiber.Ctx) error {
 	// Insert the link.
 	var link models.BudgetLink
 	err = database.DB.Pool.QueryRow(ctx, `
-		INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, source_category_id, filter_mode, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, filter_mode, created_by, created_at
+		INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by, created_at
 	`, req.SourceBudgetID, budgetID, req.SourceSectionID, req.SourceCategoryID,
-		req.FilterMode, userID,
+		req.TargetSectionID, req.FilterMode, userID,
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
-		&link.SourceSectionID, &link.SourceCategoryID, &link.FilterMode,
-		&link.CreatedBy, &link.CreatedAt)
+		&link.SourceSectionID, &link.SourceCategoryID, &link.TargetSectionID,
+		&link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
 		log.Printf("[links] insert failed: %v", err)
 		return errInternal(c, "failed to create link")
@@ -231,11 +244,11 @@ func UpdateLink(c *fiber.Ctx) error {
 	err := database.DB.Pool.QueryRow(ctx, `
 		UPDATE budget_links SET filter_mode = $1
 		WHERE id = $2 AND target_budget_id = $3
-		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, filter_mode, created_by, created_at
+		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by, created_at
 	`, req.FilterMode, linkID, budgetID,
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
-		&link.SourceSectionID, &link.SourceCategoryID, &link.FilterMode,
-		&link.CreatedBy, &link.CreatedAt)
+		&link.SourceSectionID, &link.SourceCategoryID, &link.TargetSectionID,
+		&link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
 		return errNotFound(c, "link not found")
 	}

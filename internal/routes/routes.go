@@ -41,6 +41,9 @@ func Setup(app *fiber.App) {
 	// Protected invite routes.
 	protected.Post("/invites/:token/accept", handlers.AcceptInvite)
 
+	// Display order route (save only — read is bundled in /auth/me).
+	protected.Put("/display-orders", handlers.SaveDisplayOrder)
+
 	// Budget routes.
 	budgets := protected.Group("/budgets")
 	budgets.Get("/", handlers.ListBudgets)
