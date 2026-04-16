@@ -214,6 +214,110 @@ func GoogleLogin(c *fiber.Ctx) error {
 	})
 }
 
+// googleMobileLoginRequest is the expected body for mobile Google login.
+type googleMobileLoginRequest struct {
+	IDToken string `json:"id_token"`
+}
+
+// googleTokenInfo is the response from Google's tokeninfo endpoint.
+type googleTokenInfo struct {
+	Email         string `json:"email"`
+	EmailVerified string `json:"email_verified"`
+	Name          string `json:"name"`
+	Picture       string `json:"picture"`
+	Sub           string `json:"sub"`
+	Aud           string `json:"aud"`
+}
+
+// GoogleMobileLogin handles POST /api/auth/google/mobile. It verifies a Google
+// ID token (obtained by the mobile SDK) directly with Google, upserts the
+// profile, and returns a backend-issued JWT.
+func GoogleMobileLogin(c *fiber.Ctx) error {
+	var req googleMobileLoginRequest
+	if err := c.BodyParser(&req); err != nil {
+		return errBadRequest(c, "invalid request body")
+	}
+	if req.IDToken == "" {
+		return errBadRequest(c, "id_token is required")
+	}
+
+	// Verify the ID token with Google's tokeninfo endpoint.
+	httpClient := &http.Client{Timeout: oauthHTTPTimeout}
+	resp, err := httpClient.Get("https://oauth2.googleapis.com/tokeninfo?id_token=" + url.QueryEscape(req.IDToken))
+	if err != nil {
+		return errInternal(c, "failed to verify id_token with Google")
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseSize))
+	if err != nil {
+		return errInternal(c, "failed to read token verification response")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
+			Error: "invalid or expired id_token",
+		})
+	}
+
+	var tokenInfo googleTokenInfo
+	if err := json.Unmarshal(body, &tokenInfo); err != nil {
+		return errInternal(c, "failed to parse token verification response")
+	}
+
+	// Validate the audience matches our client ID.
+	if tokenInfo.Aud != googleClientID {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
+			Error: "id_token audience mismatch",
+		})
+	}
+
+	if tokenInfo.Email == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
+			Error: "no email in id_token",
+		})
+	}
+	if tokenInfo.EmailVerified != "true" {
+		return c.Status(fiber.StatusUnauthorized).JSON(models.ErrorResponse{
+			Error: "email address is not verified by Google",
+		})
+	}
+
+	// Reuse the same upsert logic as web login.
+	userInfo := googleUserInfo{
+		ID:            tokenInfo.Sub,
+		Email:         tokenInfo.Email,
+		VerifiedEmail: true,
+		Name:          tokenInfo.Name,
+		Picture:       tokenInfo.Picture,
+	}
+
+	profile, err := upsertProfile(userInfo)
+	if err != nil {
+		log.Printf("[auth] upsertProfile failed for %s: %v", userInfo.Email, err)
+		return errInternal(c, "failed to create or find user profile")
+	}
+	if profile.ID == uuid.Nil {
+		log.Printf("[auth] upsertProfile returned nil ID for %s", userInfo.Email)
+		return errInternal(c, "failed to create or find user profile")
+	}
+
+	token, err := middleware.GenerateToken(profile.ID, profile.Email)
+	if err != nil {
+		return errInternal(c, "failed to generate token")
+	}
+
+	CreateSession(profile.ID, token, c)
+
+	return c.JSON(fiber.Map{
+		"token": token,
+		"user": fiber.Map{
+			"id":        profile.ID,
+			"email":     profile.Email,
+			"full_name": profile.FullName,
+		},
+	})
+}
+
 // upsertProfile looks up a profile by email and updates it if found, or
 // creates a new one.
 func upsertProfile(userInfo googleUserInfo) (models.Profile, error) {
