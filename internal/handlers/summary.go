@@ -148,9 +148,6 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Best-effort cleanup of expenses older than 12 months.
-	pruneOldExpenses(budgetID)
-
 	budget, err := fetchBudget(budgetID)
 	if err != nil {
 		return errInternal(c, "failed to fetch budget")

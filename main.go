@@ -60,8 +60,11 @@ func main() {
 	defer database.Close()
 	log.Println("initialized database connection pool")
 
+	// Start background expense pruner (runs hourly).
+	handlers.StartExpensePruner()
+
 	// Create Fiber app.
-	app := fiber.New(fiber.Config{
+	fiberCfg := fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if e, ok := err.(*fiber.Error); ok {
@@ -75,12 +78,17 @@ func main() {
 			}
 			return c.Status(code).JSON(fiber.Map{"error": msg})
 		},
-		AppName:                 "Financial Workspace API",
-		BodyLimit:               4 * 1024 * 1024, // 4MB (increased for migration payloads)
-		EnableTrustedProxyCheck: true,
-		TrustedProxies:          []string{"0.0.0.0/0"},
-		ProxyHeader:             "X-Forwarded-For",
-	})
+		AppName:   "Financial Workspace API",
+		BodyLimit: 4 * 1024 * 1024, // 4MB (increased for migration payloads)
+	}
+	// Only enable proxy header parsing when explicit trusted CIDRs are configured.
+	// Without this, c.IP() returns the direct connection IP (safe default).
+	if len(cfg.TrustedProxies) > 0 {
+		fiberCfg.EnableTrustedProxyCheck = true
+		fiberCfg.TrustedProxies = cfg.TrustedProxies
+		fiberCfg.ProxyHeader = "X-Forwarded-For"
+	}
+	app := fiber.New(fiberCfg)
 
 	// Global middleware.
 	app.Use(recover.New())

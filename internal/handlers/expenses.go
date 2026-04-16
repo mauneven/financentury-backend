@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -34,6 +35,27 @@ func pruneOldExpenses(budgetID uuid.UUID) {
 	_, _, err := database.DB.Delete("budget_expenses", query)
 	if err != nil {
 		log.Printf("[expenses] prune old expenses for budget %s: %v", budgetID, err)
+	}
+}
+
+// StartExpensePruner runs expense pruning every hour in the background.
+func StartExpensePruner() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			pruneAllOldExpenses()
+		}
+	}()
+}
+
+// pruneAllOldExpenses prunes old expenses across all budgets.
+func pruneAllOldExpenses() {
+	_, err := database.DB.Pool.Exec(context.Background(),
+		`DELETE FROM budget_expenses
+		 WHERE expense_date < (CURRENT_DATE - INTERVAL '24 months')`)
+	if err != nil {
+		log.Printf("[prune] failed to prune old expenses: %v", err)
 	}
 }
 
@@ -77,9 +99,6 @@ func ListExpenses(c *fiber.Ctx) error {
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
-
-	// Delete expenses older than 12 months before returning results.
-	pruneOldExpenses(budgetID)
 
 	limit, offset := parsePaginationParams(c)
 
@@ -130,23 +149,15 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Enforce per-budget expense limit.
-	countQuery := database.NewFilter().
-		Select("id").
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	countBody, countStatus, countErr := database.DB.Get("budget_expenses", countQuery)
-	if countErr != nil || countStatus != http.StatusOK {
+	// Enforce per-budget expense limit using COUNT(*) instead of fetching all rows.
+	var expenseCount int
+	err := database.DB.Pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM budget_expenses WHERE budget_id = $1`, budgetID).Scan(&expenseCount)
+	if err != nil {
 		return errInternal(c, "failed to check expense count")
 	}
-
-	var existingExpenses []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(countBody, &existingExpenses); err != nil {
-		return errInternal(c, "failed to parse expense count")
-	}
-	if len(existingExpenses) >= maxExpensesPerBudget {
-		return errBadRequest(c, "expense limit reached (max 3000 per budget)")
+	if expenseCount >= maxExpensesPerBudget {
+		return errBadRequest(c, "expense limit reached for this budget")
 	}
 
 	var req models.CreateExpenseRequest

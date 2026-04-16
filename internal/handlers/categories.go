@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -53,83 +54,64 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifySectionOwnership(budgetID, sectionID, userID); err != nil {
-		return errNotFound(c, "section not found")
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
 	}
 
-	// Fetch the parent section to get its allocation_value for validation.
-	sectionQuery := database.NewFilter().
-		Select("allocation_value").
-		Eq("id", sectionID.String()).
-		Build()
-	sectionBody, sectionStatus, sectionErr := database.DB.Get("budget_categories", sectionQuery)
-	if sectionErr != nil || sectionStatus != http.StatusOK {
-		return errInternal(c, "failed to fetch parent section")
-	}
-	var parentSections []struct {
-		AllocationValue float64 `json:"allocation_value"`
-	}
-	if err := json.Unmarshal(sectionBody, &parentSections); err != nil || len(parentSections) == 0 {
-		return errInternal(c, "failed to parse parent section")
-	}
-	sectionAlloc := parentSections[0].AllocationValue
-
-	// Validate that total category allocation won't exceed section's value.
-	existingCatQuery := database.NewFilter().
-		Select("allocation_value").
-		Eq("category_id", sectionID.String()).
-		Build()
-
-	existingCatBody, existingCatStatus, existingCatErr := database.DB.Get("budget_subcategories", existingCatQuery)
-	if existingCatErr != nil || existingCatStatus != http.StatusOK {
-		return errInternal(c, "failed to check existing category allocations")
-	}
-
-	var existingCats []struct {
-		AllocationValue float64 `json:"allocation_value"`
-	}
-	if err := json.Unmarshal(existingCatBody, &existingCats); err != nil {
-		return errInternal(c, "failed to parse existing category allocations")
-	}
-
-	var totalCatAllocation float64
-	for _, ec := range existingCats {
-		totalCatAllocation += ec.AllocationValue
-	}
-	if totalCatAllocation+req.AllocationValue > sectionAlloc {
-		return errBadRequest(c, "total category allocation would exceed section budget")
-	}
-
+	// Validate and insert atomically using a transaction with row-level
+	// locking to prevent concurrent allocation races.
 	now := time.Now().UTC()
 	catID := uuid.New()
 
-	cat := models.Category{
-		ID:                catID,
-		CategoryID:        sectionID,
-		Name:              req.Name,
-		AllocationValue: req.AllocationValue,
-		Icon:              req.Icon,
-		SortOrder:         req.SortOrder,
-		CreatedAt:         now,
-	}
-
-	payload := map[string]interface{}{
-		"id":                 catID.String(),
-		"category_id":        sectionID.String(),
-		"name":               req.Name,
-		"allocation_value": req.AllocationValue,
-		"icon":               req.Icon,
-		"sort_order":         req.SortOrder,
-		"created_at":         now.Format(time.RFC3339Nano),
-	}
-	payloadBytes, err := marshalJSON(payload)
+	tx, err := database.DB.Pool.Begin(context.Background())
 	if err != nil {
-		return errInternal(c, "failed to serialize request")
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(context.Background())
+
+	// Lock the parent section row — also verifies the section belongs to the budget.
+	var sectionAlloc float64
+	err = tx.QueryRow(context.Background(),
+		`SELECT allocation_value FROM budget_categories WHERE id = $1 AND budget_id = $2 FOR UPDATE`,
+		sectionID, budgetID).Scan(&sectionAlloc)
+	if err != nil {
+		return errNotFound(c, "section not found")
 	}
 
-	_, statusCode, err := database.DB.Post("budget_subcategories", payloadBytes)
-	if err != nil || statusCode != http.StatusCreated {
+	// Sum existing subcategory allocations under the lock.
+	var totalCatAlloc float64
+	err = tx.QueryRow(context.Background(),
+		`SELECT COALESCE(SUM(allocation_value), 0) FROM budget_subcategories WHERE category_id = $1`,
+		sectionID).Scan(&totalCatAlloc)
+	if err != nil {
+		return errInternal(c, "failed to check existing category allocations")
+	}
+
+	if totalCatAlloc+req.AllocationValue > sectionAlloc {
+		return errBadRequest(c, "total category allocation would exceed section budget")
+	}
+
+	// Insert within the same transaction.
+	_, err = tx.Exec(context.Background(),
+		`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		catID, sectionID, req.Name, req.AllocationValue, req.Icon, req.SortOrder, now)
+	if err != nil {
 		return errInternal(c, "failed to create category")
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit category creation")
+	}
+
+	cat := models.Category{
+		ID:              catID,
+		CategoryID:      sectionID,
+		Name:            req.Name,
+		AllocationValue: req.AllocationValue,
+		Icon:            req.Icon,
+		SortOrder:       req.SortOrder,
+		CreatedAt:       now,
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryCreated, cat)
@@ -190,7 +172,22 @@ func UpdateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifySectionOwnership(budgetID, sectionID, userID); err != nil {
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
+	}
+
+	// Verify the section belongs to this budget.
+	secCheckQuery := database.NewFilter().
+		Select("id").
+		Eq("id", sectionID.String()).
+		Eq("budget_id", budgetID.String()).
+		Build()
+	secCheckBody, secCheckStatus, secCheckErr := database.DB.Get("budget_categories", secCheckQuery)
+	if secCheckErr != nil || secCheckStatus != http.StatusOK {
+		return errNotFound(c, "section not found")
+	}
+	var secFound []struct{ ID string `json:"id"` }
+	if err := json.Unmarshal(secCheckBody, &secFound); err != nil || len(secFound) == 0 {
 		return errNotFound(c, "section not found")
 	}
 
@@ -326,7 +323,22 @@ func DeleteCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid category ID")
 	}
 
-	if err := verifySectionOwnership(budgetID, sectionID, userID); err != nil {
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
+		return errNotFound(c, "budget not found")
+	}
+
+	// Verify the section belongs to this budget.
+	secCheckQuery := database.NewFilter().
+		Select("id").
+		Eq("id", sectionID.String()).
+		Eq("budget_id", budgetID.String()).
+		Build()
+	secCheckBody, secCheckStatus, secCheckErr := database.DB.Get("budget_categories", secCheckQuery)
+	if secCheckErr != nil || secCheckStatus != http.StatusOK {
+		return errNotFound(c, "section not found")
+	}
+	var secFound []struct{ ID string `json:"id"` }
+	if err := json.Unmarshal(secCheckBody, &secFound); err != nil || len(secFound) == 0 {
 		return errNotFound(c, "section not found")
 	}
 
@@ -349,21 +361,21 @@ func DeleteCategory(c *fiber.Ctx) error {
 		return errNotFound(c, "category not found")
 	}
 
-	// Delete expenses linked to this category.
-	expQuery := database.NewFilter().Eq("subcategory_id", cid).Build()
-	_, statusCode, err = database.DB.Delete("budget_expenses", expQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete category expenses")
+	// Delete category in a transaction — CASCADE handles expenses.
+	tx, err := database.DB.Pool.Begin(context.Background())
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(context.Background())
+
+	_, err = tx.Exec(context.Background(),
+		`DELETE FROM budget_subcategories WHERE id = $1 AND category_id = $2`, catID, sectionID)
+	if err != nil {
+		return errInternal(c, "failed to delete category")
 	}
 
-	// Delete the category.
-	delQuery := database.NewFilter().
-		Eq("id", cid).
-		Eq("category_id", sectionID.String()).
-		Build()
-	_, statusCode, err = database.DB.Delete("budget_subcategories", delQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete category")
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit deletion")
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryDeleted, map[string]string{"id": cid})

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -143,76 +144,66 @@ func CreateSection(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Fetch budget to get monthly_income for validation.
-	budget, err := fetchBudget(budgetID)
-	if err != nil || budget == nil {
-		return errInternal(c, "failed to fetch budget")
-	}
-
-	if req.AllocationValue > budget.MonthlyIncome {
-		return errBadRequest(c, "allocation_value exceeds budget income")
-	}
-
-	// Validate that total allocation across all sections won't exceed income.
-	existingQuery := database.NewFilter().
-		Select("allocation_value").
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	existingBody, existingStatus, existingErr := database.DB.Get("budget_categories", existingQuery)
-	if existingErr != nil || existingStatus != http.StatusOK {
-		return errInternal(c, "failed to check existing allocations")
-	}
-
-	var existingSections []struct {
-		AllocationValue float64 `json:"allocation_value"`
-	}
-	if err := json.Unmarshal(existingBody, &existingSections); err != nil {
-		return errInternal(c, "failed to parse existing allocations")
-	}
-
-	var totalAllocation float64
-	for _, s := range existingSections {
-		totalAllocation += s.AllocationValue
-	}
-	if totalAllocation+req.AllocationValue > budget.MonthlyIncome {
-		return errBadRequest(c, "total allocation would exceed budget income")
-	}
-
+	// Validate and insert atomically using a transaction with row-level
+	// locking to prevent concurrent allocation races.
 	now := time.Now().UTC()
 	sectionID := uuid.New()
 
-	section := models.Section{
-		ID:                sectionID,
-		BudgetID:          budgetID,
-		Name:              req.Name,
-		AllocationValue: req.AllocationValue,
-		Icon:              req.Icon,
-		SortOrder:         req.SortOrder,
-		CreatedAt:         now,
-	}
-
-	payload := map[string]interface{}{
-		"id":                 sectionID.String(),
-		"budget_id":          budgetID.String(),
-		"name":               req.Name,
-		"allocation_value": req.AllocationValue,
-		"icon":               req.Icon,
-		"sort_order":         req.SortOrder,
-		"created_at":         now.Format(time.RFC3339Nano),
-	}
-	payloadBytes, err := marshalJSON(payload)
+	tx, err := database.DB.Pool.Begin(context.Background())
 	if err != nil {
-		return errInternal(c, "failed to serialize request")
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(context.Background())
+
+	// Lock the budget row to prevent concurrent allocation changes.
+	var currentIncome float64
+	err = tx.QueryRow(context.Background(),
+		`SELECT monthly_income FROM budgets WHERE id = $1 FOR UPDATE`, budgetID).Scan(&currentIncome)
+	if err != nil {
+		return errInternal(c, "failed to fetch budget")
 	}
 
-	_, statusCode, err := database.DB.Post("budget_categories", payloadBytes)
-	if err != nil || statusCode != http.StatusCreated {
+	if req.AllocationValue > currentIncome {
+		return errBadRequest(c, "allocation_value exceeds budget income")
+	}
+
+	// Sum existing allocations under the lock.
+	var totalAlloc float64
+	err = tx.QueryRow(context.Background(),
+		`SELECT COALESCE(SUM(allocation_value), 0) FROM budget_categories WHERE budget_id = $1`, budgetID).Scan(&totalAlloc)
+	if err != nil {
+		return errInternal(c, "failed to check existing allocations")
+	}
+
+	if totalAlloc+req.AllocationValue > currentIncome {
+		return errBadRequest(c, "total allocation would exceed budget income")
+	}
+
+	// Insert within the same transaction.
+	_, err = tx.Exec(context.Background(),
+		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		sectionID, budgetID, req.Name, req.AllocationValue, req.Icon, req.SortOrder, now)
+	if err != nil {
 		return errInternal(c, "failed to create section")
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit section creation")
+	}
+
+	section := models.Section{
+		ID:              sectionID,
+		BudgetID:        budgetID,
+		Name:            req.Name,
+		AllocationValue: req.AllocationValue,
+		Icon:            req.Icon,
+		SortOrder:       req.SortOrder,
+		CreatedAt:       now,
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeSectionCreated, section)
@@ -268,7 +259,7 @@ func UpdateSection(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
@@ -387,7 +378,7 @@ func DeleteSection(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid section ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
@@ -410,40 +401,22 @@ func DeleteSection(c *fiber.Ctx) error {
 
 	sid := sectionID.String()
 
-	// Get category IDs for this section to delete related expenses.
-	catQuery := database.NewFilter().Select("id").Eq("category_id", sid).Build()
-	catBody, catStatusCode, catErr := database.DB.Get("budget_subcategories", catQuery)
-
-	if catErr == nil && catStatusCode == http.StatusOK {
-		var cats []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(catBody, &cats); err == nil && len(cats) > 0 {
-			catIDs := make([]string, len(cats))
-			for i, ct := range cats {
-				catIDs[i] = ct.ID
-			}
-			expQuery := database.NewFilter().In("subcategory_id", catIDs).Build()
-			_, statusCode, err := database.DB.Delete("budget_expenses", expQuery)
-			if err != nil || statusCode >= 300 {
-				return errInternal(c, "failed to delete section expenses")
-			}
-		}
+	// Delete section in a transaction — CASCADE handles subcategories and
+	// their expenses.
+	tx, err := database.DB.Pool.Begin(context.Background())
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
 	}
+	defer tx.Rollback(context.Background())
 
-	// Delete categories belonging to this section.
-	delCatQuery := database.NewFilter().Eq("category_id", sid).Build()
-	_, statusCode, err = database.DB.Delete("budget_subcategories", delCatQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete categories")
-	}
-
-	// Delete the section.
-	delSectionQuery := database.NewFilter().
-		Eq("id", sid).
-		Eq("budget_id", budgetID.String()).
-		Build()
-	_, statusCode, err = database.DB.Delete("budget_categories", delSectionQuery)
-	if err != nil || statusCode >= 300 {
+	_, err = tx.Exec(context.Background(),
+		`DELETE FROM budget_categories WHERE id = $1 AND budget_id = $2`, sectionID, budgetID)
+	if err != nil {
 		return errInternal(c, "failed to delete section")
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit deletion")
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeSectionDeleted, map[string]string{"id": sid})

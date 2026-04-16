@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"strings"
 	"time"
 
@@ -30,11 +31,13 @@ func CreateSession(userID uuid.UUID, token string, c *fiber.Ctx) {
 	expiresAt := time.Now().Add(7 * 24 * time.Hour)
 
 	ctx := context.Background()
-	_, _ = database.DB.Pool.Exec(ctx,
+	if _, err := database.DB.Pool.Exec(ctx,
 		`INSERT INTO user_sessions (id, user_id, token_hash, ip_address, device_type, browser, os, created_at, last_active_at, expires_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8)`,
 		uuid.New().String(), userID.String(), tokenHash, ip, deviceType, browser, osName, expiresAt,
-	)
+	); err != nil {
+		log.Printf("[sessions] failed to create session: %v", err)
+	}
 }
 
 // ListSessions returns all active (non-revoked, non-expired) sessions for
@@ -125,10 +128,12 @@ func SignOut(c *fiber.Ctx) error {
 	}
 
 	ctx := context.Background()
-	_, _ = database.DB.Pool.Exec(ctx,
+	if _, err := database.DB.Pool.Exec(ctx,
 		`UPDATE user_sessions SET revoked_at = NOW() WHERE token_hash = $1`,
 		tokenHash,
-	)
+	); err != nil {
+		log.Printf("[sessions] failed to revoke session on sign-out: %v", err)
+	}
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

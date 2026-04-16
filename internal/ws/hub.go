@@ -46,12 +46,18 @@ func PingInterval() time.Duration { return pingIntervalDuration }
 // PongWait returns the maximum time to wait for a pong response.
 func PongWait() time.Duration { return pongWaitDuration }
 
+// sendBufSize is the capacity of each client's outbound message buffer.
+// If a client falls behind by this many messages it is considered slow and
+// will be disconnected to avoid blocking all other clients.
+const sendBufSize = 32
+
 // Client represents a single WebSocket connection tied to a user.
 type Client struct {
 	Conn      *websocket.Conn
 	UserID    string
 	BudgetIDs map[string]bool // budget IDs this client has access to
-	mu        sync.Mutex      // guards writes to the connection
+	mu        sync.Mutex      // guards direct writes (ping) to the connection
+	send      chan []byte      // buffered outbound message channel
 }
 
 // WriteJSON sends a JSON-encoded message to the client in a thread-safe manner.
@@ -66,6 +72,21 @@ func (c *Client) WritePing() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.Conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+}
+
+// writePump drains the client's send channel and writes each message to the
+// WebSocket connection. It exits when the send channel is closed (on
+// unregister) so the goroutine does not leak.
+func (c *Client) writePump() {
+	for data := range c.send {
+		c.mu.Lock()
+		err := c.Conn.WriteMessage(websocket.TextMessage, data)
+		c.mu.Unlock()
+		if err != nil {
+			log.Printf("[ws] writePump error for user=%s: %v", c.UserID, err)
+			return
+		}
+	}
 }
 
 // Message is the payload broadcast to WebSocket clients.
@@ -107,6 +128,8 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
+			client.send = make(chan []byte, sendBufSize)
+			go client.writePump()
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
@@ -116,30 +139,31 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
+				close(client.send)
 				_ = client.Conn.Close()
 			}
 			h.mu.Unlock()
 			log.Printf("[ws] client unregistered: user=%s", client.UserID)
 
 		case req := <-h.broadcast:
-			h.mu.RLock()
 			data, err := json.Marshal(req.msg)
 			if err != nil {
-				h.mu.RUnlock()
 				continue
 			}
+			h.mu.RLock()
 			for client := range h.clients {
 				// Only send to clients that have access to this budget.
 				if !client.BudgetIDs[req.budgetID] {
 					continue
 				}
-				func() {
-					client.mu.Lock()
-					defer client.mu.Unlock()
-					if err := client.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
-						log.Printf("[ws] write error for user=%s: %v", client.UserID, err)
-					}
-				}()
+				// Non-blocking send: if the client's buffer is full it is
+				// too slow — close and unregister it asynchronously.
+				select {
+				case client.send <- data:
+				default:
+					log.Printf("[ws] slow client user=%s, dropping", client.UserID)
+					go h.Unregister(client)
+				}
 			}
 			h.mu.RUnlock()
 		}

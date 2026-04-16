@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -12,6 +13,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
 )
+
+// sessionCacheEntry holds cached session revocation state to avoid hitting the
+// DB on every authenticated request.
+type sessionCacheEntry struct {
+	revokedAt *time.Time
+	sessionID string
+	cachedAt  time.Time
+}
+
+// sessionCache is a package-level in-memory cache keyed by token hash.
+var sessionCache sync.Map
+
+// sessionCacheTTL is how long a cache entry is considered fresh.
+const sessionCacheTTL = 60 * time.Second
+
+// InvalidateSessionCache removes a cached session entry so the next request
+// for that token will re-query the database. Call this when revoking a session.
+func InvalidateSessionCache(tokenHash string) {
+	sessionCache.Delete(tokenHash)
+}
 
 // Claims represents the JWT claims issued by the backend.
 type Claims struct {
@@ -76,9 +97,26 @@ func Protected() fiber.Handler {
 		tokenHash := hex.EncodeToString(h[:])
 		c.Locals("token_hash", tokenHash)
 
-		// Check if this token's session has been revoked. Also update
-		// last_active_at lazily (fire-and-forget if stale > 5 min).
+		// Check if this token's session has been revoked. Uses an in-memory
+		// TTL cache so the DB query runs at most once per minute per session.
+		// Also update last_active_at lazily (fire-and-forget if stale > 5 min).
 		if database.DB != nil {
+			// Try the cache first.
+			if cached, ok := sessionCache.Load(tokenHash); ok {
+				entry := cached.(sessionCacheEntry)
+				if time.Since(entry.cachedAt) < sessionCacheTTL {
+					if entry.revokedAt != nil {
+						return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+							"error": "session has been revoked",
+						})
+					}
+					// Cache hit and not revoked — skip DB query.
+					c.Locals("user_id", userID)
+					c.Locals("email", claims.Email)
+					return c.Next()
+				}
+			}
+
 			var revokedAt *time.Time
 			var lastActive time.Time
 			var sessionID string
@@ -87,6 +125,13 @@ func Protected() fiber.Handler {
 				tokenHash,
 			).Scan(&sessionID, &revokedAt, &lastActive)
 			if err == nil {
+				// Store result in cache.
+				sessionCache.Store(tokenHash, sessionCacheEntry{
+					revokedAt: revokedAt,
+					sessionID: sessionID,
+					cachedAt:  time.Now(),
+				})
+
 				if revokedAt != nil {
 					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 						"error": "session has been revoked",

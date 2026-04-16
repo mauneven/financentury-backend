@@ -18,6 +18,16 @@ import (
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
+// maskEmail returns a masked version of an email address for safe logging,
+// showing only the first 2 characters of the local part plus the domain.
+func maskEmail(email string) string {
+	parts := strings.SplitN(email, "@", 2)
+	if len(parts) != 2 || len(parts[0]) < 2 {
+		return "***"
+	}
+	return parts[0][:2] + "***@" + parts[1]
+}
+
 // Google OAuth credentials set at startup via InitAuth.
 var googleClientID, googleClientSecret string
 
@@ -188,11 +198,11 @@ func GoogleLogin(c *fiber.Ctx) error {
 	// Look up or create profile by email.
 	profile, err := upsertProfile(userInfo)
 	if err != nil {
-		log.Printf("[auth] upsertProfile failed for %s: %v", userInfo.Email, err)
+		log.Printf("[auth] upsertProfile failed for %s: %v", maskEmail(userInfo.Email), err)
 		return errInternal(c, "failed to create or find user profile")
 	}
 	if profile.ID == uuid.Nil {
-		log.Printf("[auth] upsertProfile returned nil ID for %s", userInfo.Email)
+		log.Printf("[auth] upsertProfile returned nil ID for %s", maskEmail(userInfo.Email))
 		return errInternal(c, "failed to create or find user profile")
 	}
 
@@ -293,11 +303,11 @@ func GoogleMobileLogin(c *fiber.Ctx) error {
 
 	profile, err := upsertProfile(userInfo)
 	if err != nil {
-		log.Printf("[auth] upsertProfile failed for %s: %v", userInfo.Email, err)
+		log.Printf("[auth] upsertProfile failed for %s: %v", maskEmail(userInfo.Email), err)
 		return errInternal(c, "failed to create or find user profile")
 	}
 	if profile.ID == uuid.Nil {
-		log.Printf("[auth] upsertProfile returned nil ID for %s", userInfo.Email)
+		log.Printf("[auth] upsertProfile returned nil ID for %s", maskEmail(userInfo.Email))
 		return errInternal(c, "failed to create or find user profile")
 	}
 

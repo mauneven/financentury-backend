@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -198,25 +199,18 @@ func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
 }
 
 // verifyBudgetAccess checks that the user is the budget owner or a
-// collaborator. Returns a non-nil error when neither condition holds.
+// collaborator using a single DB query. Returns a non-nil error when
+// neither condition holds.
 func verifyBudgetAccess(budgetID, userID uuid.UUID) error {
-	if err := verifyBudgetOwnership(budgetID, userID); err == nil {
-		return nil
-	}
-
-	query := database.NewFilter().
-		Select("id").
-		Eq("budget_id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_collaborators", query)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
+	var exists bool
+	err := database.DB.Pool.QueryRow(context.Background(),
+		`SELECT EXISTS(
+			SELECT 1 FROM budgets WHERE id = $1 AND user_id = $2
+			UNION ALL
+			SELECT 1 FROM budget_collaborators WHERE budget_id = $1 AND user_id = $2
+			LIMIT 1
+		)`, budgetID, userID).Scan(&exists)
+	if err != nil || !exists {
 		return fiber.ErrNotFound
 	}
 	return nil

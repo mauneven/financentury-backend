@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -297,43 +298,20 @@ const maxBudgetsPerUser = 7
 // Returns an error with message "limit" when the cap is hit, or a generic
 // error on internal failures. Returns nil when under the limit.
 func enforceUserBudgetLimit(userID uuid.UUID) error {
-	uid := userID.String()
+	uid := userID
 
 	var ownedCount, collabCount int
 
-	g := new(errgroup.Group)
+	g, gctx := errgroup.WithContext(context.Background())
 
 	g.Go(func() error {
-		q := database.NewFilter().
-			Select("id").
-			Eq("user_id", uid).
-			Build()
-		body, status, err := database.DB.Get("budgets", q)
-		if err != nil || status != http.StatusOK {
-			return fiber.ErrInternalServerError
-		}
-		var rows []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(body, &rows); err != nil {
-			return fiber.ErrInternalServerError
-		}
-		ownedCount = len(rows)
-		return nil
+		return database.DB.Pool.QueryRow(gctx,
+			`SELECT COUNT(*) FROM budgets WHERE user_id = $1`, uid).Scan(&ownedCount)
 	})
 
 	g.Go(func() error {
-		q := database.NewFilter().
-			Select("id").
-			Eq("user_id", uid).
-			Build()
-		body, status, err := database.DB.Get("budget_collaborators", q)
-		if err != nil || status != http.StatusOK {
-			// Non-fatal: user may have no collaborations.
-			return nil
-		}
-		var rows []struct{ ID string `json:"id"` }
-		_ = json.Unmarshal(body, &rows)
-		collabCount = len(rows)
-		return nil
+		return database.DB.Pool.QueryRow(gctx,
+			`SELECT COUNT(*) FROM budget_collaborators WHERE user_id = $1`, uid).Scan(&collabCount)
 	})
 
 	if err := g.Wait(); err != nil {
@@ -471,53 +449,48 @@ func CreateBudget(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(budget)
 }
 
-// seedGuidedSections creates template sections and categories based on the budget mode.
-// Template percentages are converted to absolute values using the budget's income.
+// seedGuidedSections creates template sections and categories based on the
+// budget mode. All inserts are batched inside a single database transaction
+// to avoid 14+ individual round-trips.
 func seedGuidedSections(budgetID uuid.UUID, mode string, monthlyIncome float64, now time.Time) error {
-	for _, gs := range getSectionsForMode(mode) {
+	sections := getSectionsForMode(mode)
+	if len(sections) == 0 {
+		return nil
+	}
+
+	tx, err := database.DB.Pool.Begin(context.Background())
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+
+	for _, gs := range sections {
 		sectionValue := math.Round(gs.Percent / 100 * monthlyIncome)
 		sectionID := uuid.New()
-		sectionPayload := map[string]interface{}{
-			"id":               sectionID.String(),
-			"budget_id":        budgetID.String(),
-			"name":             gs.Name,
-			"allocation_value": sectionValue,
-			"icon":             gs.Icon,
-			"sort_order":       gs.SortOrder,
-			"created_at":       now.Format(time.RFC3339Nano),
-		}
-		sectionBytes, err := marshalJSON(sectionPayload)
+
+		_, err := tx.Exec(context.Background(),
+			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			sectionID, budgetID, gs.Name, sectionValue, gs.Icon, gs.SortOrder, now)
 		if err != nil {
 			return err
-		}
-		_, statusCode, err := database.DB.Post("budget_categories", sectionBytes)
-		if err != nil || statusCode != http.StatusCreated {
-			return fiber.ErrInternalServerError
 		}
 
 		for _, gc := range gs.Categories {
 			catValue := math.Round(gc.Percent / 100 * sectionValue)
 			catID := uuid.New()
-			catPayload := map[string]interface{}{
-				"id":               catID.String(),
-				"category_id":      sectionID.String(),
-				"name":             gc.Name,
-				"allocation_value": catValue,
-				"icon":             gc.Icon,
-				"sort_order":       gc.SortOrder,
-				"created_at":       now.Format(time.RFC3339Nano),
-			}
-			catBytes, err := marshalJSON(catPayload)
+
+			_, err := tx.Exec(context.Background(),
+				`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order, created_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				catID, sectionID, gc.Name, catValue, gc.Icon, gc.SortOrder, now)
 			if err != nil {
 				return err
 			}
-			_, statusCode, err := database.DB.Post("budget_subcategories", catBytes)
-			if err != nil || statusCode != http.StatusCreated {
-				return fiber.ErrInternalServerError
-			}
 		}
 	}
-	return nil
+
+	return tx.Commit(context.Background())
 }
 
 // GetBudget returns a single budget by ID (owner or collaborator).
@@ -722,61 +695,29 @@ func DeleteBudget(c *fiber.Ctx) error {
 
 	bid := budgetID.String()
 
-	// 1. Delete expenses.
-	expQuery := database.NewFilter().Eq("budget_id", bid).Build()
-	_, statusCode, err = database.DB.Delete("budget_expenses", expQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete budget expenses")
+	// Delete budget in a transaction — CASCADE handles expenses, sections,
+	// categories, collaborators, and invites.
+	tx, err := database.DB.Pool.Begin(context.Background())
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
 	}
+	defer tx.Rollback(context.Background())
 
-	// 2. Get section IDs to delete categories.
-	sectionQuery := database.NewFilter().Select("id").Eq("budget_id", bid).Build()
-	sectionBody, sectionStatusCode, sectionErr := database.DB.Get("budget_categories", sectionQuery)
-
-	if sectionErr == nil && sectionStatusCode == http.StatusOK {
-		var sections []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(sectionBody, &sections); err == nil && len(sections) > 0 {
-			sectionIDs := make([]string, len(sections))
-			for i, s := range sections {
-				sectionIDs[i] = s.ID
-			}
-			catQuery := database.NewFilter().In("category_id", sectionIDs).Build()
-			_, statusCode, err = database.DB.Delete("budget_subcategories", catQuery)
-			if err != nil || statusCode >= 300 {
-				return errInternal(c, "failed to delete budget categories")
-			}
-		}
-	}
-
-	// 3. Delete sections.
-	delSectionQuery := database.NewFilter().Eq("budget_id", bid).Build()
-	_, statusCode, err = database.DB.Delete("budget_categories", delSectionQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete budget sections")
-	}
-
-	// 4. Delete collaborators.
-	collabQuery := database.NewFilter().Eq("budget_id", bid).Build()
-	_, statusCode, err = database.DB.Delete("budget_collaborators", collabQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete budget collaborators")
-	}
-
-	// 5. Delete invites.
-	inviteQuery := database.NewFilter().Eq("budget_id", bid).Build()
-	_, statusCode, err = database.DB.Delete("budget_invites", inviteQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete budget invites")
-	}
-
-	// 6. Delete the budget.
-	delBudgetQuery := database.NewFilter().
-		Eq("id", bid).
-		Eq("user_id", userID.String()).
-		Build()
-	_, statusCode, err = database.DB.Delete("budgets", delBudgetQuery)
-	if err != nil || statusCode >= 300 {
+	_, err = tx.Exec(context.Background(),
+		`DELETE FROM budgets WHERE id = $1 AND user_id = $2`, budgetID, userID)
+	if err != nil {
 		return errInternal(c, "failed to delete budget")
+	}
+
+	// Also clean up budget_links where this user created them (created_by FK has no CASCADE).
+	_, err = tx.Exec(context.Background(),
+		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`, userID, budgetID)
+	if err != nil {
+		return errInternal(c, "failed to clean up budget links")
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit deletion")
 	}
 
 	broadcast(bid, ws.MessageTypeBudgetDeleted, map[string]string{"id": bid})

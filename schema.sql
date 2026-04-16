@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS budgets (
     user_id               UUID NOT NULL REFERENCES profiles(id),
     name                  TEXT NOT NULL,
     icon                  TEXT NOT NULL DEFAULT 'wallet',
-    monthly_income        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    monthly_income        NUMERIC(18,2) NOT NULL DEFAULT 0,
     currency              TEXT NOT NULL DEFAULT 'USD',
     billing_period_months INTEGER NOT NULL DEFAULT 1,
     billing_cutoff_day    INTEGER NOT NULL DEFAULT 1,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS budget_categories (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     budget_id         UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
     name              TEXT NOT NULL,
-    allocation_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+    allocation_value NUMERIC(18,2) NOT NULL DEFAULT 0,
     icon              TEXT NOT NULL DEFAULT '',
     sort_order        INTEGER NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS budget_subcategories (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     category_id       UUID NOT NULL REFERENCES budget_categories(id) ON DELETE CASCADE,
     name              TEXT NOT NULL,
-    allocation_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+    allocation_value NUMERIC(18,2) NOT NULL DEFAULT 0,
     icon              TEXT NOT NULL DEFAULT '',
     sort_order        INTEGER NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS budget_expenses (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     budget_id       UUID NOT NULL REFERENCES budgets(id) ON DELETE CASCADE,
     subcategory_id  UUID NOT NULL REFERENCES budget_subcategories(id) ON DELETE CASCADE,
-    amount          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    amount          NUMERIC(18,2) NOT NULL DEFAULT 0,
     description     TEXT NOT NULL DEFAULT '',
     expense_date    DATE NOT NULL DEFAULT CURRENT_DATE,
     created_by      UUID REFERENCES profiles(id),
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS budget_links (
     source_category_id UUID REFERENCES budget_subcategories(id) ON DELETE CASCADE,
     target_section_id  UUID REFERENCES budget_categories(id) ON DELETE CASCADE,
     filter_mode        TEXT NOT NULL DEFAULT 'all',
-    created_by         UUID NOT NULL REFERENCES profiles(id),
+    created_by         UUID REFERENCES profiles(id) ON DELETE SET NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chk_filter_mode CHECK (filter_mode IN ('all', 'mine')),
     CONSTRAINT chk_different_budgets CHECK (source_budget_id != target_budget_id),
@@ -185,3 +185,10 @@ CREATE TABLE IF NOT EXISTS display_orders (
 CREATE INDEX IF NOT EXISTS idx_display_orders_user_id ON display_orders(user_id);
 
 ALTER TABLE display_orders DISABLE ROW LEVEL SECURITY;
+
+-- ─── composite indexes for common query patterns ─────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_budget_expenses_budget_date ON budget_expenses(budget_id, expense_date);
+CREATE INDEX IF NOT EXISTS idx_budget_expenses_budget_subcategory ON budget_expenses(budget_id, subcategory_id);
+CREATE INDEX IF NOT EXISTS idx_budget_collaborators_budget_user ON budget_collaborators(budget_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_budget_categories_budget_sort ON budget_categories(budget_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_budget_subcategories_category_sort ON budget_subcategories(category_id, sort_order);

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -30,26 +31,13 @@ const inviteExpiry = 7 * 24 * time.Hour
 // maxCollaboratorsPerBudget is the cap on collaborators (excluding the owner).
 const maxCollaboratorsPerBudget = 5
 
-// countBudgetCollaborators returns the current number of collaborators for a budget.
+// countBudgetCollaborators returns the current number of collaborators for a budget
+// using a COUNT(*) query instead of fetching all rows.
 func countBudgetCollaborators(budgetID uuid.UUID) (int, error) {
-	query := database.NewFilter().
-		Select("id").
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_collaborators", query)
-	if err != nil || statusCode != http.StatusOK {
-		return 0, err
-	}
-
-	var rows []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &rows); err != nil {
-		return 0, err
-	}
-
-	return len(rows), nil
+	var count int
+	err := database.DB.Pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM budget_collaborators WHERE budget_id = $1`, budgetID).Scan(&count)
+	return count, err
 }
 
 // InitInvites configures the invites handler with the frontend URL used to
@@ -276,10 +264,6 @@ func AcceptInvite(c *fiber.Ctx) error {
 
 	invite := invites[0]
 
-	if invite.UsedBy != nil {
-		return errBadRequest(c, "invite has already been used")
-	}
-
 	// Check expiry.
 	expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
 	if parseErr != nil {
@@ -340,23 +324,16 @@ func AcceptInvite(c *fiber.Ctx) error {
 
 	now := time.Now().UTC()
 
-	// Mark invite as used.
-	usedPayload := map[string]interface{}{
-		"used_by": userID.String(),
-		"used_at": now.Format(time.RFC3339Nano),
-	}
-	usedBytes, err := marshalJSON(usedPayload)
+	// Atomically mark invite as used — prevents race condition where two
+	// concurrent requests both pass the used_by check.
+	var inviteID string
+	err = database.DB.Pool.QueryRow(context.Background(),
+		`UPDATE budget_invites SET used_by = $1, used_at = NOW()
+		 WHERE id = $2 AND used_by IS NULL
+		 RETURNING id`,
+		userID, invite.ID).Scan(&inviteID)
 	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	patchQuery := database.NewFilter().
-		Eq("id", invite.ID.String()).
-		Build()
-
-	_, statusCode, err = database.DB.Patch("budget_invites", patchQuery, usedBytes)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to update invite")
+		return errBadRequest(c, "invite has already been used")
 	}
 
 	// Add user to budget_collaborators.

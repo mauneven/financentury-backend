@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all application configuration.
@@ -15,6 +16,7 @@ type Config struct {
 	FrontendURL        string
 	Port               int
 	CORSOrigin         string
+	TrustedProxies     []string
 }
 
 // Load reads configuration from environment variables.
@@ -64,6 +66,18 @@ func Load() (*Config, error) {
 		corsOrigin = "http://localhost:3000"
 	}
 
+	// TRUSTED_PROXIES: comma-separated CIDRs of reverse proxies (e.g. load balancer).
+	// When empty, proxy header checking is disabled entirely (safe default).
+	var trustedProxies []string
+	if tp := os.Getenv("TRUSTED_PROXIES"); tp != "" {
+		for _, cidr := range strings.Split(tp, ",") {
+			cidr = strings.TrimSpace(cidr)
+			if cidr != "" {
+				trustedProxies = append(trustedProxies, cidr)
+			}
+		}
+	}
+
 	return &Config{
 		DatabaseURL:        databaseURL,
 		JWTSecret:          jwtSecret,
@@ -72,5 +86,6 @@ func Load() (*Config, error) {
 		FrontendURL:        frontendURL,
 		Port:               port,
 		CORSOrigin:         corsOrigin,
+		TrustedProxies:     trustedProxies,
 	}, nil
 }

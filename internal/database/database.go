@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -29,6 +30,11 @@ func Init(databaseURL string) {
 	if err != nil {
 		panic(fmt.Sprintf("invalid DATABASE_URL: %v", err))
 	}
+	cfg.MinConns = 5
+	cfg.MaxConns = 20
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.HealthCheckPeriod = 30 * time.Second
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect to database: %v", err))
@@ -127,19 +133,19 @@ func (p parsedQuery) buildWhere(argStart int) (string, []interface{}) {
 			args = append(args, c.value)
 			idx++
 		case "gt":
-			clauses = append(clauses, fmt.Sprintf("%s::text > $%d", col, idx))
+			clauses = append(clauses, fmt.Sprintf("%s > $%d", col, idx))
 			args = append(args, c.value)
 			idx++
 		case "gte":
-			clauses = append(clauses, fmt.Sprintf("%s::text >= $%d", col, idx))
+			clauses = append(clauses, fmt.Sprintf("%s >= $%d", col, idx))
 			args = append(args, c.value)
 			idx++
 		case "lt":
-			clauses = append(clauses, fmt.Sprintf("%s::text < $%d", col, idx))
+			clauses = append(clauses, fmt.Sprintf("%s < $%d", col, idx))
 			args = append(args, c.value)
 			idx++
 		case "lte":
-			clauses = append(clauses, fmt.Sprintf("%s::text <= $%d", col, idx))
+			clauses = append(clauses, fmt.Sprintf("%s <= $%d", col, idx))
 			args = append(args, c.value)
 			idx++
 		case "in":

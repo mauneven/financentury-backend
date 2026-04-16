@@ -20,6 +20,9 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /app/server .
 
+RUN adduser -D -u 1001 appuser
+USER appuser
+
 EXPOSE 8080
 
 ENTRYPOINT ["./server"]
