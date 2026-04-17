@@ -184,6 +184,20 @@ func CreateLink(c *fiber.Ctx) error {
 		return errBadRequest(c, "maximum number of links reached")
 	}
 
+	// Prevent circular links (A→B and B→A).
+	var reverseExists bool
+	err = database.DB.Pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM budget_links
+			WHERE source_budget_id = $1 AND target_budget_id = $2
+		)`, budgetID, req.SourceBudgetID).Scan(&reverseExists)
+	if err != nil {
+		return errInternal(c, "failed to check for circular links")
+	}
+	if reverseExists {
+		return errBadRequest(c, "cannot create circular link between budgets")
+	}
+
 	// Insert the link.
 	var link models.BudgetLink
 	err = database.DB.Pool.QueryRow(ctx, `

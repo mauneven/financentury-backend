@@ -257,9 +257,9 @@ func TestMigrateRequest_StructFields(t *testing.T) {
 				Sections: []MigrateSection{
 					{
 						Name:              "Section 1",
-						AllocationPercent: 100,
+						AllocationValue: 100,
 						Categories: []MigrateCategory{
-							{Name: "Cat 1", AllocationPercent: 100, LocalID: "cat-1"},
+							{Name: "Cat 1", AllocationValue: 100, LocalID: "cat-1"},
 						},
 					},
 				},

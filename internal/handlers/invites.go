@@ -296,17 +296,6 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errInternal(c, "failed to check budget count")
 	}
 
-	// Enforce max collaborators per budget.
-	collabCount, countErr := countBudgetCollaborators(invite.BudgetID)
-	if countErr != nil {
-		return errInternal(c, "failed to check collaborator count")
-	}
-	if collabCount >= maxCollaboratorsPerBudget {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "collaborator limit reached (max 5)",
-		})
-	}
-
 	// Prevent duplicate collaborator.
 	collabCheckQuery := database.NewFilter().
 		Select("id").
@@ -322,8 +311,6 @@ func AcceptInvite(c *fiber.Ctx) error {
 		}
 	}
 
-	now := time.Now().UTC()
-
 	// Atomically mark invite as used — prevents race condition where two
 	// concurrent requests both pass the used_by check.
 	var inviteID string
@@ -336,23 +323,20 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errBadRequest(c, "invite has already been used")
 	}
 
-	// Add user to budget_collaborators.
+	// Atomically add collaborator only if under the limit (prevents race condition).
 	collabID := uuid.New()
-	collabPayload := map[string]interface{}{
-		"id":        collabID.String(),
-		"budget_id": invite.BudgetID.String(),
-		"user_id":   userID.String(),
-		"role":      "collaborator",
-		"added_at":  now.Format(time.RFC3339Nano),
-	}
-	collabBytes, err := marshalJSON(collabPayload)
-	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	_, statusCode, err = database.DB.Post("budget_collaborators", collabBytes)
-	if err != nil || statusCode != http.StatusCreated {
+	tag, insertErr := database.DB.Pool.Exec(context.Background(),
+		`INSERT INTO budget_collaborators (id, budget_id, user_id, role)
+		 SELECT $1, $2, $3, 'collaborator'
+		 WHERE (SELECT COUNT(*) FROM budget_collaborators WHERE budget_id = $2) < $4`,
+		collabID, invite.BudgetID, userID, maxCollaboratorsPerBudget)
+	if insertErr != nil {
 		return errInternal(c, "failed to add collaborator")
+	}
+	if tag.RowsAffected() == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "collaborator limit reached (max 5)",
+		})
 	}
 
 	// Return the budget data.

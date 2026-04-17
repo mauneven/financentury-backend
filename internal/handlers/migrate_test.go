@@ -29,7 +29,7 @@ func TestMigrationConstants(t *testing.T) {
 func TestValidateMigrateSection_Valid(t *testing.T) {
 	ms := MigrateSection{
 		Name:              "Necesidades",
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              "home",
 		SortOrder:         1,
 	}
@@ -41,7 +41,7 @@ func TestValidateMigrateSection_Valid(t *testing.T) {
 func TestValidateMigrateSection_EmptyName(t *testing.T) {
 	ms := MigrateSection{
 		Name:              "",
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              "home",
 	}
 	err := validateMigrateSection(ms)
@@ -63,7 +63,7 @@ func TestValidateMigrateSection_EmptyName(t *testing.T) {
 func TestValidateMigrateSection_NameTooLong(t *testing.T) {
 	ms := MigrateSection{
 		Name:              strings.Repeat("a", maxNameLength+1),
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              "home",
 	}
 	err := validateMigrateSection(ms)
@@ -75,7 +75,7 @@ func TestValidateMigrateSection_NameTooLong(t *testing.T) {
 func TestValidateMigrateSection_IconTooLong(t *testing.T) {
 	ms := MigrateSection{
 		Name:              "Valid",
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              strings.Repeat("x", maxIconLength+1),
 	}
 	err := validateMigrateSection(ms)
@@ -94,7 +94,7 @@ func TestValidateMigrateSection_IconTooLong(t *testing.T) {
 func TestValidateMigrateSection_AllocationNegative(t *testing.T) {
 	ms := MigrateSection{
 		Name:              "Valid",
-		AllocationPercent: -1,
+		AllocationValue: -1,
 		Icon:              "home",
 	}
 	err := validateMigrateSection(ms)
@@ -106,7 +106,7 @@ func TestValidateMigrateSection_AllocationNegative(t *testing.T) {
 func TestValidateMigrateSection_AllocationOver100(t *testing.T) {
 	ms := MigrateSection{
 		Name:              "Valid",
-		AllocationPercent: 101,
+		AllocationValue: 101,
 		Icon:              "home",
 	}
 	err := validateMigrateSection(ms)
@@ -117,13 +117,13 @@ func TestValidateMigrateSection_AllocationOver100(t *testing.T) {
 
 func TestValidateMigrateSection_AllocationBoundaries(t *testing.T) {
 	// 0% should pass
-	ms0 := MigrateSection{Name: "Valid", AllocationPercent: 0, Icon: "home"}
+	ms0 := MigrateSection{Name: "Valid", AllocationValue: 0, Icon: "home"}
 	if err := validateMigrateSection(ms0); err != nil {
 		t.Errorf("0%% allocation should pass: %v", err)
 	}
 
 	// 100% should pass
-	ms100 := MigrateSection{Name: "Valid", AllocationPercent: 100, Icon: "home"}
+	ms100 := MigrateSection{Name: "Valid", AllocationValue: 100, Icon: "home"}
 	if err := validateMigrateSection(ms100); err != nil {
 		t.Errorf("100%% allocation should pass: %v", err)
 	}
@@ -132,11 +132,11 @@ func TestValidateMigrateSection_AllocationBoundaries(t *testing.T) {
 func TestValidateMigrateSection_TooManyCategories(t *testing.T) {
 	cats := make([]MigrateCategory, maxMigrateCategoriesPerGroup+1)
 	for i := range cats {
-		cats[i] = MigrateCategory{Name: "cat", AllocationPercent: 1, Icon: "a"}
+		cats[i] = MigrateCategory{Name: "cat", AllocationValue: 1, Icon: "a"}
 	}
 	ms := MigrateSection{
 		Name:              "Valid",
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              "home",
 		Categories:        cats,
 	}
@@ -150,7 +150,7 @@ func TestValidateMigrateSection_EmptyIcon(t *testing.T) {
 	// Empty icon should be valid.
 	ms := MigrateSection{
 		Name:              "Valid",
-		AllocationPercent: 50,
+		AllocationValue: 50,
 		Icon:              "",
 	}
 	if err := validateMigrateSection(ms); err != nil {
@@ -163,7 +163,7 @@ func TestValidateMigrateSection_EmptyIcon(t *testing.T) {
 func TestValidateMigrateCategory_Valid(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              "Vivienda",
-		AllocationPercent: 45,
+		AllocationValue: 45,
 		Icon:              "home",
 		SortOrder:         1,
 	}
@@ -175,7 +175,7 @@ func TestValidateMigrateCategory_Valid(t *testing.T) {
 func TestValidateMigrateCategory_EmptyName(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              "",
-		AllocationPercent: 45,
+		AllocationValue: 45,
 		Icon:              "home",
 	}
 	err := validateMigrateCategory(mc)
@@ -194,7 +194,7 @@ func TestValidateMigrateCategory_EmptyName(t *testing.T) {
 func TestValidateMigrateCategory_NameTooLong(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              strings.Repeat("a", maxNameLength+1),
-		AllocationPercent: 45,
+		AllocationValue: 45,
 		Icon:              "home",
 	}
 	err := validateMigrateCategory(mc)
@@ -206,7 +206,7 @@ func TestValidateMigrateCategory_NameTooLong(t *testing.T) {
 func TestValidateMigrateCategory_IconTooLong(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              "Valid",
-		AllocationPercent: 45,
+		AllocationValue: 45,
 		Icon:              strings.Repeat("x", maxIconLength+1),
 	}
 	err := validateMigrateCategory(mc)
@@ -218,7 +218,7 @@ func TestValidateMigrateCategory_IconTooLong(t *testing.T) {
 func TestValidateMigrateCategory_AllocationNegative(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              "Valid",
-		AllocationPercent: -0.1,
+		AllocationValue: -0.1,
 		Icon:              "home",
 	}
 	err := validateMigrateCategory(mc)
@@ -230,7 +230,7 @@ func TestValidateMigrateCategory_AllocationNegative(t *testing.T) {
 func TestValidateMigrateCategory_AllocationOver100(t *testing.T) {
 	mc := MigrateCategory{
 		Name:              "Valid",
-		AllocationPercent: 100.1,
+		AllocationValue: 100.1,
 		Icon:              "home",
 	}
 	err := validateMigrateCategory(mc)
@@ -240,12 +240,12 @@ func TestValidateMigrateCategory_AllocationOver100(t *testing.T) {
 }
 
 func TestValidateMigrateCategory_AllocationBoundaries(t *testing.T) {
-	mc0 := MigrateCategory{Name: "Valid", AllocationPercent: 0, Icon: "home"}
+	mc0 := MigrateCategory{Name: "Valid", AllocationValue: 0, Icon: "home"}
 	if err := validateMigrateCategory(mc0); err != nil {
 		t.Errorf("0%% allocation should pass: %v", err)
 	}
 
-	mc100 := MigrateCategory{Name: "Valid", AllocationPercent: 100, Icon: "home"}
+	mc100 := MigrateCategory{Name: "Valid", AllocationValue: 100, Icon: "home"}
 	if err := validateMigrateCategory(mc100); err != nil {
 		t.Errorf("100%% allocation should pass: %v", err)
 	}

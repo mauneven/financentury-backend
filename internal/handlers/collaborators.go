@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -166,6 +167,15 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 	_, statusCode, err = database.DB.Delete("budget_collaborators", delQuery)
 	if err != nil || statusCode >= 300 {
 		return errInternal(c, "failed to delete collaborator")
+	}
+
+	// Clean up links created by the removed collaborator for this budget.
+	_, cleanupErr := database.DB.Pool.Exec(context.Background(),
+		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`,
+		targetUserID, budgetID)
+	if cleanupErr != nil {
+		// Log but don't fail the request — collaborator removal succeeded.
+		// Links will be orphaned but won't cause data integrity issues.
 	}
 
 	broadcast(budgetID.String(), ws.MessageTypeCollabRemoved, map[string]string{
