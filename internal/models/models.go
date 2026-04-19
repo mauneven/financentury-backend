@@ -33,26 +33,17 @@ type Budget struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
-// Section represents a budget section (top-level grouping, stored in budget_categories table).
-type Section struct {
-	ID                uuid.UUID `json:"id"`
-	BudgetID          uuid.UUID `json:"budget_id"`
-	Name              string    `json:"name"`
-	AllocationValue float64   `json:"allocation_value"`
-	Icon              string    `json:"icon"`
-	SortOrder         int       `json:"sort_order"`
-	CreatedAt         time.Time `json:"created_at"`
-}
-
-// Category represents a budget category (child of a Section, stored in the categories table).
+// Category represents a flat budget category belonging directly to a budget.
+// The former two-level Section -> Category hierarchy has been collapsed into
+// this single table (budget_categories) with a max of 50 rows per budget.
 type Category struct {
-	ID                uuid.UUID `json:"id"`
-	CategoryID        uuid.UUID `json:"category_id"`
-	Name              string    `json:"name"`
+	ID              uuid.UUID `json:"id"`
+	BudgetID        uuid.UUID `json:"budget_id"`
+	Name            string    `json:"name"`
 	AllocationValue float64   `json:"allocation_value"`
-	Icon              string    `json:"icon"`
-	SortOrder         int       `json:"sort_order"`
-	CreatedAt         time.Time `json:"created_at"`
+	Icon            string    `json:"icon"`
+	SortOrder       int       `json:"sort_order"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Expense represents a budget expense.
@@ -68,10 +59,9 @@ type Expense struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
-// UnmarshalJSON handles both the DB column name (subcategory_id) and the
-// canonical API field name (category_id) so that expenses read from the
-// database deserialize correctly even though the DB column has not been
-// renamed yet.
+// UnmarshalJSON handles legacy payloads that still carry the old
+// "subcategory_id" column name by mapping it to the canonical "category_id"
+// field. New payloads use "category_id" directly.
 func (e *Expense) UnmarshalJSON(data []byte) error {
 	type Alias Expense
 	aux := &struct {
@@ -120,20 +110,17 @@ type InviteInfo struct {
 	IsUsed      bool   `json:"is_used"`
 }
 
-// BudgetLink represents a cross-budget link from a source section/category to a target budget.
-// For section-level links, TargetSectionID is nil (the whole section appears in the target budget).
-// For category-level links, TargetSectionID points to the section in the target budget where
-// the linked category should appear.
+// BudgetLink represents a cross-budget link from a source category to a
+// target budget. The flat model means every link is now at category
+// granularity — section-level links no longer exist.
 type BudgetLink struct {
-	ID               uuid.UUID  `json:"id"`
-	SourceBudgetID   uuid.UUID  `json:"source_budget_id"`
-	TargetBudgetID   uuid.UUID  `json:"target_budget_id"`
-	SourceSectionID  uuid.UUID  `json:"source_section_id"`
-	SourceCategoryID *uuid.UUID `json:"source_category_id,omitempty"`
-	TargetSectionID  *uuid.UUID `json:"target_section_id,omitempty"`
-	FilterMode       string     `json:"filter_mode"`
-	CreatedBy        uuid.UUID  `json:"created_by"`
-	CreatedAt        time.Time  `json:"created_at"`
+	ID               uuid.UUID `json:"id"`
+	SourceBudgetID   uuid.UUID `json:"source_budget_id"`
+	TargetBudgetID   uuid.UUID `json:"target_budget_id"`
+	SourceCategoryID uuid.UUID `json:"source_category_id"`
+	FilterMode       string    `json:"filter_mode"`
+	CreatedBy        uuid.UUID `json:"created_by"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // --- Request/Response DTOs ---
@@ -160,36 +147,20 @@ type UpdateBudgetRequest struct {
 	Mode                *string  `json:"mode,omitempty"`
 }
 
-// CreateSectionRequest is the payload for creating a section.
-type CreateSectionRequest struct {
-	Name              string  `json:"name"`
-	AllocationValue float64 `json:"allocation_value"`
-	Icon              string  `json:"icon"`
-	SortOrder         int     `json:"sort_order"`
-}
-
-// UpdateSectionRequest is the payload for updating a section.
-type UpdateSectionRequest struct {
-	Name              *string  `json:"name,omitempty"`
-	AllocationValue *float64 `json:"allocation_value,omitempty"`
-	Icon              *string  `json:"icon,omitempty"`
-	SortOrder         *int     `json:"sort_order,omitempty"`
-}
-
 // CreateCategoryRequest is the payload for creating a category.
 type CreateCategoryRequest struct {
-	Name              string  `json:"name"`
+	Name            string  `json:"name"`
 	AllocationValue float64 `json:"allocation_value"`
-	Icon              string  `json:"icon"`
-	SortOrder         int     `json:"sort_order"`
+	Icon            string  `json:"icon"`
+	SortOrder       int     `json:"sort_order"`
 }
 
 // UpdateCategoryRequest is the payload for updating a category.
 type UpdateCategoryRequest struct {
-	Name              *string  `json:"name,omitempty"`
+	Name            *string  `json:"name,omitempty"`
 	AllocationValue *float64 `json:"allocation_value,omitempty"`
-	Icon              *string  `json:"icon,omitempty"`
-	SortOrder         *int     `json:"sort_order,omitempty"`
+	Icon            *string  `json:"icon,omitempty"`
+	SortOrder       *int     `json:"sort_order,omitempty"`
 }
 
 // CreateExpenseRequest is the payload for creating an expense.
@@ -211,19 +182,18 @@ type UpdateExpenseRequest struct {
 // --- Summary Response Types ---
 
 // SummaryCategoryView is the category representation used in summary responses.
-// It maps the DB column "category_id" to the JSON key "section_id" because the
-// frontend Category type uses "section_id" to refer to the parent section.
+// It mirrors Category one-for-one now that the model is flat.
 type SummaryCategoryView struct {
-	ID                uuid.UUID `json:"id"`
-	SectionID         uuid.UUID `json:"section_id"`
-	Name              string    `json:"name"`
+	ID              uuid.UUID `json:"id"`
+	BudgetID        uuid.UUID `json:"budget_id"`
+	Name            string    `json:"name"`
 	AllocationValue float64   `json:"allocation_value"`
-	Icon              string    `json:"icon"`
-	SortOrder         int       `json:"sort_order"`
-	CreatedAt         time.Time `json:"created_at"`
+	Icon            string    `json:"icon"`
+	SortOrder       int       `json:"sort_order"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
-// UserSpending represents one user's spending within a budget, section, or category.
+// UserSpending represents one user's spending within a budget or category.
 type UserSpending struct {
 	UserID  uuid.UUID `json:"user_id"`
 	Profile *Profile  `json:"profile,omitempty"`
@@ -239,33 +209,22 @@ type CategorySummary struct {
 	SpendingByUser  []UserSpending      `json:"spending_by_user,omitempty"`
 }
 
-// SectionSummary contains a section with category summaries.
-type SectionSummary struct {
-	Section         Section           `json:"section"`
-	Categories      []CategorySummary `json:"categories"`
-	AllocatedAmount float64           `json:"allocated_amount"`
-	TotalSpent      float64           `json:"total_spent"`
-	SpendingByUser  []UserSpending    `json:"spending_by_user,omitempty"`
-}
-
-// LinkedSectionSummary is a section summary for linked content in a target budget.
-type LinkedSectionSummary struct {
-	Link           BudgetLink        `json:"link"`
-	SourceBudget   Budget            `json:"source_budget"`
-	Section        Section           `json:"section"`
-	Categories     []CategorySummary `json:"categories"`
-	TotalSpent     float64           `json:"total_spent"`
-	SpendingByUser []UserSpending    `json:"spending_by_user,omitempty"`
+// LinkedCategorySummary is a category summary for linked content in a target
+// budget, together with the link metadata and source-budget reference.
+type LinkedCategorySummary struct {
+	Link         BudgetLink      `json:"link"`
+	SourceBudget Budget          `json:"source_budget"`
+	Category     CategorySummary `json:"category"`
 }
 
 // BudgetSummary is the full budget summary response.
 type BudgetSummary struct {
-	Budget         Budget                 `json:"budget"`
-	Sections       []SectionSummary       `json:"sections"`
-	LinkedSections []LinkedSectionSummary `json:"linked_sections,omitempty"`
-	TotalBudget    float64                `json:"total_budget"`
-	TotalSpent     float64                `json:"total_spent"`
-	SpendingByUser []UserSpending         `json:"spending_by_user,omitempty"`
+	Budget           Budget                  `json:"budget"`
+	Categories       []CategorySummary       `json:"categories"`
+	LinkedCategories []LinkedCategorySummary `json:"linked_categories,omitempty"`
+	TotalBudget      float64                 `json:"total_budget"`
+	TotalSpent       float64                 `json:"total_spent"`
+	SpendingByUser   []UserSpending          `json:"spending_by_user,omitempty"`
 }
 
 // MonthlyTrend represents spending for a single month.
@@ -274,20 +233,17 @@ type MonthlyTrend struct {
 	TotalSpent float64 `json:"total_spent"`
 }
 
-// SectionTrend contains trends for a single section. JSON keys use
-// "category_id" / "category_name" because the frontend type calls sections
-// "categories" in the trends context.
-type SectionTrend struct {
-	SectionID   uuid.UUID      `json:"category_id"`
-	SectionName string         `json:"category_name"`
-	Months      []MonthlyTrend `json:"months"`
+// CategoryTrend contains trends for a single category.
+type CategoryTrend struct {
+	CategoryID   uuid.UUID      `json:"category_id"`
+	CategoryName string         `json:"category_name"`
+	Months       []MonthlyTrend `json:"months"`
 }
 
-// TrendsResponse is the trends endpoint response. The JSON key "categories"
-// actually contains section-level trend data (matching the frontend type).
+// TrendsResponse is the trends endpoint response.
 type TrendsResponse struct {
-	BudgetID uuid.UUID      `json:"budget_id"`
-	Sections []SectionTrend `json:"categories"`
+	BudgetID   uuid.UUID       `json:"budget_id"`
+	Categories []CategoryTrend `json:"categories"`
 }
 
 // BudgetResumePeriod represents the resume for a single billing period.

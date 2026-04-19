@@ -19,7 +19,7 @@ import (
 // --- Validation Constants ---
 
 const (
-	// maxNameLength is the upper bound for name fields (budgets, sections, categories).
+	// maxNameLength is the upper bound for name fields (budgets, categories).
 	maxNameLength = 200
 	// maxDescriptionLength is the upper bound for description fields.
 	// Aligned with frontend limit of 500 characters.
@@ -44,7 +44,7 @@ var validBudgetModes = map[string]bool{
 	"event":      true,
 }
 
-// guidedModes lists modes that should seed template sections on creation.
+// guidedModes lists modes that should seed template categories on creation.
 var guidedModes = map[string]bool{
 	"balanced":   true,
 	"debt-free":  true,
@@ -202,8 +202,14 @@ func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
 // collaborator using a single DB query. Returns a non-nil error when
 // neither condition holds.
 func verifyBudgetAccess(budgetID, userID uuid.UUID) error {
+	return verifyBudgetAccessCtx(context.Background(), budgetID, userID)
+}
+
+// verifyBudgetAccessCtx is the context-aware variant of verifyBudgetAccess so
+// that a cancelled HTTP request propagates to the database query.
+func verifyBudgetAccessCtx(ctx context.Context, budgetID, userID uuid.UUID) error {
 	var exists bool
-	err := database.DB.Pool.QueryRow(context.Background(),
+	err := database.DB.Pool.QueryRow(ctx,
 		`SELECT EXISTS(
 			SELECT 1 FROM budgets WHERE id = $1 AND user_id = $2
 			UNION ALL
@@ -216,65 +222,15 @@ func verifyBudgetAccess(budgetID, userID uuid.UUID) error {
 	return nil
 }
 
-// verifySectionOwnership checks that the section belongs to the budget and
-// the user has access. Returns a non-nil error on failure.
-func verifySectionOwnership(budgetID, sectionID, userID uuid.UUID) error {
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return err
-	}
-
-	query := database.NewFilter().
-		Select("id").
-		Eq("id", sectionID.String()).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_categories", query)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return fiber.ErrNotFound
-	}
-	return nil
-}
-
-// verifyCategoryBelongsToBudget verifies that a category (by its ID)
-// ultimately belongs to the given budget by checking its parent section.
+// verifyCategoryBelongsToBudget verifies that a category (by its ID) belongs
+// to the given budget. Categories are flat (no sections), so this is a single
+// existence check against budget_categories.
 func verifyCategoryBelongsToBudget(categoryID, budgetID uuid.UUID) error {
-	catQuery := database.NewFilter().
-		Select("id,category_id").
-		Eq("id", categoryID.String()).
-		Build()
-
-	catBody, statusCode, err := database.DB.Get("budget_subcategories", catQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var catResults []struct {
-		ID         string `json:"id"`
-		CategoryID string `json:"category_id"`
-	}
-	if err := json.Unmarshal(catBody, &catResults); err != nil || len(catResults) == 0 {
-		return fiber.ErrNotFound
-	}
-
-	sectionCheckQuery := database.NewFilter().
-		Select("id").
-		Eq("id", catResults[0].CategoryID).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	sectionBody, statusCode, err := database.DB.Get("budget_categories", sectionCheckQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var sectionFound []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(sectionBody, &sectionFound); err != nil || len(sectionFound) == 0 {
+	var exists bool
+	err := database.DB.Pool.QueryRow(context.Background(),
+		`SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)`,
+		categoryID, budgetID).Scan(&exists)
+	if err != nil || !exists {
 		return fiber.ErrNotFound
 	}
 	return nil
@@ -283,4 +239,34 @@ func verifyCategoryBelongsToBudget(categoryID, budgetID uuid.UUID) error {
 // marshalJSON marshals v to JSON bytes, returning an error response on failure.
 func marshalJSON(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
+}
+
+// --- Nullable deref helpers (used when scanning LEFT JOIN rows) ---
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func derefFloat(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func derefTime(p *time.Time) time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	return *p
 }

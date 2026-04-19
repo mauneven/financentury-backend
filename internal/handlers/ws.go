@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"strings"
@@ -70,6 +72,15 @@ func WebSocketHandler() fiber.Handler {
 		userID, err := parseWSToken(authMsg.Token)
 		if err != nil {
 			log.Printf("[ws] connection rejected: invalid token: %v", err)
+			_ = c.Close()
+			return
+		}
+
+		// Security: ensure the token's underlying session has not been
+		// revoked. Without this check a signed-out user could keep a
+		// real-time WS channel open and observe budget events.
+		if !isWSSessionActive(authMsg.Token) {
+			log.Printf("[ws] connection rejected: session revoked for user %s", userID)
 			_ = c.Close()
 			return
 		}
@@ -155,6 +166,32 @@ func fetchUserBudgetIDs(userID string) (map[string]bool, error) {
 		}
 	}
 	return ids, nil
+}
+
+// isWSSessionActive returns true when the session matching the JWT token
+// exists and has not been revoked. Returns true when there is no session row
+// (mirrors middleware.Protected's backward-compatible behavior for tokens
+// issued before sessions were tracked) so existing users are not locked out
+// but any explicitly-revoked session is rejected.
+func isWSSessionActive(tokenStr string) bool {
+	if database.DB == nil || database.DB.Pool == nil {
+		return true
+	}
+	h := sha256.Sum256([]byte(tokenStr))
+	tokenHash := hex.EncodeToString(h[:])
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var revokedAt *time.Time
+	err := database.DB.Pool.QueryRow(ctx,
+		`SELECT revoked_at FROM user_sessions WHERE token_hash = $1`, tokenHash,
+	).Scan(&revokedAt)
+	if err != nil {
+		// No session row — allow (backward compatible).
+		return true
+	}
+	return revokedAt == nil
 }
 
 // parseWSToken validates a JWT token string and returns the user ID claim.

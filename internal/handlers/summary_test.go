@@ -220,282 +220,99 @@ func TestRoundAmount(t *testing.T) {
 	}
 }
 
-func TestAllocationMath_SectionAndCategory(t *testing.T) {
-	monthlyIncome := 5000000.0 // 5M COP
+func TestAllocationMath_FlatCategory(t *testing.T) {
+	// In the flat model each category holds a direct monetary allocation.
+	monthlyIncome := 5000000.0
 
-	// Section: Necesidades at 50%.
-	sectionAllocated := roundAmount(monthlyIncome * 50 / 100)
-	if sectionAllocated != 2500000 {
-		t.Errorf("section allocated: got %v, want 2500000", sectionAllocated)
-	}
-
-	// Category: Vivienda at 56% of section.
-	catAllocated := roundAmount(sectionAllocated * 56 / 100)
-	if catAllocated != 1400000 {
-		t.Errorf("category Vivienda allocated: got %v, want 1400000", catAllocated)
-	}
-
-	// Category: Comida at 24% of section.
-	catAllocated2 := roundAmount(sectionAllocated * 24 / 100)
-	if catAllocated2 != 600000 {
-		t.Errorf("category Comida allocated: got %v, want 600000", catAllocated2)
+	// A category allocated 22.5% of income equals 1,125,000 COP.
+	catAllocated := roundAmount(monthlyIncome * 22.5 / 100)
+	if catAllocated != 1125000 {
+		t.Errorf("flat category allocated: got %v, want 1125000", catAllocated)
 	}
 }
 
 func TestAllocationMath_ZeroIncome(t *testing.T) {
 	monthlyIncome := 0.0
-	sectionAllocated := roundAmount(monthlyIncome * 50 / 100)
-	if sectionAllocated != 0 {
-		t.Errorf("zero income section: got %v, want 0", sectionAllocated)
-	}
-	catAllocated := roundAmount(sectionAllocated * 56 / 100)
-	if catAllocated != 0 {
-		t.Errorf("zero income category: got %v, want 0", catAllocated)
+	allocated := roundAmount(monthlyIncome * 50 / 100)
+	if allocated != 0 {
+		t.Errorf("zero income category: got %v, want 0", allocated)
 	}
 }
 
 func TestAllocationMath_ZeroAllocationPercent(t *testing.T) {
 	monthlyIncome := 5000000.0
-	sectionAllocated := roundAmount(monthlyIncome * 0 / 100)
-	if sectionAllocated != 0 {
-		t.Errorf("zero allocation section: got %v, want 0", sectionAllocated)
-	}
-	catAllocated := roundAmount(sectionAllocated * 50 / 100)
-	if catAllocated != 0 {
-		t.Errorf("zero allocation category: got %v, want 0", catAllocated)
-	}
-}
-
-func TestAllocationMath_Full50_30_20Template(t *testing.T) {
-	monthlyIncome := 8500000.0
-
-	// Necesidades: 50%
-	necesidades := roundAmount(monthlyIncome * 50 / 100)
-	// Deseos: 30%
-	deseos := roundAmount(monthlyIncome * 30 / 100)
-	// Ahorro: 20%
-	ahorro := roundAmount(monthlyIncome * 20 / 100)
-
-	totalBudget := necesidades + deseos + ahorro
-	if totalBudget != 8500000 {
-		t.Errorf("total budget: got %v, want 8500000", totalBudget)
-	}
-
-	// Verify category allocations within Necesidades.
-	vivienda := roundAmount(necesidades * 56 / 100)
-	comida := roundAmount(necesidades * 24 / 100)
-	transporte := roundAmount(necesidades * 12 / 100)
-	servicios := roundAmount(necesidades * 8 / 100)
-
-	if vivienda != 2380000 {
-		t.Errorf("vivienda: got %v, want 2380000", vivienda)
-	}
-	if comida != 1020000 {
-		t.Errorf("comida: got %v, want 1020000", comida)
-	}
-	if transporte != 510000 {
-		t.Errorf("transporte: got %v, want 510000", transporte)
-	}
-	if servicios != 340000 {
-		t.Errorf("servicios: got %v, want 340000", servicios)
-	}
-
-	// Verify category allocations within Ahorro.
-	fondo := roundAmount(ahorro * 40 / 100)
-	inversion := roundAmount(ahorro * 60 / 100)
-
-	if fondo != 680000 {
-		t.Errorf("fondo: got %v, want 680000", fondo)
-	}
-	if inversion != 1020000 {
-		t.Errorf("inversion: got %v, want 1020000", inversion)
-	}
-
-	// Verify Deseos categories.
-	salidas := roundAmount(deseos * 33 / 100)
-	entretenimiento := roundAmount(deseos * 17 / 100)
-	ropa := roundAmount(deseos * 23 / 100)
-	viajes := roundAmount(deseos * 27 / 100)
-
-	if salidas != 841500 {
-		t.Errorf("salidas: got %v, want 841500", salidas)
-	}
-	if entretenimiento != 433500 {
-		t.Errorf("entretenimiento: got %v, want 433500", entretenimiento)
-	}
-	if ropa != 586500 {
-		t.Errorf("ropa: got %v, want 586500", ropa)
-	}
-	if viajes != 688500 {
-		t.Errorf("viajes: got %v, want 688500", viajes)
+	allocated := roundAmount(monthlyIncome * 0 / 100)
+	if allocated != 0 {
+		t.Errorf("zero allocation category: got %v, want 0", allocated)
 	}
 }
 
 func TestAllocationMath_SmallIncome(t *testing.T) {
 	monthlyIncome := 1.0 // 1 COP
-	sectionAllocated := roundAmount(monthlyIncome * 50 / 100)
-	if sectionAllocated != 0.5 {
-		t.Errorf("small income section: got %v, want 0.5", sectionAllocated)
-	}
-	catAllocated := roundAmount(sectionAllocated * 56 / 100)
-	if catAllocated != 0.28 {
-		t.Errorf("small income category: got %v, want 0.28", catAllocated)
+	allocated := roundAmount(monthlyIncome * 50 / 100)
+	if allocated != 0.5 {
+		t.Errorf("small income category: got %v, want 0.5", allocated)
 	}
 }
 
-func TestAllocationMath_CorrectFormula(t *testing.T) {
-	// This test verifies the correct two-step allocation formula:
-	// step 1: section_alloc = income * section_pct / 100
-	// step 2: cat_alloc    = section_alloc * cat_pct / 100
-	//
-	// The OLD buggy RPC used category percents that were "percent of total
-	// income" (e.g. Vivienda = 28% meaning 28% of total). That combined with
-	// the formula (section_pct/100 * cat_pct/100 * income) caused
-	// double-division of the section proportion.
-	//
-	// The FIX: category percents now mean "percent of parent section" (e.g.
-	// Vivienda = 56% meaning 56% of the Necesidades section). This makes the
-	// two-step formula produce allocations that properly sum to the section total.
+// ---------- Template Categories Validation ----------
 
-	income := 8500000.0
-
-	// Necesidades section: 50% of income.
-	sectionAlloc := roundAmount(income * 50 / 100)
-	if sectionAlloc != 4250000 {
-		t.Errorf("section alloc = %v, want 4250000", sectionAlloc)
-	}
-
-	// Vivienda: 56% of Necesidades section.
-	catAlloc := roundAmount(sectionAlloc * 56 / 100)
-	if catAlloc != 2380000 {
-		t.Errorf("cat alloc = %v, want 2380000", catAlloc)
-	}
-
-	// Verify that the category allocations within Necesidades sum to the
-	// section total (the old encoding could not guarantee this).
-	cats := []float64{56, 24, 12, 8} // percent of section
-	var catSum float64
-	for _, pct := range cats {
-		catSum += roundAmount(sectionAlloc * pct / 100)
-	}
-	if catSum != sectionAlloc {
-		t.Errorf("category sum %v != section total %v", catSum, sectionAlloc)
-	}
-}
-
-// ---------- Template Sections Validation ----------
-
-// TestAllTemplates_CategoriesSumTo100 verifies that every template's
-// category percentages within each section sum to 100.
+// TestAllTemplates_CategoriesSumTo100 verifies every template's flat category
+// percentages add up to 100.
 func TestAllTemplates_CategoriesSumTo100(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":   getBalancedSections(),
-		"debt-free":  getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":     getTravelSections(),
-		"event":      getEventSections(),
+	templates := map[string][]guidedCategory{
+		"balanced":    getBalancedCategories(),
+		"debt-free":   getDebtFreeCategories(),
+		"debt-payoff": getDebtPayoffCategories(),
+		"travel":      getTravelCategories(),
+		"event":       getEventCategories(),
 	}
-	for name, sections := range templates {
-		for _, s := range sections {
-			var sum float64
-			for _, c := range s.Categories {
-				sum += c.Percent
-			}
-			if math.Abs(sum-100) > 0.01 {
-				t.Errorf("%s / section %s: categories sum to %f, want 100", name, s.Name, sum)
-			}
-		}
-	}
-}
-
-// TestAllTemplates_SectionsSumTo100 verifies that the section percentages
-// for every template sum to exactly 100.
-func TestAllTemplates_SectionsSumTo100(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":   getBalancedSections(),
-		"debt-free":  getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":     getTravelSections(),
-		"event":      getEventSections(),
-	}
-	for name, sections := range templates {
+	for name, cats := range templates {
 		var sum float64
-		for _, s := range sections {
-			sum += s.Percent
+		for _, c := range cats {
+			sum += c.Percent
 		}
-		if sum != 100 {
-			t.Errorf("%s: sections sum to %f, want 100", name, sum)
+		if math.Abs(sum-100) > 0.01 {
+			t.Errorf("%s: categories sum to %f, want 100", name, sum)
 		}
 	}
 }
 
 // TestAllTemplates_UsesLucideIcons verifies all icons are short key strings.
 func TestAllTemplates_UsesLucideIcons(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":   getBalancedSections(),
-		"debt-free":  getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":     getTravelSections(),
-		"event":      getEventSections(),
+	templates := map[string][]guidedCategory{
+		"balanced":    getBalancedCategories(),
+		"debt-free":   getDebtFreeCategories(),
+		"debt-payoff": getDebtPayoffCategories(),
+		"travel":      getTravelCategories(),
+		"event":       getEventCategories(),
 	}
-	for name, sections := range templates {
-		for _, s := range sections {
-			if len(s.Icon) > 20 || containsEmoji(s.Icon) {
-				t.Errorf("%s / section %s icon should be a lucide key string, got %q", name, s.Name, s.Icon)
-			}
-			for _, c := range s.Categories {
-				if len(c.Icon) > 20 || containsEmoji(c.Icon) {
-					t.Errorf("%s / category %s icon should be a lucide key string, got %q", name, c.Name, c.Icon)
-				}
+	for name, cats := range templates {
+		for _, c := range cats {
+			if len(c.Icon) > 20 || containsEmoji(c.Icon) {
+				t.Errorf("%s / category %s icon should be a lucide key string, got %q", name, c.Name, c.Icon)
 			}
 		}
 	}
 }
 
-func TestBalancedSections_Structure(t *testing.T) {
-	sections := getBalancedSections()
+func TestBalancedCategories_Structure(t *testing.T) {
+	cats := getBalancedCategories()
 
-	if len(sections) != 4 {
-		t.Fatalf("expected 4 sections, got %d", len(sections))
+	if len(cats) == 0 {
+		t.Fatal("balanced template should have at least one category")
+	}
+	if len(cats) > maxCategoriesPerBudget {
+		t.Errorf("balanced template has %d categories, exceeds cap of %d", len(cats), maxCategoriesPerBudget)
 	}
 
-	expectedCounts := map[string]int{
-		"Necesidades": 4,
-		"Deseos":      2,
-		"Deudas":      2,
-		"Ahorro":      2,
-	}
-
-	for _, s := range sections {
-		want, ok := expectedCounts[s.Name]
-		if !ok {
-			t.Errorf("unexpected section name: %s", s.Name)
-			continue
+	// Each category must have a non-empty name and a positive percent.
+	for _, c := range cats {
+		if c.Name == "" {
+			t.Error("balanced category has empty name")
 		}
-		if len(s.Categories) != want {
-			t.Errorf("section %s: expected %d categories, got %d", s.Name, want, len(s.Categories))
-		}
-	}
-}
-
-func TestBalancedSections_PercentValues(t *testing.T) {
-	sections := getBalancedSections()
-
-	expected := map[string]float64{
-		"Necesidades": 50,
-		"Deseos":      30,
-		"Deudas":      10,
-		"Ahorro":      10,
-	}
-
-	for _, s := range sections {
-		want, ok := expected[s.Name]
-		if !ok {
-			t.Errorf("unexpected section name: %s", s.Name)
-			continue
-		}
-		if s.Percent != want {
-			t.Errorf("section %s: percent = %f, want %f", s.Name, s.Percent, want)
+		if c.Percent <= 0 {
+			t.Errorf("balanced category %q has non-positive percent %v", c.Name, c.Percent)
 		}
 	}
 }

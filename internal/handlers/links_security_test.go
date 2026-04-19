@@ -18,7 +18,7 @@ import (
 )
 
 // setupLinkSecurityEnv initializes the database from TEST_DATABASE_URL for
-// link security tests. Returns a Fiber app and a JWT token for the test user.
+// link security tests. Returns a Fiber app and a placeholder token string.
 func setupLinkSecurityEnv(t *testing.T) (*fiber.App, string) {
 	t.Helper()
 
@@ -46,35 +46,33 @@ func tokenForUser(userID uuid.UUID, email string) string {
 
 // Static UUIDs used across tests.
 var (
-	ownerUserID    = uuid.MustParse("11111111-1111-1111-1111-111111111111")
-	collabUserID   = uuid.MustParse("22222222-2222-2222-2222-222222222222")
-	thirdUserID    = uuid.MustParse("33333333-3333-3333-3333-333333333333")
-	budgetAID      = uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-	budgetBID      = uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-	budgetCID      = uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
-	sectionA1ID    = uuid.MustParse("a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1")
-	sectionB1ID    = uuid.MustParse("b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1")
-	categoryA1aID  = uuid.MustParse("a11a11a1-a11a-a11a-a11a-a11a11a11a11")
+	ownerUserID   = uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	collabUserID  = uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	thirdUserID   = uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	budgetAID     = uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	budgetBID     = uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	budgetCID     = uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
+	categoryA1ID  = uuid.MustParse("a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1")
+	categoryB1ID  = uuid.MustParse("b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1")
 )
 
 // seedLinkTestData inserts the minimal set of rows needed by most link
-// security tests: three users, three budgets, sections, and a category.
-// Budget A is owned by ownerUserID, budget B by collabUserID, budget C by
-// thirdUserID. All use USD currency.
+// security tests: three users, three budgets, and a flat category in each
+// relevant budget. Budget A is owned by ownerUserID, budget B by collabUserID,
+// budget C by thirdUserID. All use USD currency.
 func seedLinkTestData(t *testing.T) {
 	t.Helper()
-	ctx := database.DB.Pool
+	pool := database.DB.Pool
 
 	// Clean up first (in dependency order).
-	ctx.Exec(nil, "DELETE FROM budget_links")
-	ctx.Exec(nil, "DELETE FROM budget_expenses")
-	ctx.Exec(nil, "DELETE FROM budget_subcategories")
-	ctx.Exec(nil, "DELETE FROM budget_categories")
-	ctx.Exec(nil, "DELETE FROM budget_collaborators")
-	ctx.Exec(nil, "DELETE FROM budget_invites")
-	ctx.Exec(nil, "DELETE FROM budgets")
-	ctx.Exec(nil, "DELETE FROM user_sessions")
-	ctx.Exec(nil, "DELETE FROM profiles")
+	pool.Exec(nil, "DELETE FROM budget_links")
+	pool.Exec(nil, "DELETE FROM budget_expenses")
+	pool.Exec(nil, "DELETE FROM budget_categories")
+	pool.Exec(nil, "DELETE FROM budget_collaborators")
+	pool.Exec(nil, "DELETE FROM budget_invites")
+	pool.Exec(nil, "DELETE FROM budgets")
+	pool.Exec(nil, "DELETE FROM user_sessions")
+	pool.Exec(nil, "DELETE FROM profiles")
 
 	// Profiles.
 	for _, u := range []struct {
@@ -86,7 +84,7 @@ func seedLinkTestData(t *testing.T) {
 		{collabUserID, "collab@test.com", "Collaborator"},
 		{thirdUserID, "third@test.com", "Third"},
 	} {
-		_, err := ctx.Exec(nil,
+		_, err := pool.Exec(nil,
 			`INSERT INTO profiles (id, email, full_name, password_hash, auth_provider)
 			 VALUES ($1, $2, $3, 'hash', 'email')`,
 			u.id, u.email, u.name)
@@ -105,7 +103,7 @@ func seedLinkTestData(t *testing.T) {
 		{budgetBID, collabUserID, "Budget B"},
 		{budgetCID, thirdUserID, "Budget C"},
 	} {
-		_, err := ctx.Exec(nil,
+		_, err := pool.Exec(nil,
 			`INSERT INTO budgets (id, user_id, name, monthly_income, currency, billing_period_months, billing_cutoff_day, mode)
 			 VALUES ($1, $2, $3, 5000000, 'USD', 1, 1, 'manual')`,
 			b.id, b.owner, b.name)
@@ -114,31 +112,22 @@ func seedLinkTestData(t *testing.T) {
 		}
 	}
 
-	// Sections.
-	for _, s := range []struct {
+	// Flat categories (one per budget we touch).
+	for _, c := range []struct {
 		id       uuid.UUID
 		budgetID uuid.UUID
 		name     string
 	}{
-		{sectionA1ID, budgetAID, "Section A1"},
-		{sectionB1ID, budgetBID, "Section B1"},
+		{categoryA1ID, budgetAID, "Category A1"},
+		{categoryB1ID, budgetBID, "Category B1"},
 	} {
-		_, err := ctx.Exec(nil,
+		_, err := pool.Exec(nil,
 			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 			 VALUES ($1, $2, $3, 50, 'home', 1)`,
-			s.id, s.budgetID, s.name)
+			c.id, c.budgetID, c.name)
 		if err != nil {
-			t.Fatalf("seed section %s: %v", s.name, err)
+			t.Fatalf("seed category %s: %v", c.name, err)
 		}
-	}
-
-	// Category in section A1.
-	_, err := ctx.Exec(nil,
-		`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order)
-		 VALUES ($1, $2, 'Cat A1a', 100, 'tag', 1)`,
-		categoryA1aID, sectionA1ID)
-	if err != nil {
-		t.Fatalf("seed category: %v", err)
 	}
 }
 
@@ -155,7 +144,7 @@ func TestCreateLink_CannotLinkToSelf(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-		"source_section_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+		"source_category_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
 		"filter_mode": "all"
 	}`
 
@@ -201,7 +190,7 @@ func TestCreateLink_InvalidFilterMode(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "invalid"
 	}`
 
@@ -230,7 +219,7 @@ func TestCreateLink_SourceBudgetAccessRequired(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "all"
 	}`
 
@@ -255,7 +244,7 @@ func TestCreateLink_TargetBudgetAccessRequired(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "all"
 	}`
 
@@ -293,7 +282,7 @@ func TestCreateLink_CurrencyMismatchRejected(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "all"
 	}`
 
@@ -327,7 +316,7 @@ func TestCreateLink_Success(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "all"
 	}`
 
@@ -357,6 +346,9 @@ func TestCreateLink_Success(t *testing.T) {
 	if link.TargetBudgetID != budgetAID {
 		t.Errorf("target_budget_id = %s, want %s", link.TargetBudgetID, budgetAID)
 	}
+	if link.SourceCategoryID != categoryB1ID {
+		t.Errorf("source_category_id = %s, want %s", link.SourceCategoryID, categoryB1ID)
+	}
 	if link.FilterMode != "all" {
 		t.Errorf("filter_mode = %q, want 'all'", link.FilterMode)
 	}
@@ -379,18 +371,19 @@ func TestCreateLink_MaxLinksPerBudgetEnforced(t *testing.T) {
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
 
-	// Insert 10 links (the max) directly in the DB.
+	// Insert 10 links (the max) directly in the DB, each for a distinct
+	// source category to satisfy the unique constraint.
 	for i := 0; i < maxLinksPerBudget; i++ {
-		sectionID := uuid.New()
+		catID := uuid.New()
 		database.DB.Pool.Exec(nil,
 			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 			 VALUES ($1, $2, $3, 10, 'tag', $4)`,
-			sectionID, budgetBID, "DummySection"+string(rune('0'+i)), i+10)
+			catID, budgetBID, "DummyCategory"+string(rune('0'+i)), i+10)
 
 		database.DB.Pool.Exec(nil,
-			`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+			`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 			 VALUES ($1, $2, $3, 'all', $4)`,
-			budgetBID, budgetAID, sectionID, ownerUserID)
+			budgetBID, budgetAID, catID, ownerUserID)
 	}
 
 	token := tokenForUser(ownerUserID, "owner@test.com")
@@ -398,7 +391,7 @@ func TestCreateLink_MaxLinksPerBudgetEnforced(t *testing.T) {
 
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
+		"source_category_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
 		"filter_mode": "all"
 	}`
 
@@ -414,10 +407,10 @@ func TestCreateLink_MaxLinksPerBudgetEnforced(t *testing.T) {
 }
 
 // =====================================================================
-// Test 7: Full-section and category-level links are mutually exclusive
+// Test 7: Missing source_category_id rejected
 // =====================================================================
 
-func TestCreateLink_MutualExclusivity_FullThenCategory(t *testing.T) {
+func TestCreateLink_MissingSourceCategoryID(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedLinkTestData(t)
 
@@ -427,29 +420,11 @@ func TestCreateLink_MutualExclusivity_FullThenCategory(t *testing.T) {
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
 
-	// Create a category in section B1 for the category-level link.
-	catB1a := uuid.New()
-	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order)
-		 VALUES ($1, $2, 'Cat B1a', 100, 'tag', 1)`,
-		catB1a, sectionB1ID)
-
-	// Insert a full-section link (source_category_id IS NULL).
-	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
-		 VALUES ($1, $2, $3, 'all', $4)`,
-		budgetBID, budgetAID, sectionB1ID, ownerUserID)
-
-	// Now try to create a category-level link for the same section — should fail.
 	token := tokenForUser(ownerUserID, "owner@test.com")
 	app.Post("/api/budgets/:id/links", middleware.Protected(), CreateLink)
 
-	// We also need a target section in budget A for the category link.
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
-		"source_category_id": "` + catB1a.String() + `",
-		"target_section_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
 		"filter_mode": "all"
 	}`
 
@@ -460,51 +435,7 @@ func TestCreateLink_MutualExclusivity_FullThenCategory(t *testing.T) {
 	resp, _ := app.Test(req)
 	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("mutual exclusivity full→cat: status = %d, want 400, body: %s", resp.StatusCode, string(body))
-	}
-}
-
-func TestCreateLink_MutualExclusivity_CategoryThenFull(t *testing.T) {
-	app, _ := setupLinkSecurityEnv(t)
-	seedLinkTestData(t)
-
-	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
-		 ON CONFLICT DO NOTHING`,
-		budgetBID, ownerUserID)
-
-	// Create a category in section B1 for the category-level link.
-	catB1a := uuid.New()
-	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order)
-		 VALUES ($1, $2, 'Cat B1a', 100, 'tag', 1)`,
-		catB1a, sectionB1ID)
-
-	// Insert a category-level link first.
-	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by)
-		 VALUES ($1, $2, $3, $4, $5, 'all', $6)`,
-		budgetBID, budgetAID, sectionB1ID, catB1a, sectionA1ID, ownerUserID)
-
-	// Now try to create a full-section link for the same section — should fail.
-	token := tokenForUser(ownerUserID, "owner@test.com")
-	app.Post("/api/budgets/:id/links", middleware.Protected(), CreateLink)
-
-	payload := `{
-		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1",
-		"filter_mode": "all"
-	}`
-
-	req := httptest.NewRequest(http.MethodPost, "/api/budgets/"+budgetAID.String()+"/links", strings.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, _ := app.Test(req)
-	if resp.StatusCode != http.StatusBadRequest {
-		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("mutual exclusivity cat→full: status = %d, want 400, body: %s", resp.StatusCode, string(body))
+		t.Errorf("missing source_category_id: status = %d, want 400, body: %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -554,9 +485,9 @@ func TestUpdateLink_Success(t *testing.T) {
 
 	linkID := uuid.New()
 	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
-		linkID, budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
 
 	token := tokenForUser(ownerUserID, "owner@test.com")
 	app.Patch("/api/budgets/:id/links/:linkId", middleware.Protected(), UpdateLink)
@@ -599,9 +530,9 @@ func TestUpdateLink_InvalidFilterMode(t *testing.T) {
 
 	linkID := uuid.New()
 	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
-		linkID, budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
 
 	token := tokenForUser(ownerUserID, "owner@test.com")
 	app.Patch("/api/budgets/:id/links/:linkId", middleware.Protected(), UpdateLink)
@@ -635,9 +566,9 @@ func TestDeleteLink_Success(t *testing.T) {
 
 	linkID := uuid.New()
 	database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
-		linkID, budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
 
 	token := tokenForUser(ownerUserID, "owner@test.com")
 	app.Delete("/api/budgets/:id/links/:linkId", middleware.Protected(), DeleteLink)
@@ -681,10 +612,10 @@ func TestDeleteLink_NotFound(t *testing.T) {
 }
 
 // =====================================================================
-// Test 11: Source section must belong to source budget
+// Test 11: Source category must belong to source budget
 // =====================================================================
 
-func TestCreateLink_SectionMustBelongToSourceBudget(t *testing.T) {
+func TestCreateLink_CategoryMustBelongToSourceBudget(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedLinkTestData(t)
 
@@ -697,10 +628,10 @@ func TestCreateLink_SectionMustBelongToSourceBudget(t *testing.T) {
 	token := tokenForUser(ownerUserID, "owner@test.com")
 	app.Post("/api/budgets/:id/links", middleware.Protected(), CreateLink)
 
-	// Try to use sectionA1 (belongs to budget A) as source for budget B.
+	// Try to use categoryA1 (belongs to budget A) as source for budget B.
 	payload := `{
 		"source_budget_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-		"source_section_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+		"source_category_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
 		"filter_mode": "all"
 	}`
 
@@ -711,7 +642,7 @@ func TestCreateLink_SectionMustBelongToSourceBudget(t *testing.T) {
 	resp, _ := app.Test(req)
 	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("wrong section for source: status = %d, want 404, body: %s", resp.StatusCode, string(body))
+		t.Errorf("wrong category for source: status = %d, want 404, body: %s", resp.StatusCode, string(body))
 	}
 }
 
@@ -745,9 +676,9 @@ func TestDBConstraint_DifferentBudgets(t *testing.T) {
 
 	// Attempt to insert a link where source == target directly via SQL.
 	_, err := database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $1, $2, 'all', $3)`,
-		budgetAID, sectionA1ID, ownerUserID)
+		budgetAID, categoryA1ID, ownerUserID)
 
 	if err == nil {
 		t.Error("expected DB constraint violation for same-budget link, got nil")
@@ -763,9 +694,9 @@ func TestDBConstraint_FilterMode(t *testing.T) {
 	seedLinkTestData(t)
 
 	_, err := database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'invalid', $4)`,
-		budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		budgetBID, budgetAID, categoryB1ID, ownerUserID)
 
 	if err == nil {
 		t.Error("expected DB constraint violation for invalid filter_mode, got nil")
@@ -782,18 +713,18 @@ func TestDBConstraint_UniqueLink(t *testing.T) {
 
 	// Insert first link.
 	_, err := database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'all', $4)`,
-		budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		budgetBID, budgetAID, categoryB1ID, ownerUserID)
 	if err != nil {
 		t.Fatalf("first link insert: %v", err)
 	}
 
 	// Duplicate should fail.
 	_, err = database.DB.Pool.Exec(nil,
-		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, filter_mode, created_by)
+		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'all', $4)`,
-		budgetBID, budgetAID, sectionB1ID, ownerUserID)
+		budgetBID, budgetAID, categoryB1ID, ownerUserID)
 	if err == nil {
 		t.Error("expected uniqueness violation for duplicate link, got nil")
 	}

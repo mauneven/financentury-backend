@@ -25,7 +25,6 @@ func seedCollabTestData(t *testing.T) {
 	// Clean up (dependency order).
 	pool.Exec(nil, "DELETE FROM budget_links")
 	pool.Exec(nil, "DELETE FROM budget_expenses")
-	pool.Exec(nil, "DELETE FROM budget_subcategories")
 	pool.Exec(nil, "DELETE FROM budget_categories")
 	pool.Exec(nil, "DELETE FROM budget_collaborators")
 	pool.Exec(nil, "DELETE FROM budget_invites")
@@ -174,22 +173,17 @@ func TestRemoveCollaborator_PreservesExpenseData(t *testing.T) {
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
 
-	// Create a section and category in budget A.
-	sectionID := uuid.New()
+	// Create a flat category in budget A.
 	categoryID := uuid.New()
 	pool.Exec(nil,
 		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
-		 VALUES ($1, $2, 'Test Section', 100, 'home', 1)`,
-		sectionID, budgetAID)
-	pool.Exec(nil,
-		`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order)
 		 VALUES ($1, $2, 'Test Cat', 100, 'tag', 1)`,
-		categoryID, sectionID)
+		categoryID, budgetAID)
 
 	// Collaborator creates an expense.
 	expenseID := uuid.New()
 	pool.Exec(nil,
-		`INSERT INTO budget_expenses (id, budget_id, subcategory_id, amount, description, expense_date, created_by)
+		`INSERT INTO budget_expenses (id, budget_id, category_id, amount, description, expense_date, created_by)
 		 VALUES ($1, $2, $3, 150.00, 'Collab expense', '2026-04-10', $4)`,
 		expenseID, budgetAID, categoryID, collabUserID)
 
@@ -217,10 +211,10 @@ func TestRemoveCollaborator_PreservesExpenseData(t *testing.T) {
 }
 
 // =====================================================================
-// Test: Collaborator cannot delete owner's sections
+// Test: Collaborator cannot delete owner's categories
 // =====================================================================
 
-func TestCollaborator_CannotDeleteOwnerSection(t *testing.T) {
+func TestCollaborator_CannotDeleteOwnerCategory(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedCollabTestData(t)
 
@@ -232,27 +226,27 @@ func TestCollaborator_CannotDeleteOwnerSection(t *testing.T) {
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
 
-	// Owner creates a section.
-	sectionID := uuid.New()
+	// Owner creates a category.
+	categoryID := uuid.New()
 	pool.Exec(nil,
 		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
-		 VALUES ($1, $2, 'Owner Section', 100, 'home', 1)`,
-		sectionID, budgetAID)
+		 VALUES ($1, $2, 'Owner Category', 100, 'home', 1)`,
+		categoryID, budgetAID)
 
-	// DeleteSection requires ownership, not just access.
-	app.Delete("/api/budgets/:id/sections/:sectionId", middleware.Protected(), DeleteSection)
+	// DeleteCategory requires ownership, not just access.
+	app.Delete("/api/budgets/:id/categories/:catId", middleware.Protected(), DeleteCategory)
 
-	// Collaborator tries to delete the section.
+	// Collaborator tries to delete the category.
 	token := tokenForUser(collabUserID, "collab@test.com")
 	req := httptest.NewRequest(http.MethodDelete,
-		"/api/budgets/"+budgetAID.String()+"/sections/"+sectionID.String(), nil)
+		"/api/budgets/"+budgetAID.String()+"/categories/"+categoryID.String(), nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, _ := app.Test(req)
-	// DeleteSection uses verifyBudgetOwnership — collab should get 404 (not owner).
+	// DeleteCategory uses verifyBudgetOwnership — collab should get 404 (not owner).
 	if resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("collab delete owner section: status = %d, want 404, body: %s", resp.StatusCode, string(body))
+		t.Errorf("collab delete owner category: status = %d, want 404, body: %s", resp.StatusCode, string(body))
 	}
 }
 

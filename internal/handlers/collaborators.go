@@ -25,56 +25,64 @@ func ListCollaborators(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
+	reqCtx := c.Context()
 
-	// Fetch the budget to get the owner user_id.
-	budgetQuery := database.NewFilter().
-		Select("user_id").
-		Eq("id", budgetID.String()).
-		Build()
+	// Fetch budget owner + collaborators in a single round-trip. The old path
+	// used verifyBudgetAccess + budget GET + collab GET = three DB hits.
+	var ownerID uuid.UUID
+	var collaborators []models.Collaborator
 
-	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
-	if budgetErr != nil || budgetStatus != http.StatusOK {
-		return errInternal(c, "failed to fetch budget")
-	}
-
-	var budgetRows []struct {
-		UserID string `json:"user_id"`
-	}
-	if err := json.Unmarshal(budgetBody, &budgetRows); err != nil || len(budgetRows) == 0 {
-		return errNotFound(c, "budget not found")
-	}
-
-	ownerID := budgetRows[0].UserID
-
-	query := database.NewFilter().
-		Select("*").
-		Eq("budget_id", budgetID.String()).
-		Order("added_at", "asc").
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_collaborators", query)
-	if err != nil || statusCode != http.StatusOK {
+	rows, err := database.DB.Pool.Query(reqCtx, `
+		SELECT 'owner' AS src, b.user_id AS user_id, NULL::uuid AS collab_id, NULL::text AS added_at, NULL::text AS role
+		FROM budgets b
+		WHERE b.id = $1
+		  AND (b.user_id = $2 OR EXISTS (
+		    SELECT 1 FROM budget_collaborators c WHERE c.budget_id = b.id AND c.user_id = $2
+		  ))
+		UNION ALL
+		SELECT 'collab' AS src, c.user_id, c.id, c.added_at::text, c.role
+		FROM budget_collaborators c
+		WHERE c.budget_id = $1
+		ORDER BY src DESC, added_at ASC NULLS FIRST
+	`, budgetID, userID)
+	if err != nil {
 		return errInternal(c, "failed to fetch collaborators")
 	}
+	defer rows.Close()
 
-	var collaborators []models.Collaborator
-	if err := json.Unmarshal(body, &collaborators); err != nil {
-		return errInternal(c, "failed to parse collaborators")
+	for rows.Next() {
+		var src string
+		var rowUserID uuid.UUID
+		var collabID *uuid.UUID
+		var addedAt *string
+		var role *string
+		if err := rows.Scan(&src, &rowUserID, &collabID, &addedAt, &role); err != nil {
+			continue
+		}
+		if src == "owner" {
+			ownerID = rowUserID
+		} else {
+			c := models.Collaborator{
+				BudgetID: budgetID,
+				UserID:   rowUserID,
+				Role:     derefString(role),
+				AddedAt:  derefString(addedAt),
+			}
+			if collabID != nil {
+				c.ID = *collabID
+			}
+			collaborators = append(collaborators, c)
+		}
+	}
+	if ownerID == uuid.Nil {
+		return errNotFound(c, "budget not found")
 	}
 
-	if collaborators == nil {
-		collaborators = make([]models.Collaborator, 0)
-	}
-
-	// Prepend the budget owner as a synthetic collaborator entry.
-	ownerUUID, _ := uuid.Parse(ownerID)
+	// Prepend owner as synthetic entry.
 	ownerEntry := models.Collaborator{
-		ID:       ownerUUID,
+		ID:       ownerID,
 		BudgetID: budgetID,
-		UserID:   ownerUUID,
+		UserID:   ownerID,
 		Role:     "owner",
 		AddedAt:  "",
 	}
@@ -93,7 +101,7 @@ func ListCollaborators(c *fiber.Ctx) error {
 		In("id", userIDs).
 		Build()
 
-	profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+	profileBody, profileStatus, profileErr := database.DB.GetCtx(reqCtx, "profiles", profileQuery)
 	if profileErr == nil && profileStatus == http.StatusOK {
 		var profiles []models.Profile
 		if err := json.Unmarshal(profileBody, &profiles); err == nil {
@@ -177,6 +185,9 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 		// Log but don't fail the request — collaborator removal succeeded.
 		// Links will be orphaned but won't cause data integrity issues.
 	}
+	// Invalidate every cached entry: we don't know which source budgets the
+	// removed collaborator had links on without another query.
+	invalidateLinkTargetsCacheAll()
 
 	broadcast(budgetID.String(), ws.MessageTypeCollabRemoved, map[string]string{
 		"user_id": targetUserID.String(),

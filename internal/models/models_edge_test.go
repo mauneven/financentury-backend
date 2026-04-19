@@ -340,17 +340,17 @@ func TestExpense_LargeDescription(t *testing.T) {
 	}
 }
 
-// ==================== Category with Zero-Value CategoryID ====================
+// ==================== Category with Zero-Value BudgetID ====================
 
-func TestCategory_ZeroValueCategoryID(t *testing.T) {
+func TestCategory_ZeroValueBudgetID(t *testing.T) {
 	cat := Category{
-		ID:                uuid.New(),
-		CategoryID:        uuid.Nil, // zero-value parent reference
-		Name:              "Orphan category",
-		AllocationPercent: 50,
-		Icon:              "home",
-		SortOrder:         1,
-		CreatedAt:         time.Now(),
+		ID:              uuid.New(),
+		BudgetID:        uuid.Nil,
+		Name:            "Orphan category",
+		AllocationValue: 50,
+		Icon:            "home",
+		SortOrder:       1,
+		CreatedAt:       time.Now(),
 	}
 
 	data, err := json.Marshal(cat)
@@ -363,27 +363,27 @@ func TestCategory_ZeroValueCategoryID(t *testing.T) {
 		t.Fatalf("unmarshal to map failed: %v", err)
 	}
 
-	// The category_id should be the zero UUID string, not omitted.
-	catIDStr, ok := m["category_id"].(string)
+	// The budget_id should be the zero UUID string, not omitted.
+	budgetIDStr, ok := m["budget_id"].(string)
 	if !ok {
-		t.Fatal("category_id should be present as a string in JSON")
+		t.Fatal("budget_id should be present as a string in JSON")
 	}
-	if catIDStr != uuid.Nil.String() {
-		t.Errorf("category_id = %q, want %q", catIDStr, uuid.Nil.String())
+	if budgetIDStr != uuid.Nil.String() {
+		t.Errorf("budget_id = %q, want %q", budgetIDStr, uuid.Nil.String())
 	}
 }
 
-// ==================== SummaryCategoryView section_id Mapping ====================
+// ==================== SummaryCategoryView Zero BudgetID ====================
 
-func TestSummaryCategoryView_NilUUID_SectionID(t *testing.T) {
+func TestSummaryCategoryView_NilUUID_BudgetID(t *testing.T) {
 	scv := SummaryCategoryView{
-		ID:                uuid.New(),
-		SectionID:         uuid.Nil,
-		Name:              "Test",
-		AllocationPercent: 50,
-		Icon:              "home",
-		SortOrder:         1,
-		CreatedAt:         time.Now(),
+		ID:              uuid.New(),
+		BudgetID:        uuid.Nil,
+		Name:            "Test",
+		AllocationValue: 50,
+		Icon:            "home",
+		SortOrder:       1,
+		CreatedAt:       time.Now(),
 	}
 
 	data, err := json.Marshal(scv)
@@ -396,13 +396,12 @@ func TestSummaryCategoryView_NilUUID_SectionID(t *testing.T) {
 		t.Fatalf("unmarshal to map failed: %v", err)
 	}
 
-	// section_id should be present even when it is the zero UUID.
-	sectionIDStr, ok := m["section_id"].(string)
+	budgetIDStr, ok := m["budget_id"].(string)
 	if !ok {
-		t.Fatal("section_id should be present")
+		t.Fatal("budget_id should be present")
 	}
-	if sectionIDStr != uuid.Nil.String() {
-		t.Errorf("section_id = %q, want %q", sectionIDStr, uuid.Nil.String())
+	if budgetIDStr != uuid.Nil.String() {
+		t.Errorf("budget_id = %q, want %q", budgetIDStr, uuid.Nil.String())
 	}
 }
 

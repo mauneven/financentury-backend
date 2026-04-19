@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -126,10 +127,8 @@ func resolveUserToday(c *fiber.Ctx) time.Time {
 // GetBudgetSummary computes and returns the full budget summary. All math is
 // done in Go; the database is used purely as storage via PostgREST.
 //
-// The endpoint issues three independent DB queries (sections, categories,
-// expenses) after the initial budget fetch. Sections and expenses run
-// concurrently via errgroup; categories must wait for section IDs but run
-// concurrently with expense aggregation.
+// The endpoint issues two independent DB queries (categories, expenses)
+// after the initial budget fetch, run concurrently via errgroup.
 func GetBudgetSummary(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -144,11 +143,12 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	// 1. Verify access and fetch budget in one step. verifyBudgetAccess
 	//    already hits the budgets table, so we combine the ownership/access
 	//    check with the budget fetch to eliminate a redundant round-trip.
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	reqCtx := c.Context()
+	if err := verifyBudgetAccessCtx(reqCtx, budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	budget, err := fetchBudget(budgetID)
+	budget, err := fetchBudgetCtx(reqCtx, budgetID)
 	if err != nil {
 		return errInternal(c, "failed to fetch budget")
 	}
@@ -156,10 +156,9 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	// 2. Fetch sections and expenses concurrently. These two queries are
-	//    independent -- both only need the budgetID (and periodStart for
-	//    expenses). Running them in parallel saves one full round-trip to
-	//    the database.
+	// 2. Fetch categories and expenses concurrently. Both only need the
+	//    budgetID (and periodStart for expenses). Running them in parallel
+	//    saves one full round-trip to the database.
 	//
 	//    For one-time budgets (billing_period_months == 0), skip billing period
 	//    calculation and include ALL expenses.
@@ -170,17 +169,17 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	userToday := resolveUserToday(c)
 
 	var (
-		sections []models.Section
-		expenses []models.Expense
+		categories []models.Category
+		expenses   []models.Expense
 	)
 
-	g, _ := errgroup.WithContext(c.Context())
+	g, gctx := errgroup.WithContext(reqCtx)
 
 	g.Go(func() error {
 		var fetchErr error
-		sections, fetchErr = fetchSections(budgetID)
+		categories, fetchErr = fetchCategoriesCtx(gctx, budgetID)
 		if fetchErr != nil {
-			return fmt.Errorf("fetch sections: %w", fetchErr)
+			return fmt.Errorf("fetch categories: %w", fetchErr)
 		}
 		return nil
 	})
@@ -190,10 +189,10 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		if budget.BillingPeriodMonths == 0 {
 			// One-time budget: all expenses count toward the total,
 			// without the 12-month retention cutoff.
-			expenses, fetchErr = fetchAllExpensesNoRetention(budgetID)
+			expenses, fetchErr = fetchAllExpensesNoRetentionCtx(gctx, budgetID)
 		} else {
 			periodStart := ComputeBillingPeriodStart(userToday, budget.BillingCutoffDay, budget.BillingPeriodMonths)
-			expenses, fetchErr = fetchExpensesForSummary(budgetID, periodStart)
+			expenses, fetchErr = fetchExpensesForSummaryCtx(gctx, budgetID, periodStart)
 		}
 		if fetchErr != nil {
 			return fmt.Errorf("fetch expenses: %w", fetchErr)
@@ -205,42 +204,21 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return errInternal(c, "failed to fetch summary data")
 	}
 
-	// 4. Fetch categories for all sections (needs section IDs from above).
-	sectionIDs := make([]string, len(sections))
-	for i, s := range sections {
-		sectionIDs[i] = s.ID.String()
-	}
-
-	var categories []models.Category
-	if len(sectionIDs) > 0 {
-		categories, err = fetchCategoriesForSections(sectionIDs)
-		if err != nil {
-			return errInternal(c, "failed to fetch categories")
-		}
-	}
-
-	// 5. Index categories by parent section ID. Pre-size the map to avoid
-	//    rehashing for budgets with many sections.
-	catsBySection := make(map[uuid.UUID][]models.Category, len(sections))
-	for _, cat := range categories {
-		catsBySection[cat.CategoryID] = append(catsBySection[cat.CategoryID], cat)
-	}
-
-	// 6. Aggregate expenses by category_id AND by user at each level.
+	// 3. Aggregate expenses by category_id AND by user at each level.
 	type expenseAgg struct {
 		totalSpent float64
 		count      int
 		byUser     map[uuid.UUID]float64
 	}
-	expBySubcat := make(map[uuid.UUID]*expenseAgg, len(categories))
+	expByCategory := make(map[uuid.UUID]*expenseAgg, len(categories))
 	budgetByUser := make(map[uuid.UUID]float64)
 	allUserIDs := make(map[uuid.UUID]struct{})
 
 	for _, exp := range expenses {
-		agg := expBySubcat[exp.CategoryID]
+		agg := expByCategory[exp.CategoryID]
 		if agg == nil {
 			agg = &expenseAgg{byUser: make(map[uuid.UUID]float64)}
-			expBySubcat[exp.CategoryID] = agg
+			expByCategory[exp.CategoryID] = agg
 		}
 		agg.totalSpent += exp.Amount
 		agg.count++
@@ -254,7 +232,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		}
 	}
 
-	// 6b. Batch-fetch profiles for all users who have expenses.
+	// 3b. Batch-fetch profiles for all users who have expenses.
 	//     Only do this when there are multiple spenders (shared budget).
 	profileMap := make(map[uuid.UUID]*models.Profile)
 	if len(allUserIDs) > 1 {
@@ -266,7 +244,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 			Select("id,email,full_name,created_at,updated_at").
 			In("id", userIDStrs).
 			Build()
-		profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+		profileBody, profileStatus, profileErr := database.DB.GetCtx(reqCtx, "profiles", profileQuery)
 		if profileErr == nil && profileStatus == http.StatusOK {
 			var profiles []models.Profile
 			if err := json.Unmarshal(profileBody, &profiles); err == nil {
@@ -303,7 +281,7 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 		return result
 	}
 
-	// 7. Build the response.
+	// 4. Build the response.
 	totalBudget := roundAmount(budget.MonthlyIncome)
 
 	var totalSpent float64
@@ -312,73 +290,77 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	}
 	totalSpent = roundAmount(totalSpent)
 
-	sectionSummaries := make([]models.SectionSummary, 0, len(sections))
-	for _, section := range sections {
-		sectionAllocated := roundAmount(section.AllocationValue)
+	categorySummaries := make([]models.CategorySummary, 0, len(categories))
+	for _, cat := range categories {
+		catAllocated := roundAmount(cat.AllocationValue)
 
-		cats := catsBySection[section.ID]
-		catSummaries := make([]models.CategorySummary, 0, len(cats))
-		var sectionSpent float64
-		sectionByUser := make(map[uuid.UUID]float64)
-
-		for _, cat := range cats {
-			catAllocated := roundAmount(cat.AllocationValue)
-
-			var catSpent float64
-			var catCount int
-			var catUserSpending []models.UserSpending
-			if agg, ok := expBySubcat[cat.ID]; ok {
-				catSpent = roundAmount(agg.totalSpent)
-				catCount = agg.count
-				catUserSpending = buildUserSpending(agg.byUser)
-				// Roll up to section level.
-				for uid, amt := range agg.byUser {
-					sectionByUser[uid] += amt
-				}
-			}
-			sectionSpent += catSpent
-
-			catSummaries = append(catSummaries, models.CategorySummary{
-				Category: models.SummaryCategoryView{
-					ID:                cat.ID,
-					SectionID:         cat.CategoryID,
-					Name:              cat.Name,
-					AllocationValue: cat.AllocationValue,
-					Icon:              cat.Icon,
-					SortOrder:         cat.SortOrder,
-					CreatedAt:         cat.CreatedAt,
-				},
-				AllocatedAmount: catAllocated,
-				TotalSpent:      catSpent,
-				ExpenseCount:    catCount,
-				SpendingByUser:  catUserSpending,
-			})
+		var catSpent float64
+		var catCount int
+		var catUserSpending []models.UserSpending
+		if agg, ok := expByCategory[cat.ID]; ok {
+			catSpent = roundAmount(agg.totalSpent)
+			catCount = agg.count
+			catUserSpending = buildUserSpending(agg.byUser)
 		}
 
-		sectionSpent = roundAmount(sectionSpent)
-
-		sectionSummaries = append(sectionSummaries, models.SectionSummary{
-			Section:         section,
-			Categories:      catSummaries,
-			AllocatedAmount: sectionAllocated,
-			TotalSpent:      sectionSpent,
-			SpendingByUser:  buildUserSpending(sectionByUser),
+		categorySummaries = append(categorySummaries, models.CategorySummary{
+			Category: models.SummaryCategoryView{
+				ID:              cat.ID,
+				BudgetID:        cat.BudgetID,
+				Name:            cat.Name,
+				AllocationValue: cat.AllocationValue,
+				Icon:            cat.Icon,
+				SortOrder:       cat.SortOrder,
+				CreatedAt:       cat.CreatedAt,
+			},
+			AllocatedAmount: catAllocated,
+			TotalSpent:      catSpent,
+			ExpenseCount:    catCount,
+			SpendingByUser:  catUserSpending,
 		})
 	}
 
-	// 8. Fetch and aggregate linked sections from other budgets.
-	linkedSummaries := buildLinkedSections(budgetID, userID, userToday, profileMap, buildUserSpending)
+	// 5. Fetch and aggregate linked categories from other budgets. The helper
+	//    folds per-user spending from linked categories into budgetByUser so
+	//    the budget-level SpendingByUser stays consistent with totalSpent.
+	//    We must also refresh profileMap to include any collaborators from
+	//    source budgets who appear only through linked expenses.
+	linkedSummaries := buildLinkedCategories(c.Context(), budgetID, userID, userToday, profileMap, buildUserSpending, budgetByUser)
 	for _, ls := range linkedSummaries {
-		totalSpent = roundAmount(totalSpent + ls.TotalSpent)
+		totalSpent = roundAmount(totalSpent + ls.Category.TotalSpent)
+	}
+
+	// After linked categories possibly added new user IDs to budgetByUser,
+	// ensure we have their profiles for display. Cheap no-op when empty.
+	missingUserIDs := make([]string, 0)
+	for uid := range budgetByUser {
+		if _, have := profileMap[uid]; !have {
+			missingUserIDs = append(missingUserIDs, uid.String())
+		}
+	}
+	if len(missingUserIDs) > 0 {
+		profileQuery := database.NewFilter().
+			Select("id,email,full_name,created_at,updated_at").
+			In("id", missingUserIDs).
+			Build()
+		profileBody, profileStatus, profileErr := database.DB.GetCtx(reqCtx, "profiles", profileQuery)
+		if profileErr == nil && profileStatus == http.StatusOK {
+			var profiles []models.Profile
+			if err := json.Unmarshal(profileBody, &profiles); err == nil {
+				for i := range profiles {
+					profileMap[profiles[i].ID] = &profiles[i]
+				}
+			}
+		}
 	}
 
 	resp := models.BudgetSummary{
-		Budget:         *budget,
-		Sections:       sectionSummaries,
-		LinkedSections: linkedSummaries,
-		TotalBudget:    totalBudget,
-		TotalSpent:     totalSpent,
-		SpendingByUser: buildUserSpending(budgetByUser),
+		Budget:           *budget,
+		Categories:       categorySummaries,
+		LinkedCategories: linkedSummaries,
+		TotalBudget:      totalBudget,
+		TotalSpent:       totalSpent,
+		SpendingByUser:   buildUserSpending(budgetByUser),
 	}
 
 	return c.JSON(resp)
@@ -386,12 +368,11 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 
 // ---------- GetBudgetTrends ----------
 
-// GetBudgetTrends returns daily spending data grouped by section. All
+// GetBudgetTrends returns daily spending data grouped by category. All
 // computation is done in Go; the database is used purely as storage.
 //
-// Sections, categories, and expenses are fetched with maximum concurrency:
-// sections and expenses run in parallel, then categories are fetched once
-// section IDs are known.
+// Categories and expenses are fetched with maximum concurrency — they are
+// independent and run in parallel.
 func GetBudgetTrends(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -403,23 +384,33 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	reqCtx := c.Context()
+	if err := verifyBudgetAccessCtx(reqCtx, budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	// Fetch sections and all expenses concurrently -- they are independent.
+	// Fetch the budget itself first so we know whether this is a one-time
+	// budget (BillingPeriodMonths == 0), which changes the expense-retention
+	// semantics: for one-time budgets EVERY expense counts toward the trend,
+	// regardless of age, matching the summary endpoint's behavior.
+	budget, err := fetchBudgetCtx(reqCtx, budgetID)
+	if err != nil || budget == nil {
+		return errNotFound(c, "budget not found")
+	}
+
+	// Fetch categories and all expenses concurrently — they are independent.
 	var (
-		sections    []models.Section
+		categories  []models.Category
 		allExpenses []models.Expense
 	)
 
-	g, _ := errgroup.WithContext(c.Context())
+	g, gctx := errgroup.WithContext(reqCtx)
 
 	g.Go(func() error {
 		var fetchErr error
-		sections, fetchErr = fetchSections(budgetID)
+		categories, fetchErr = fetchCategoriesCtx(gctx, budgetID)
 		if fetchErr != nil {
-			return fmt.Errorf("fetch sections: %w", fetchErr)
+			return fmt.Errorf("fetch categories: %w", fetchErr)
 		}
 		return nil
 	})
@@ -427,7 +418,14 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 	g.Go(func() error {
 		var fetchErr error
 		// For trends we only need category_id, amount, and expense_date.
-		allExpenses, fetchErr = fetchExpensesForTrends(budgetID)
+		// One-time budgets are not bounded by the 12-month retention cutoff:
+		// their lifetime IS the single billing period, so the full history
+		// is required to produce meaningful monthly trends.
+		if budget.BillingPeriodMonths == 0 {
+			allExpenses, fetchErr = fetchExpensesForTrendsNoRetentionCtx(gctx, budgetID)
+		} else {
+			allExpenses, fetchErr = fetchExpensesForTrendsCtx(gctx, budgetID)
+		}
 		if fetchErr != nil {
 			return fmt.Errorf("fetch expenses: %w", fetchErr)
 		}
@@ -438,45 +436,20 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		return errInternal(c, "failed to fetch trends data")
 	}
 
-	// Build section ID list and fetch categories (depends on sections).
-	sectionIDs := make([]string, len(sections))
-	for i, s := range sections {
-		sectionIDs[i] = s.ID.String()
-	}
-
-	var categories []models.Category
-	if len(sectionIDs) > 0 {
-		var err error
-		categories, err = fetchCategoriesForSections(sectionIDs)
-		if err != nil {
-			return errInternal(c, "failed to fetch categories")
-		}
-	}
-
-	// Map category -> parent section.
-	subcatToSection := make(map[uuid.UUID]uuid.UUID, len(categories))
-	for _, cat := range categories {
-		subcatToSection[cat.ID] = cat.CategoryID
-	}
-
-	// Aggregate: section -> date -> total_spent.
-	sectionDailyMap := make(map[uuid.UUID]map[string]float64, len(sections))
+	// Aggregate: category -> date -> total_spent.
+	categoryDailyMap := make(map[uuid.UUID]map[string]float64, len(categories))
 	for _, exp := range allExpenses {
-		sectionID, ok := subcatToSection[exp.CategoryID]
-		if !ok {
-			continue
-		}
-		if sectionDailyMap[sectionID] == nil {
-			sectionDailyMap[sectionID] = make(map[string]float64)
+		if categoryDailyMap[exp.CategoryID] == nil {
+			categoryDailyMap[exp.CategoryID] = make(map[string]float64)
 		}
 		// Use expense_date directly (already YYYY-MM-DD string).
-		sectionDailyMap[sectionID][exp.ExpenseDate] += exp.Amount
+		categoryDailyMap[exp.CategoryID][exp.ExpenseDate] += exp.Amount
 	}
 
-	// Build response preserving section sort order.
-	sectionTrends := make([]models.SectionTrend, 0, len(sections))
-	for _, section := range sections {
-		dailyMap := sectionDailyMap[section.ID]
+	// Build response preserving category sort order.
+	categoryTrends := make([]models.CategoryTrend, 0, len(categories))
+	for _, cat := range categories {
+		dailyMap := categoryDailyMap[cat.ID]
 		months := make([]models.MonthlyTrend, 0, len(dailyMap))
 		for date, spent := range dailyMap {
 			months = append(months, models.MonthlyTrend{
@@ -487,16 +460,16 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		// Sort months chronologically.
 		sortMonthlyTrends(months)
 
-		sectionTrends = append(sectionTrends, models.SectionTrend{
-			SectionID:   section.ID,
-			SectionName: section.Name,
-			Months:      months,
+		categoryTrends = append(categoryTrends, models.CategoryTrend{
+			CategoryID:   cat.ID,
+			CategoryName: cat.Name,
+			Months:       months,
 		})
 	}
 
 	resp := models.TrendsResponse{
-		BudgetID: budgetID,
-		Sections: sectionTrends,
+		BudgetID:   budgetID,
+		Categories: categoryTrends,
 	}
 
 	return c.JSON(resp)
@@ -532,11 +505,12 @@ func GetBudgetResume(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	reqCtx := c.Context()
+	if err := verifyBudgetAccessCtx(reqCtx, budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
-	budget, err := fetchBudget(budgetID)
+	budget, err := fetchBudgetCtx(reqCtx, budgetID)
 	if err != nil || budget == nil {
 		return errInternal(c, "failed to fetch budget")
 	}
@@ -545,7 +519,7 @@ func GetBudgetResume(c *fiber.Ctx) error {
 
 	// One-time budgets: single period from creation to now.
 	if budget.BillingPeriodMonths == 0 {
-		allExpenses, err := fetchAllExpensesNoRetention(budgetID)
+		allExpenses, err := fetchAllExpensesNoRetentionCtx(reqCtx, budgetID)
 		if err != nil {
 			return errInternal(c, "failed to fetch expenses")
 		}
@@ -579,7 +553,11 @@ func GetBudgetResume(c *fiber.Ctx) error {
 	// Recurring budget: completed periods going back up to 12 months.
 	periodMonths := budget.BillingPeriodMonths
 	cutoffDay := budget.BillingCutoffDay
-	income := budget.MonthlyIncome
+	// Income reported per period scales with the number of months in the
+	// billing cycle: a 3-month budget accrues 3 * monthly_income over the
+	// period, not just one month's worth. Without this scaling the Balance
+	// (income - spent) is wildly negative for 3/6/12-month budgets.
+	income := budget.MonthlyIncome * float64(periodMonths)
 
 	// Current period start — still in progress, skip it.
 	currentStart := ComputeBillingPeriodStart(userToday, cutoffDay, periodMonths)
@@ -617,7 +595,7 @@ func GetBudgetResume(c *fiber.Ctx) error {
 	}
 
 	oldestStart := periods[len(periods)-1].start
-	allExpenses, err := fetchExpensesInDateRange(budgetID, oldestStart, currentStart)
+	allExpenses, err := fetchExpensesInDateRangeCtx(reqCtx, budgetID, oldestStart, currentStart)
 	if err != nil {
 		return errInternal(c, "failed to fetch expenses")
 	}
@@ -665,125 +643,178 @@ func GetBudgetResume(c *fiber.Ctx) error {
 	})
 }
 
-// ---------- Linked sections helper ----------
+// ---------- Linked categories helper ----------
 
-// buildLinkedSections fetches and aggregates linked sections for a target budget.
-// It reuses the same fetchSections/fetchCategoriesForSections/fetch*Expenses helpers.
-func buildLinkedSections(
+// buildLinkedCategories fetches and aggregates linked categories for a target
+// budget. Batches all lookups (links, source budgets, categories, expenses)
+// to avoid the N+1 pattern where each link fired 3–4 independent queries.
+// buildLinkedCategories returns the per-link summaries AND writes raw per-user
+// spending across all linked categories into budgetByUser (so the caller's
+// budget-level SpendingByUser total matches TotalSpent which also includes
+// linked spending). budgetByUser may be nil, in which case aggregation is
+// skipped.
+func buildLinkedCategories(
+	ctx context.Context,
 	targetBudgetID, userID uuid.UUID,
 	userToday time.Time,
 	profileMap map[uuid.UUID]*models.Profile,
 	buildUserSpending func(map[uuid.UUID]float64) []models.UserSpending,
-) []models.LinkedSectionSummary {
+	budgetByUser map[uuid.UUID]float64,
+) []models.LinkedCategorySummary {
 	if database.DB == nil || database.DB.Pool == nil {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// Fetch all links for this target budget.
+	// Step 1: Fetch all links for this target budget.
 	rows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, source_budget_id, target_budget_id, source_section_id,
-		       source_category_id, target_section_id, filter_mode, created_by, created_at
+		SELECT id, source_budget_id, target_budget_id, source_category_id,
+		       filter_mode, created_by, created_at
 		FROM budget_links WHERE target_budget_id = $1
 	`, targetBudgetID)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
-
 	var links []models.BudgetLink
 	for rows.Next() {
 		var l models.BudgetLink
 		if err := rows.Scan(&l.ID, &l.SourceBudgetID, &l.TargetBudgetID,
-			&l.SourceSectionID, &l.SourceCategoryID, &l.TargetSectionID,
-			&l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
+			&l.SourceCategoryID, &l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
 			continue
 		}
 		links = append(links, l)
 	}
+	rows.Close()
 	if len(links) == 0 {
 		return nil
 	}
 
-	// Group links by source budget and cache fetched budgets.
-	budgetCache := make(map[uuid.UUID]*models.Budget)
-	result := make([]models.LinkedSectionSummary, 0, len(links))
+	// Step 2: Collect unique source budget IDs and source category IDs.
+	srcBudgetIDSet := make(map[uuid.UUID]struct{}, len(links))
+	srcCategoryIDSet := make(map[uuid.UUID]struct{}, len(links))
+	for _, l := range links {
+		srcBudgetIDSet[l.SourceBudgetID] = struct{}{}
+		srcCategoryIDSet[l.SourceCategoryID] = struct{}{}
+	}
+	srcBudgetIDs := make([]uuid.UUID, 0, len(srcBudgetIDSet))
+	for id := range srcBudgetIDSet {
+		srcBudgetIDs = append(srcBudgetIDs, id)
+	}
+	srcCategoryIDs := make([]uuid.UUID, 0, len(srcCategoryIDSet))
+	for id := range srcCategoryIDSet {
+		srcCategoryIDs = append(srcCategoryIDs, id)
+	}
 
-	for _, link := range links {
-		// Fetch source budget (cached).
-		srcBudget, ok := budgetCache[link.SourceBudgetID]
-		if !ok {
-			fetched, fetchErr := fetchBudget(link.SourceBudgetID)
-			if fetchErr != nil || fetched == nil {
+	// Step 3: Batch-fetch source budgets and the referenced categories
+	// concurrently.
+	budgetCache := make(map[uuid.UUID]*models.Budget, len(srcBudgetIDs))
+	categoryMap := make(map[uuid.UUID]*models.Category, len(srcCategoryIDs))
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		bRows, err := database.DB.Pool.Query(gctx, `
+			SELECT id, user_id, name, icon, monthly_income, currency,
+			       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+			FROM budgets WHERE id = ANY($1)
+		`, srcBudgetIDs)
+		if err != nil {
+			return err
+		}
+		defer bRows.Close()
+		for bRows.Next() {
+			var b models.Budget
+			if err := bRows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
+				&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+				&b.CreatedAt, &b.UpdatedAt); err != nil {
 				continue
 			}
-			budgetCache[link.SourceBudgetID] = fetched
-			srcBudget = fetched
+			budgetCpy := b
+			budgetCache[b.ID] = &budgetCpy
 		}
+		return nil
+	})
 
-		// Fetch the linked section.
-		allSections, err := fetchSections(link.SourceBudgetID)
+	g.Go(func() error {
+		cRows, err := database.DB.Pool.Query(gctx, `
+			SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
+			FROM budget_categories WHERE id = ANY($1)
+		`, srcCategoryIDs)
 		if err != nil {
-			continue
+			return err
 		}
-		var section *models.Section
-		for i := range allSections {
-			if allSections[i].ID == link.SourceSectionID {
-				section = &allSections[i]
-				break
+		defer cRows.Close()
+		for cRows.Next() {
+			var cat models.Category
+			if err := cRows.Scan(&cat.ID, &cat.BudgetID, &cat.Name,
+				&cat.AllocationValue, &cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
+				continue
 			}
+			catCpy := cat
+			categoryMap[cat.ID] = &catCpy
 		}
-		if section == nil {
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return nil
+	}
+
+	// Step 4: Fetch expenses for each unique source budget — each budget has
+	// its own billing period start so the date filter differs. Run all
+	// expense queries concurrently.
+	expensesByBudget := make(map[uuid.UUID][]models.Expense, len(srcBudgetIDs))
+	var expMu sync.Mutex
+	eg, egctx := errgroup.WithContext(ctx)
+	for _, bid := range srcBudgetIDs {
+		bid := bid
+		srcBudget, ok := budgetCache[bid]
+		if !ok {
 			continue
 		}
-
-		// Fetch categories for this section.
-		cats, err := fetchCategoriesForSections([]string{section.ID.String()})
-		if err != nil {
-			continue
-		}
-
-		// If single-category link, filter to only that category.
-		if link.SourceCategoryID != nil {
-			filtered := make([]models.Category, 0, 1)
-			for _, c := range cats {
-				if c.ID == *link.SourceCategoryID {
-					filtered = append(filtered, c)
-					break
-				}
+		eg.Go(func() error {
+			var exps []models.Expense
+			var err error
+			if srcBudget.BillingPeriodMonths == 0 {
+				exps, err = fetchAllExpensesNoRetentionCtx(egctx, bid)
+			} else {
+				periodStart := ComputeBillingPeriodStart(userToday, srcBudget.BillingCutoffDay, srcBudget.BillingPeriodMonths)
+				exps, err = fetchExpensesForSummaryCtx(egctx, bid, periodStart)
 			}
-			cats = filtered
+			if err != nil {
+				return nil // best-effort: skip failed budgets
+			}
+			expMu.Lock()
+			expensesByBudget[bid] = exps
+			expMu.Unlock()
+			return nil
+		})
+	}
+	_ = eg.Wait()
+
+	// Step 5: Build per-link summaries from the cached data.
+	result := make([]models.LinkedCategorySummary, 0, len(links))
+	for _, link := range links {
+		srcBudget, ok := budgetCache[link.SourceBudgetID]
+		if !ok {
+			continue
+		}
+		cat, ok := categoryMap[link.SourceCategoryID]
+		if !ok {
+			continue
 		}
 
-		// Fetch expenses for the source budget's current billing period.
-		var expenses []models.Expense
-		if srcBudget.BillingPeriodMonths == 0 {
-			expenses, _ = fetchAllExpensesNoRetention(link.SourceBudgetID)
-		} else {
-			periodStart := ComputeBillingPeriodStart(userToday, srcBudget.BillingCutoffDay, srcBudget.BillingPeriodMonths)
-			expenses, _ = fetchExpensesForSummary(link.SourceBudgetID, periodStart)
-		}
+		expenses := expensesByBudget[link.SourceBudgetID]
 
-		// Build a set of category IDs in this link.
-		catIDSet := make(map[uuid.UUID]bool, len(cats))
-		for _, c := range cats {
-			catIDSet[c.ID] = true
-		}
-
-		// Filter expenses to linked categories + apply filter_mode.
-		type expAgg struct {
-			totalSpent float64
-			count      int
-			byUser     map[uuid.UUID]float64
-		}
-		expBySubcat := make(map[uuid.UUID]*expAgg, len(cats))
-		var linkTotalSpent float64
-		linkByUser := make(map[uuid.UUID]float64)
+		// Filter expenses to this linked category + apply filter_mode.
+		var catTotalSpent float64
+		var catCount int
+		catByUser := make(map[uuid.UUID]float64)
 
 		for _, exp := range expenses {
-			if !catIDSet[exp.CategoryID] {
+			if exp.CategoryID != link.SourceCategoryID {
 				continue
 			}
 			// Apply filter mode.
@@ -791,58 +822,41 @@ func buildLinkedSections(
 				continue
 			}
 
-			agg := expBySubcat[exp.CategoryID]
-			if agg == nil {
-				agg = &expAgg{byUser: make(map[uuid.UUID]float64)}
-				expBySubcat[exp.CategoryID] = agg
-			}
-			agg.totalSpent += exp.Amount
-			agg.count++
-			linkTotalSpent += exp.Amount
+			catTotalSpent += exp.Amount
+			catCount++
 
 			if exp.CreatedBy != nil {
 				uid := *exp.CreatedBy
-				agg.byUser[uid] += exp.Amount
-				linkByUser[uid] += exp.Amount
+				catByUser[uid] += exp.Amount
+				// Roll raw per-user spending into the budget-level map so the
+				// top-level SpendingByUser sum matches TotalSpent (which
+				// already folds in each link's TotalSpent).
+				if budgetByUser != nil {
+					budgetByUser[uid] += exp.Amount
+				}
 			}
 		}
 
-		// Build category summaries.
-		catSummaries := make([]models.CategorySummary, 0, len(cats))
-		for _, cat := range cats {
-			catAllocated := roundAmount(cat.AllocationValue)
-			var catSpent float64
-			var catCount int
-			var catUserSpending []models.UserSpending
-			if agg, ok := expBySubcat[cat.ID]; ok {
-				catSpent = roundAmount(agg.totalSpent)
-				catCount = agg.count
-				catUserSpending = buildUserSpending(agg.byUser)
-			}
-			catSummaries = append(catSummaries, models.CategorySummary{
-				Category: models.SummaryCategoryView{
-					ID:                cat.ID,
-					SectionID:         cat.CategoryID,
-					Name:              cat.Name,
-					AllocationValue: cat.AllocationValue,
-					Icon:              cat.Icon,
-					SortOrder:         cat.SortOrder,
-					CreatedAt:         cat.CreatedAt,
-				},
-				AllocatedAmount: catAllocated,
-				TotalSpent:      catSpent,
-				ExpenseCount:    catCount,
-				SpendingByUser:  catUserSpending,
-			})
+		catSummary := models.CategorySummary{
+			Category: models.SummaryCategoryView{
+				ID:              cat.ID,
+				BudgetID:        cat.BudgetID,
+				Name:            cat.Name,
+				AllocationValue: cat.AllocationValue,
+				Icon:            cat.Icon,
+				SortOrder:       cat.SortOrder,
+				CreatedAt:       cat.CreatedAt,
+			},
+			AllocatedAmount: roundAmount(cat.AllocationValue),
+			TotalSpent:      roundAmount(catTotalSpent),
+			ExpenseCount:    catCount,
+			SpendingByUser:  buildUserSpending(catByUser),
 		}
 
-		result = append(result, models.LinkedSectionSummary{
-			Link:           link,
-			SourceBudget:   *srcBudget,
-			Section:        *section,
-			Categories:     catSummaries,
-			TotalSpent:     roundAmount(linkTotalSpent),
-			SpendingByUser: buildUserSpending(linkByUser),
+		result = append(result, models.LinkedCategorySummary{
+			Link:         link,
+			SourceBudget: *srcBudget,
+			Category:     catSummary,
 		})
 	}
 
@@ -853,12 +867,17 @@ func buildLinkedSections(
 
 // fetchBudget loads a single budget by ID. Returns nil if not found.
 func fetchBudget(budgetID uuid.UUID) (*models.Budget, error) {
+	return fetchBudgetCtx(context.Background(), budgetID)
+}
+
+// fetchBudgetCtx is the context-aware variant of fetchBudget.
+func fetchBudgetCtx(ctx context.Context, budgetID uuid.UUID) (*models.Budget, error) {
 	query := database.NewFilter().
 		Select("*").
 		Eq("id", budgetID.String()).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budgets", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budgets", query)
 	if err != nil {
 		return nil, err
 	}
@@ -876,39 +895,20 @@ func fetchBudget(budgetID uuid.UUID) (*models.Budget, error) {
 	return &budgets[0], nil
 }
 
-// fetchSections loads all sections for a budget, ordered by sort_order.
-func fetchSections(budgetID uuid.UUID) ([]models.Section, error) {
+// fetchCategories loads all categories for a budget, ordered by sort_order.
+func fetchCategories(budgetID uuid.UUID) ([]models.Category, error) {
+	return fetchCategoriesCtx(context.Background(), budgetID)
+}
+
+// fetchCategoriesCtx is the context-aware variant of fetchCategories.
+func fetchCategoriesCtx(ctx context.Context, budgetID uuid.UUID) ([]models.Category, error) {
 	query := database.NewFilter().
 		Select("*").
 		Eq("budget_id", budgetID.String()).
 		Order("sort_order", "asc").
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_categories", query)
-	if err != nil {
-		return nil, err
-	}
-	if statusCode != http.StatusOK {
-		return nil, nil
-	}
-
-	var sections []models.Section
-	if err := json.Unmarshal(body, &sections); err != nil {
-		return nil, err
-	}
-	return sections, nil
-}
-
-// fetchCategoriesForSections loads all categories whose parent section ID is
-// in the provided list, ordered by sort_order.
-func fetchCategoriesForSections(sectionIDs []string) ([]models.Category, error) {
-	query := database.NewFilter().
-		Select("*").
-		In("category_id", sectionIDs).
-		Order("sort_order", "asc").
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_subcategories", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_categories", query)
 	if err != nil {
 		return nil, err
 	}
@@ -976,7 +976,7 @@ func fetchAllExpenses(budgetID uuid.UUID) ([]models.Expense, error) {
 // (12 months). Used for recurring budgets.
 func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount,created_by").
+		Select("category_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", expenseRetentionCutoff()).
 		Build()
@@ -1001,12 +1001,18 @@ func fetchAllExpensesForSummary(budgetID uuid.UUID) ([]models.Expense, error) {
 // 12-month retention cutoff. Used for one-time budgets where every expense
 // counts toward the total regardless of age.
 func fetchAllExpensesNoRetention(budgetID uuid.UUID) ([]models.Expense, error) {
+	return fetchAllExpensesNoRetentionCtx(context.Background(), budgetID)
+}
+
+// fetchAllExpensesNoRetentionCtx is the context-aware variant of
+// fetchAllExpensesNoRetention.
+func fetchAllExpensesNoRetentionCtx(ctx context.Context, budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount,created_by").
+		Select("category_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_expenses", query)
 	if err != nil {
 		return nil, err
 	}
@@ -1025,13 +1031,18 @@ func fetchAllExpensesNoRetention(budgetID uuid.UUID) ([]models.Expense, error) {
 // aggregation (category_id, amount) within the current billing period.
 // Fetching fewer columns reduces data transfer for budgets with many expenses.
 func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]models.Expense, error) {
+	return fetchExpensesForSummaryCtx(context.Background(), budgetID, periodStart)
+}
+
+// fetchExpensesForSummaryCtx is the context-aware variant of fetchExpensesForSummary.
+func fetchExpensesForSummaryCtx(ctx context.Context, budgetID uuid.UUID, periodStart time.Time) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount,created_by").
+		Select("category_id,amount,created_by").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", periodStart.Format("2006-01-02")).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_expenses", query)
 	if err != nil {
 		return nil, err
 	}
@@ -1049,14 +1060,19 @@ func fetchExpensesForSummary(budgetID uuid.UUID, periodStart time.Time) ([]model
 // fetchExpensesInDateRange loads expenses for a budget where expense_date is
 // between start (inclusive) and end (exclusive).
 func fetchExpensesInDateRange(budgetID uuid.UUID, start, end time.Time) ([]models.Expense, error) {
+	return fetchExpensesInDateRangeCtx(context.Background(), budgetID, start, end)
+}
+
+// fetchExpensesInDateRangeCtx is the context-aware variant of fetchExpensesInDateRange.
+func fetchExpensesInDateRangeCtx(ctx context.Context, budgetID uuid.UUID, start, end time.Time) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount,expense_date").
+		Select("category_id,amount,expense_date").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", start.Format("2006-01-02")).
 		Lt("expense_date", end.Format("2006-01-02")).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_expenses", query)
 	if err != nil {
 		return nil, err
 	}
@@ -1075,13 +1091,44 @@ func fetchExpensesInDateRange(budgetID uuid.UUID, start, end time.Time) ([]model
 // (category_id, amount, expense_date) for all time. Ordering is unnecessary
 // since we aggregate by date in Go.
 func fetchExpensesForTrends(budgetID uuid.UUID) ([]models.Expense, error) {
+	return fetchExpensesForTrendsCtx(context.Background(), budgetID)
+}
+
+// fetchExpensesForTrendsCtx is the context-aware variant of fetchExpensesForTrends.
+func fetchExpensesForTrendsCtx(ctx context.Context, budgetID uuid.UUID) ([]models.Expense, error) {
 	query := database.NewFilter().
-		Select("subcategory_id,amount,expense_date").
+		Select("category_id,amount,expense_date").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", expenseRetentionCutoff()).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_expenses", query)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var expenses []models.Expense
+	if err := json.Unmarshal(body, &expenses); err != nil {
+		return nil, err
+	}
+	return expenses, nil
+}
+
+// fetchExpensesForTrendsNoRetentionCtx loads trends-aggregation columns
+// (category_id, amount, expense_date) for ALL expenses of a budget without
+// applying the 12-month retention cutoff. Used for one-time budgets, whose
+// lifetime may exceed 12 months and whose full expense history is
+// semantically part of the single billing "period".
+func fetchExpensesForTrendsNoRetentionCtx(ctx context.Context, budgetID uuid.UUID) ([]models.Expense, error) {
+	query := database.NewFilter().
+		Select("category_id,amount,expense_date").
+		Eq("budget_id", budgetID.String()).
+		Build()
+
+	body, statusCode, err := database.DB.GetCtx(ctx, "budget_expenses", query)
 	if err != nil {
 		return nil, err
 	}

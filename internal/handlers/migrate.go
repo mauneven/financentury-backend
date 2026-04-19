@@ -1,8 +1,8 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -14,10 +14,9 @@ import (
 
 // Migration limits to prevent abuse.
 const (
-	maxMigrateBudgets            = 20
-	maxMigrateSectionsPerBudget  = 100
-	maxMigrateCategoriesPerGroup = 100
-	maxMigrateExpensesPerBudget  = 10000
+	maxMigrateBudgets             = 20
+	maxMigrateCategoriesPerBudget = 50
+	maxMigrateExpensesPerBudget   = 10000
 )
 
 // --- Migration Request Types ---
@@ -27,37 +26,29 @@ type MigrateRequest struct {
 	Budgets []MigrateBudget `json:"budgets"`
 }
 
-// MigrateBudget represents a budget to migrate.
+// MigrateBudget represents a budget to migrate. In the flat-category model
+// sections do not exist; each budget has a flat list of categories.
 type MigrateBudget struct {
-	Name                string           `json:"name"`
-	MonthlyIncome       float64          `json:"monthly_income"`
-	Currency            string           `json:"currency"`
-	BillingPeriodMonths int              `json:"billing_period_months"`
-	Mode                string           `json:"mode"`
-	Sections            []MigrateSection `json:"sections"`
-	Expenses            []MigrateExpense `json:"expenses"`
+	Name                string            `json:"name"`
+	MonthlyIncome       float64           `json:"monthly_income"`
+	Currency            string            `json:"currency"`
+	BillingPeriodMonths int               `json:"billing_period_months"`
+	Mode                string            `json:"mode"`
+	Categories          []MigrateCategory `json:"categories"`
+	Expenses            []MigrateExpense  `json:"expenses"`
 }
 
-// MigrateSection represents a section to migrate.
-type MigrateSection struct {
-	Name              string            `json:"name"`
-	AllocationValue float64           `json:"allocation_value"`
-	Icon              string            `json:"icon"`
-	SortOrder         int               `json:"sort_order"`
-	LocalID           string            `json:"local_id"`
-	Categories        []MigrateCategory `json:"categories"`
-}
-
-// MigrateCategory represents a category to migrate.
+// MigrateCategory represents a flat category to migrate.
 type MigrateCategory struct {
-	Name              string  `json:"name"`
+	Name            string  `json:"name"`
 	AllocationValue float64 `json:"allocation_value"`
-	Icon              string  `json:"icon"`
-	SortOrder         int     `json:"sort_order"`
-	LocalID           string  `json:"local_id"`
+	Icon            string  `json:"icon"`
+	SortOrder       int     `json:"sort_order"`
+	LocalID         string  `json:"local_id"`
 }
 
-// MigrateExpense represents an expense to migrate.
+// MigrateExpense represents an expense to migrate. local_category_id references
+// a MigrateCategory.LocalID in the same budget.
 type MigrateExpense struct {
 	LocalCategoryID string  `json:"local_category_id"`
 	Amount          float64 `json:"amount"`
@@ -65,20 +56,12 @@ type MigrateExpense struct {
 	ExpenseDate     string  `json:"expense_date"`
 }
 
-// Migrate handles POST /api/migrate (protected). It imports budgets,
-// sections, categories, and expenses from client-side local data.
+// Migrate handles POST /api/migrate (protected). It imports budgets, flat
+// categories, and expenses from client-side local data.
 func Migrate(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
 		return errUnauthorized(c)
-	}
-
-	// Enforce per-user budget limit before creating any new budgets.
-	if err := enforceUserBudgetLimit(userID); err != nil {
-		if err.Error() == "limit" {
-			return c.Status(fiber.StatusConflict).JSON(models.ErrorResponse{Error: "budget limit reached (max 7)"})
-		}
-		return errInternal(c, "failed to check budget count")
 	}
 
 	var req MigrateRequest
@@ -93,9 +76,20 @@ func Migrate(c *fiber.Ctx) error {
 		return errBadRequest(c, fmt.Sprintf("too many budgets in migration (max %d)", maxMigrateBudgets))
 	}
 
+	// Security: enforce the per-user budget limit BEFORE each insertion.
+	// Previously the check ran once up-front, which allowed a user sitting
+	// below the cap to push the migration request for up to 20 budgets and
+	// blow past the maxBudgetsPerUser ceiling.
 	var createdBudgets []models.Budget
 
 	for _, mb := range req.Budgets {
+		if err := enforceUserBudgetLimit(userID); err != nil {
+			if err.Error() == "limit" {
+				return c.Status(fiber.StatusConflict).JSON(models.ErrorResponse{Error: "budget limit reached (max 7)"})
+			}
+			return errInternal(c, "failed to check budget count")
+		}
+
 		budget, err := migrateSingleBudget(userID, mb)
 		if err != nil {
 			// Return the error as-is (it's already a *fiber.Error or bad-request).
@@ -112,8 +106,8 @@ func Migrate(c *fiber.Ctx) error {
 	})
 }
 
-// migrateSingleBudget validates and creates a single budget with its sections,
-// categories, and expenses.
+// migrateSingleBudget validates and creates a single budget with its flat
+// categories and expenses.
 func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, error) {
 	now := time.Now().UTC()
 	budgetID := uuid.New()
@@ -136,8 +130,8 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 	if mb.MonthlyIncome > maxAmountValue {
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "monthly_income exceeds maximum allowed value")
 	}
-	if len(mb.Sections) > maxMigrateSectionsPerBudget {
-		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("too many sections per budget (max %d)", maxMigrateSectionsPerBudget))
+	if len(mb.Categories) > maxMigrateCategoriesPerBudget {
+		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("too many categories per budget (max %d)", maxMigrateCategoriesPerBudget))
 	}
 	if len(mb.Expenses) > maxMigrateExpensesPerBudget {
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("too many expenses per budget (max %d)", maxMigrateExpensesPerBudget))
@@ -160,121 +154,128 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 		return models.Budget{}, fiber.NewError(fiber.StatusBadRequest, "invalid currency code (must be 3 uppercase letters)")
 	}
 
-	// Create the budget.
-	budgetPayload := map[string]interface{}{
-		"id":                    budgetID.String(),
-		"user_id":               userID.String(),
-		"name":                  mb.Name,
-		"monthly_income":        mb.MonthlyIncome,
-		"currency":              mb.Currency,
-		"billing_period_months": mb.BillingPeriodMonths,
-		"mode":                  mb.Mode,
-		"created_at":            now.Format(time.RFC3339Nano),
-		"updated_at":            now.Format(time.RFC3339Nano),
-	}
-	budgetBytes, err := marshalJSON(budgetPayload)
-	if err != nil {
-		return models.Budget{}, fiber.ErrInternalServerError
-	}
-
-	_, statusCode, err := database.DB.Post("budgets", budgetBytes)
-	if err != nil || statusCode != http.StatusCreated {
-		return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create budget: %s", mb.Name))
-	}
-
-	// Build localID -> real UUID map for categories.
+	// Validate all categories and expenses up-front so we can bail out BEFORE
+	// opening the transaction.
 	catLocalIDMap := make(map[string]uuid.UUID)
-
-	for _, ms := range mb.Sections {
-		if err := validateMigrateSection(ms); err != nil {
+	type preparedCategory struct {
+		id  uuid.UUID
+		raw MigrateCategory
+	}
+	prepared := make([]preparedCategory, 0, len(mb.Categories))
+	for _, mc := range mb.Categories {
+		if err := validateMigrateCategory(mc); err != nil {
 			return models.Budget{}, err
 		}
-
-		sectionID := uuid.New()
-		sectionPayload := map[string]interface{}{
-			"id":                 sectionID.String(),
-			"budget_id":          budgetID.String(),
-			"name":               ms.Name,
-			"allocation_value": ms.AllocationValue,
-			"icon":               ms.Icon,
-			"sort_order":         ms.SortOrder,
-			"created_at":         now.Format(time.RFC3339Nano),
-		}
-		sectionBytes, err := marshalJSON(sectionPayload)
-		if err != nil {
-			return models.Budget{}, fiber.ErrInternalServerError
-		}
-
-		_, statusCode, err := database.DB.Post("budget_categories", sectionBytes)
-		if err != nil || statusCode != http.StatusCreated {
-			return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create section: %s", ms.Name))
-		}
-
-		for _, mc := range ms.Categories {
-			if err := validateMigrateCategory(mc); err != nil {
-				return models.Budget{}, err
-			}
-
-			catID := uuid.New()
-			if mc.LocalID != "" {
-				catLocalIDMap[mc.LocalID] = catID
-			}
-
-			catPayload := map[string]interface{}{
-				"id":                 catID.String(),
-				"category_id":        sectionID.String(),
-				"name":               mc.Name,
-				"allocation_value": mc.AllocationValue,
-				"icon":               mc.Icon,
-				"sort_order":         mc.SortOrder,
-				"created_at":         now.Format(time.RFC3339Nano),
-			}
-			catBytes, err := marshalJSON(catPayload)
-			if err != nil {
-				return models.Budget{}, fiber.ErrInternalServerError
-			}
-
-			_, statusCode, err := database.DB.Post("budget_subcategories", catBytes)
-			if err != nil || statusCode != http.StatusCreated {
-				return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create category: %s", mc.Name))
-			}
+		cat := preparedCategory{id: uuid.New(), raw: mc}
+		prepared = append(prepared, cat)
+		if mc.LocalID != "" {
+			catLocalIDMap[mc.LocalID] = cat.id
 		}
 	}
-
-	// Create expenses.
 	for _, me := range mb.Expenses {
 		if err := validateMigrateExpense(me); err != nil {
 			return models.Budget{}, err
 		}
+	}
 
+	// Single transaction with UNNEST-based batch inserts. Every table gets
+	// exactly one INSERT.
+	ctx := context.Background()
+	tx, err := database.DB.Pool.Begin(ctx)
+	if err != nil {
+		return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, "failed to start migration transaction")
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Budget row.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO budgets (id, user_id, name, monthly_income, currency,
+		                     billing_period_months, mode, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+	`, budgetID, userID, mb.Name, mb.MonthlyIncome, mb.Currency,
+		mb.BillingPeriodMonths, mb.Mode, now)
+	if err != nil {
+		return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create budget: %s", mb.Name))
+	}
+
+	// 2. Flat categories (one INSERT via UNNEST).
+	if len(prepared) > 0 {
+		cIDs := make([]uuid.UUID, len(prepared))
+		cNames := make([]string, len(prepared))
+		cAlloc := make([]float64, len(prepared))
+		cIcons := make([]string, len(prepared))
+		cOrders := make([]int, len(prepared))
+		for i, cat := range prepared {
+			cIDs[i] = cat.id
+			cNames[i] = cat.raw.Name
+			cAlloc[i] = cat.raw.AllocationValue
+			cIcons[i] = cat.raw.Icon
+			cOrders[i] = cat.raw.SortOrder
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
+			SELECT id, $1, name, allocation_value, icon, sort_order, $2
+			FROM unnest($3::uuid[], $4::text[], $5::numeric[], $6::text[], $7::int[])
+			   AS u(id, name, allocation_value, icon, sort_order)
+		`, budgetID, now, cIDs, cNames, cAlloc, cIcons, cOrders)
+		if err != nil {
+			return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, "failed to create categories")
+		}
+	}
+
+	// 3. Expenses (one INSERT via UNNEST; rows with unknown category are
+	// silently skipped, matching the previous behaviour).
+	type expenseRow struct {
+		id        uuid.UUID
+		catID     uuid.UUID
+		amount    float64
+		descr     string
+		expenseDt string
+	}
+	expRows := make([]expenseRow, 0, len(mb.Expenses))
+	for _, me := range mb.Expenses {
 		realCatID, ok := catLocalIDMap[me.LocalCategoryID]
 		if !ok {
-			continue // Skip unknown category references.
+			continue
 		}
-
 		expenseDate := me.ExpenseDate
 		if expenseDate == "" {
 			expenseDate = now.Format(dateFormat)
 		}
-
-		expPayload := map[string]interface{}{
-			"id":             uuid.New().String(),
-			"budget_id":      budgetID.String(),
-			"subcategory_id": realCatID.String(),
-			"amount":         me.Amount,
-			"description":    me.Description,
-			"expense_date":   expenseDate,
-			"created_at":     now.Format(time.RFC3339Nano),
+		expRows = append(expRows, expenseRow{
+			id:        uuid.New(),
+			catID:     realCatID,
+			amount:    me.Amount,
+			descr:     me.Description,
+			expenseDt: expenseDate,
+		})
+	}
+	if len(expRows) > 0 {
+		eIDs := make([]uuid.UUID, len(expRows))
+		eCats := make([]uuid.UUID, len(expRows))
+		eAmts := make([]float64, len(expRows))
+		eDescr := make([]string, len(expRows))
+		eDates := make([]string, len(expRows))
+		for i, r := range expRows {
+			eIDs[i] = r.id
+			eCats[i] = r.catID
+			eAmts[i] = r.amount
+			eDescr[i] = r.descr
+			eDates[i] = r.expenseDt
 		}
-		expBytes, err := marshalJSON(expPayload)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO budget_expenses (id, budget_id, category_id, amount, description, expense_date, created_at)
+			SELECT id, $1, category_id, amount, description, expense_date::date, $2
+			FROM unnest($3::uuid[], $4::uuid[], $5::numeric[], $6::text[], $7::text[])
+			   AS u(id, category_id, amount, description, expense_date)
+		`, budgetID, now, eIDs, eCats, eAmts, eDescr, eDates)
 		if err != nil {
-			return models.Budget{}, fiber.ErrInternalServerError
+			return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, "failed to create expenses")
 		}
+	}
 
-		_, statusCode, err := database.DB.Post("budget_expenses", expBytes)
-		if err != nil || statusCode != http.StatusCreated {
-			return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("failed to create expense: %s", me.Description))
-		}
+	if err := tx.Commit(ctx); err != nil {
+		return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, "failed to commit migration")
 	}
 
 	return models.Budget{
@@ -288,25 +289,6 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}, nil
-}
-
-// validateMigrateSection checks migration section fields.
-func validateMigrateSection(ms MigrateSection) error {
-	ms.Name = strings.TrimSpace(ms.Name)
-	ms.Icon = strings.TrimSpace(ms.Icon)
-	if ms.Name == "" || len(ms.Name) > maxNameLength {
-		return fiber.NewError(fiber.StatusBadRequest, "section name is required and must not exceed 200 characters")
-	}
-	if len(ms.Icon) > maxIconLength {
-		return fiber.NewError(fiber.StatusBadRequest, "section icon too long (max 50 characters)")
-	}
-	if ms.AllocationValue < 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "section allocation_value must be positive")
-	}
-	if len(ms.Categories) > maxMigrateCategoriesPerGroup {
-		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("too many categories per section (max %d)", maxMigrateCategoriesPerGroup))
-	}
-	return nil
 }
 
 // validateMigrateCategory checks migration category fields.

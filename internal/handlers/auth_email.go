@@ -182,7 +182,8 @@ func Register(c *fiber.Ctx) error {
 		Eq("email", req.Email).
 		Build()
 
-	body, statusCode, err := database.DB.Get("profiles", checkQuery)
+	reqCtx := c.Context()
+	body, statusCode, err := database.DB.GetCtx(reqCtx, "profiles", checkQuery)
 	if err != nil {
 		log.Printf("[auth-email] GET profiles failed: %v", err)
 		return errInternal(c, "failed to check existing account")
@@ -231,7 +232,7 @@ func Register(c *fiber.Ctx) error {
 		return errInternal(c, "failed to marshal profile")
 	}
 
-	respBody, respStatus, err := database.DB.Post("profiles", payloadBytes)
+	respBody, respStatus, err := database.DB.PostCtx(reqCtx, "profiles", payloadBytes)
 	if err != nil {
 		log.Printf("[auth-email] POST profiles failed: %v", err)
 		return errInternal(c, "failed to create account")
@@ -288,7 +289,7 @@ func Login(c *fiber.Ctx) error {
 		Eq("email", req.Email).
 		Build()
 
-	body, statusCode, err := database.DB.Get("profiles", query)
+	body, statusCode, err := database.DB.GetCtx(c.Context(), "profiles", query)
 	if err != nil {
 		log.Printf("[auth-email] GET profiles failed: %v", err)
 		return errInternal(c, "failed to authenticate")

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -13,6 +14,46 @@ import (
 )
 
 const maxLinksPerBudget = 10
+
+// linkTargetsCache memoises fetchTargetBudgetIDs results for a short window.
+// broadcastToLinkedTargets is called on every expense / category mutation,
+// and the vast majority of budgets have no links — without this cache every
+// mutation fires a DB round-trip that returns nothing. Cache hits AND misses
+// are recorded; writes to budget_links invalidate the affected source budget
+// (invalidateLinkTargetsCache).
+var (
+	linkTargetsCacheTTL = 30 * time.Second
+	linkTargetsCacheMu  sync.RWMutex
+	linkTargetsCache    = map[uuid.UUID]linkTargetsCacheEntry{}
+)
+
+type linkTargetsCacheEntry struct {
+	ids       []string
+	expiresAt time.Time
+}
+
+// invalidateLinkTargetsCache drops cached target IDs for the given source
+// budget. Called from CreateLink, DeleteLink, and anywhere budget_links rows
+// are inserted / deleted for a specific source budget.
+func invalidateLinkTargetsCache(sourceBudgetIDs ...uuid.UUID) {
+	if len(sourceBudgetIDs) == 0 {
+		return
+	}
+	linkTargetsCacheMu.Lock()
+	for _, id := range sourceBudgetIDs {
+		delete(linkTargetsCache, id)
+	}
+	linkTargetsCacheMu.Unlock()
+}
+
+// invalidateLinkTargetsCacheAll drops every entry. Used after bulk deletes
+// (e.g. removing a collaborator clears their links across many budgets) where
+// tracking exact source IDs is not worth the complexity.
+func invalidateLinkTargetsCacheAll() {
+	linkTargetsCacheMu.Lock()
+	linkTargetsCache = map[uuid.UUID]linkTargetsCacheEntry{}
+	linkTargetsCacheMu.Unlock()
+}
 
 // ListLinks returns all budget links for the given target budget.
 func ListLinks(c *fiber.Ctx) error {
@@ -34,8 +75,8 @@ func ListLinks(c *fiber.Ctx) error {
 	defer cancel()
 
 	rows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, source_budget_id, target_budget_id, source_section_id,
-		       source_category_id, target_section_id, filter_mode, created_by, created_at
+		SELECT id, source_budget_id, target_budget_id, source_category_id,
+		       filter_mode, created_by, created_at
 		FROM budget_links
 		WHERE target_budget_id = $1
 		ORDER BY created_at
@@ -49,8 +90,7 @@ func ListLinks(c *fiber.Ctx) error {
 	for rows.Next() {
 		var l models.BudgetLink
 		if err := rows.Scan(&l.ID, &l.SourceBudgetID, &l.TargetBudgetID,
-			&l.SourceSectionID, &l.SourceCategoryID, &l.TargetSectionID,
-			&l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
+			&l.SourceCategoryID, &l.FilterMode, &l.CreatedBy, &l.CreatedAt); err != nil {
 			return errInternal(c, "failed to parse link")
 		}
 		links = append(links, l)
@@ -59,7 +99,9 @@ func ListLinks(c *fiber.Ctx) error {
 	return c.JSON(links)
 }
 
-// CreateLink creates a new budget link from a source section/category to the target budget.
+// CreateLink creates a new budget link from a source category into the
+// target budget. Section-level links no longer exist; every link targets a
+// single source category.
 func CreateLink(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -72,11 +114,9 @@ func CreateLink(c *fiber.Ctx) error {
 	}
 
 	var req struct {
-		SourceBudgetID   uuid.UUID  `json:"source_budget_id"`
-		SourceSectionID  uuid.UUID  `json:"source_section_id"`
-		SourceCategoryID *uuid.UUID `json:"source_category_id,omitempty"`
-		TargetSectionID  *uuid.UUID `json:"target_section_id,omitempty"`
-		FilterMode       string     `json:"filter_mode"`
+		SourceBudgetID   uuid.UUID `json:"source_budget_id"`
+		SourceCategoryID uuid.UUID `json:"source_category_id"`
+		FilterMode       string    `json:"filter_mode"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return errBadRequest(c, "invalid request body")
@@ -90,6 +130,10 @@ func CreateLink(c *fiber.Ctx) error {
 	// No self-linking.
 	if req.SourceBudgetID == budgetID {
 		return errBadRequest(c, "cannot link a budget to itself")
+	}
+
+	if req.SourceCategoryID == uuid.Nil {
+		return errBadRequest(c, "source_category_id is required")
 	}
 
 	// User must have access to both budgets.
@@ -119,61 +163,13 @@ func CreateLink(c *fiber.Ctx) error {
 		return errBadRequest(c, "budgets must have the same currency")
 	}
 
-	// Verify source section exists in source budget.
-	var sectionExists bool
+	// Verify source category exists in source budget.
+	var categoryExists bool
 	err = database.DB.Pool.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)",
-		req.SourceSectionID, req.SourceBudgetID).Scan(&sectionExists)
-	if err != nil || !sectionExists {
-		return errNotFound(c, "source section not found in source budget")
-	}
-
-	// If category specified, verify it belongs to the section.
-	if req.SourceCategoryID != nil {
-		var catExists bool
-		err = database.DB.Pool.QueryRow(ctx,
-			"SELECT EXISTS(SELECT 1 FROM budget_subcategories WHERE id = $1 AND category_id = $2)",
-			*req.SourceCategoryID, req.SourceSectionID).Scan(&catExists)
-		if err != nil || !catExists {
-			return errNotFound(c, "source category not found in source section")
-		}
-
-		// Category links require target_section_id (which section in target budget to place it in).
-		if req.TargetSectionID == nil {
-			return errBadRequest(c, "target_section_id is required for category links")
-		}
-		var targetSectionExists bool
-		err = database.DB.Pool.QueryRow(ctx,
-			"SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)",
-			*req.TargetSectionID, budgetID).Scan(&targetSectionExists)
-		if err != nil || !targetSectionExists {
-			return errNotFound(c, "target section not found in target budget")
-		}
-	}
-
-	// Check mutual exclusivity: full-section link and single-category links can't coexist.
-	if req.SourceCategoryID == nil {
-		// Creating full-section link: reject if any category-level link exists for this section.
-		var hasPartial bool
-		err = database.DB.Pool.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM budget_links
-			 WHERE target_budget_id = $1 AND source_section_id = $2
-			   AND source_category_id IS NOT NULL)`,
-			budgetID, req.SourceSectionID).Scan(&hasPartial)
-		if err == nil && hasPartial {
-			return errBadRequest(c, "cannot link entire section when individual categories from it are already linked")
-		}
-	} else {
-		// Creating category link: reject if a full-section link already exists.
-		var hasFull bool
-		err = database.DB.Pool.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM budget_links
-			 WHERE target_budget_id = $1 AND source_section_id = $2
-			   AND source_category_id IS NULL)`,
-			budgetID, req.SourceSectionID).Scan(&hasFull)
-		if err == nil && hasFull {
-			return errBadRequest(c, "cannot link individual category when the entire section is already linked")
-		}
+		req.SourceCategoryID, req.SourceBudgetID).Scan(&categoryExists)
+	if err != nil || !categoryExists {
+		return errNotFound(c, "source category not found in source budget")
 	}
 
 	// Enforce per-budget link limit.
@@ -201,18 +197,18 @@ func CreateLink(c *fiber.Ctx) error {
 	// Insert the link.
 	var link models.BudgetLink
 	err = database.DB.Pool.QueryRow(ctx, `
-		INSERT INTO budget_links (source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by, created_at
-	`, req.SourceBudgetID, budgetID, req.SourceSectionID, req.SourceCategoryID,
-		req.TargetSectionID, req.FilterMode, userID,
+		INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by, created_at
+	`, req.SourceBudgetID, budgetID, req.SourceCategoryID, req.FilterMode, userID,
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
-		&link.SourceSectionID, &link.SourceCategoryID, &link.TargetSectionID,
-		&link.FilterMode, &link.CreatedBy, &link.CreatedAt)
+		&link.SourceCategoryID, &link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
 		log.Printf("[links] insert failed: %v", err)
 		return errInternal(c, "failed to create link")
 	}
+
+	invalidateLinkTargetsCache(req.SourceBudgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeLinkCreated, link)
 	broadcast(req.SourceBudgetID.String(), ws.MessageTypeLinkCreated, link)
@@ -258,11 +254,10 @@ func UpdateLink(c *fiber.Ctx) error {
 	err := database.DB.Pool.QueryRow(ctx, `
 		UPDATE budget_links SET filter_mode = $1
 		WHERE id = $2 AND target_budget_id = $3
-		RETURNING id, source_budget_id, target_budget_id, source_section_id, source_category_id, target_section_id, filter_mode, created_by, created_at
+		RETURNING id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by, created_at
 	`, req.FilterMode, linkID, budgetID,
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
-		&link.SourceSectionID, &link.SourceCategoryID, &link.TargetSectionID,
-		&link.FilterMode, &link.CreatedBy, &link.CreatedAt)
+		&link.SourceCategoryID, &link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
 		return errNotFound(c, "link not found")
 	}
@@ -312,14 +307,17 @@ func DeleteLink(c *fiber.Ctx) error {
 		return errInternal(c, "failed to delete link")
 	}
 
+	invalidateLinkTargetsCache(sourceBudgetID)
+
 	broadcast(budgetID.String(), ws.MessageTypeLinkDeleted, fiber.Map{"id": linkID})
 	broadcast(sourceBudgetID.String(), ws.MessageTypeLinkDeleted, fiber.Map{"id": linkID})
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
-// GetLinkableBudgets returns budgets the user has access to (excluding the current one)
-// that share the same currency, with their sections and categories.
+// GetLinkableBudgets returns budgets the user has access to (excluding the
+// current one) that share the same currency, together with their flat
+// category lists.
 func GetLinkableBudgets(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -364,11 +362,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 
 	type linkableBudget struct {
 		models.Budget
-		Sections []sectionWithCategories `json:"sections"`
-	}
-	type sectionEntry struct {
-		b      models.Budget
-		idx    int
+		Categories []models.Category `json:"categories"`
 	}
 
 	var budgets []linkableBudget
@@ -381,7 +375,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 			&b.CreatedAt, &b.UpdatedAt); err != nil {
 			continue
 		}
-		budgets = append(budgets, linkableBudget{Budget: b, Sections: make([]sectionWithCategories, 0)})
+		budgets = append(budgets, linkableBudget{Budget: b, Categories: make([]models.Category, 0)})
 		budgetIDs = append(budgetIDs, b.ID)
 	}
 
@@ -395,81 +389,50 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 		budgetIdx[b.ID] = i
 	}
 
-	// Fetch sections for all budgets.
-	sectionRows, err := database.DB.Pool.Query(ctx, `
+	// Fetch categories for all budgets in one batched query.
+	catRows, err := database.DB.Pool.Query(ctx, `
 		SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
 		FROM budget_categories
 		WHERE budget_id = ANY($1)
 		ORDER BY sort_order, created_at
 	`, budgetIDs)
 	if err != nil {
-		return errInternal(c, "failed to fetch sections")
+		return errInternal(c, "failed to fetch categories")
 	}
-	defer sectionRows.Close()
+	defer catRows.Close()
 
-	sectionIDs := make([]uuid.UUID, 0)
-	sectionIdx := make(map[uuid.UUID]struct{ budgetIdx, sectionIdx int })
-
-	for sectionRows.Next() {
-		var s models.Section
-		if err := sectionRows.Scan(&s.ID, &s.BudgetID, &s.Name, &s.AllocationValue,
-			&s.Icon, &s.SortOrder, &s.CreatedAt); err != nil {
+	for catRows.Next() {
+		var cat models.Category
+		if err := catRows.Scan(&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue,
+			&cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
 			continue
 		}
-		bi, ok := budgetIdx[s.BudgetID]
+		idx, ok := budgetIdx[cat.BudgetID]
 		if !ok {
 			continue
 		}
-		si := len(budgets[bi].Sections)
-		budgets[bi].Sections = append(budgets[bi].Sections, sectionWithCategories{
-			Section:    s,
-			Categories: make([]models.Category, 0),
-		})
-		sectionIdx[s.ID] = struct{ budgetIdx, sectionIdx int }{bi, si}
-		sectionIDs = append(sectionIDs, s.ID)
-	}
-
-	// Fetch categories for all sections.
-	if len(sectionIDs) > 0 {
-		catRows, err := database.DB.Pool.Query(ctx, `
-			SELECT id, category_id, name, allocation_value, icon, sort_order, created_at
-			FROM budget_subcategories
-			WHERE category_id = ANY($1)
-			ORDER BY sort_order, created_at
-		`, sectionIDs)
-		if err == nil {
-			defer catRows.Close()
-			for catRows.Next() {
-				var cat models.Category
-				if err := catRows.Scan(&cat.ID, &cat.CategoryID, &cat.Name,
-					&cat.AllocationValue, &cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
-					continue
-				}
-				idx, ok := sectionIdx[cat.CategoryID]
-				if !ok {
-					continue
-				}
-				budgets[idx.budgetIdx].Sections[idx.sectionIdx].Categories = append(
-					budgets[idx.budgetIdx].Sections[idx.sectionIdx].Categories, cat)
-			}
-		}
+		budgets[idx].Categories = append(budgets[idx].Categories, cat)
 	}
 
 	return c.JSON(budgets)
 }
 
-// sectionWithCategories is used by GetLinkableBudgets to return sections with their categories.
-type sectionWithCategories struct {
-	models.Section
-	Categories []models.Category `json:"categories"`
-}
-
 // fetchTargetBudgetIDs returns all target budget IDs that have links from the given source budget.
-// Used for cross-budget WS broadcasting.
+// Used for cross-budget WS broadcasting. Results are cached for linkTargetsCacheTTL
+// to avoid hammering the DB from every mutation when most budgets have no links.
 func fetchTargetBudgetIDs(sourceBudgetID uuid.UUID) ([]string, error) {
 	if database.DB == nil || database.DB.Pool == nil {
 		return nil, nil
 	}
+
+	now := time.Now()
+	linkTargetsCacheMu.RLock()
+	entry, ok := linkTargetsCache[sourceBudgetID]
+	linkTargetsCacheMu.RUnlock()
+	if ok && now.Before(entry.expiresAt) {
+		return entry.ids, nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -488,5 +451,13 @@ func fetchTargetBudgetIDs(sourceBudgetID uuid.UUID) ([]string, error) {
 			ids = append(ids, id)
 		}
 	}
+
+	linkTargetsCacheMu.Lock()
+	linkTargetsCache[sourceBudgetID] = linkTargetsCacheEntry{
+		ids:       ids,
+		expiresAt: now.Add(linkTargetsCacheTTL),
+	}
+	linkTargetsCacheMu.Unlock()
+
 	return ids, nil
 }

@@ -14,20 +14,12 @@ import (
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
-	"golang.org/x/sync/errgroup"
 )
 
-// guidedSection defines a section for a budget template mode.
-type guidedSection struct {
-	Name       string
-	Percent    float64
-	Icon       string
-	SortOrder  int
-	Categories []guidedCategory
-}
-
-// guidedCategory defines a category within a guided section.
-// Percent represents the percentage of the PARENT SECTION (not the total budget).
+// guidedCategory defines a single flat category entry in a budget template.
+// Percent represents the percentage of the TOTAL budget income. The former
+// two-level section templates are flattened at definition time by multiplying
+// the section percentage by the subcategory percentage.
 type guidedCategory struct {
 	Name      string
 	Percent   float64
@@ -35,166 +27,88 @@ type guidedCategory struct {
 	SortOrder int
 }
 
-// getBalancedSections returns the 50/30/10/10 balanced template.
-func getBalancedSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
-				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
-				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
-				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
-			},
-		},
-		{
-			Name: "Deseos", Percent: 30, Icon: "party", SortOrder: 2,
-			Categories: []guidedCategory{
-				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
-			},
-		},
-		{
-			Name: "Deudas", Percent: 10, Icon: "credit-card", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Tarjetas", Percent: 50, Icon: "credit-card", SortOrder: 1},
-				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
-			},
-		},
-		{
-			Name: "Ahorro", Percent: 10, Icon: "coins", SortOrder: 4,
-			Categories: []guidedCategory{
-				{Name: "Fondo de emergencia", Percent: 50, Icon: "landmark", SortOrder: 1},
-				{Name: "Inversión", Percent: 50, Icon: "trending", SortOrder: 2},
-			},
-		},
+// getBalancedCategories returns the flattened 50/30/10/10 balanced template.
+// Each percent is of the monthly income: e.g. "Vivienda" was 45% of the 50%
+// Necesidades section, which is 22.5% of the total budget.
+func getBalancedCategories() []guidedCategory {
+	return []guidedCategory{
+		{Name: "Vivienda", Percent: 22.5, Icon: "home", SortOrder: 1},
+		{Name: "Comida", Percent: 12.5, Icon: "utensils", SortOrder: 2},
+		{Name: "Transporte", Percent: 9, Icon: "car", SortOrder: 3},
+		{Name: "Servicios", Percent: 6, Icon: "lightbulb", SortOrder: 4},
+		{Name: "Salidas", Percent: 15, Icon: "party", SortOrder: 5},
+		{Name: "Entretenimiento", Percent: 15, Icon: "clapperboard", SortOrder: 6},
+		{Name: "Tarjetas", Percent: 5, Icon: "credit-card", SortOrder: 7},
+		{Name: "Préstamos", Percent: 5, Icon: "landmark", SortOrder: 8},
+		{Name: "Fondo de emergencia", Percent: 5, Icon: "landmark", SortOrder: 9},
+		{Name: "Inversión", Percent: 5, Icon: "trending", SortOrder: 10},
 	}
 }
 
-// getDebtFreeSections returns the 50/30/20 financially free template.
-func getDebtFreeSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
-				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
-				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
-				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
-			},
-		},
-		{
-			Name: "Deseos", Percent: 30, Icon: "party", SortOrder: 2,
-			Categories: []guidedCategory{
-				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
-			},
-		},
-		{
-			Name: "Ahorro", Percent: 20, Icon: "coins", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Fondo de emergencia", Percent: 50, Icon: "landmark", SortOrder: 1},
-				{Name: "Inversión", Percent: 50, Icon: "trending", SortOrder: 2},
-			},
-		},
+// getDebtFreeCategories returns the flattened 50/30/20 financially-free template.
+func getDebtFreeCategories() []guidedCategory {
+	return []guidedCategory{
+		{Name: "Vivienda", Percent: 22.5, Icon: "home", SortOrder: 1},
+		{Name: "Comida", Percent: 12.5, Icon: "utensils", SortOrder: 2},
+		{Name: "Transporte", Percent: 9, Icon: "car", SortOrder: 3},
+		{Name: "Servicios", Percent: 6, Icon: "lightbulb", SortOrder: 4},
+		{Name: "Salidas", Percent: 15, Icon: "party", SortOrder: 5},
+		{Name: "Entretenimiento", Percent: 15, Icon: "clapperboard", SortOrder: 6},
+		{Name: "Fondo de emergencia", Percent: 10, Icon: "landmark", SortOrder: 7},
+		{Name: "Inversión", Percent: 10, Icon: "trending", SortOrder: 8},
 	}
 }
 
-// getDebtPayoffSections returns the 50/20/30 debt payoff template.
-func getDebtPayoffSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Necesidades", Percent: 50, Icon: "sprout", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Vivienda", Percent: 45, Icon: "home", SortOrder: 1},
-				{Name: "Comida", Percent: 25, Icon: "utensils", SortOrder: 2},
-				{Name: "Transporte", Percent: 18, Icon: "car", SortOrder: 3},
-				{Name: "Servicios", Percent: 12, Icon: "lightbulb", SortOrder: 4},
-			},
-		},
-		{
-			Name: "Deseos", Percent: 20, Icon: "party", SortOrder: 2,
-			Categories: []guidedCategory{
-				{Name: "Salidas", Percent: 50, Icon: "party", SortOrder: 1},
-				{Name: "Entretenimiento", Percent: 50, Icon: "clapperboard", SortOrder: 2},
-			},
-		},
-		{
-			Name: "Deuda", Percent: 30, Icon: "credit-card", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Tarjetas", Percent: 50, Icon: "credit-card", SortOrder: 1},
-				{Name: "Préstamos", Percent: 50, Icon: "landmark", SortOrder: 2},
-			},
-		},
+// getDebtPayoffCategories returns the flattened 50/20/30 debt-payoff template.
+func getDebtPayoffCategories() []guidedCategory {
+	return []guidedCategory{
+		{Name: "Vivienda", Percent: 22.5, Icon: "home", SortOrder: 1},
+		{Name: "Comida", Percent: 12.5, Icon: "utensils", SortOrder: 2},
+		{Name: "Transporte", Percent: 9, Icon: "car", SortOrder: 3},
+		{Name: "Servicios", Percent: 6, Icon: "lightbulb", SortOrder: 4},
+		{Name: "Salidas", Percent: 10, Icon: "party", SortOrder: 5},
+		{Name: "Entretenimiento", Percent: 10, Icon: "clapperboard", SortOrder: 6},
+		{Name: "Tarjetas", Percent: 15, Icon: "credit-card", SortOrder: 7},
+		{Name: "Préstamos", Percent: 15, Icon: "landmark", SortOrder: 8},
 	}
 }
 
-// getTravelSections returns the 30/30/40 travel budget template.
-func getTravelSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Vuelos", Percent: 30, Icon: "plane", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Vuelos", Percent: 100, Icon: "plane", SortOrder: 1},
-			},
-		},
-		{
-			Name: "Hospedaje", Percent: 30, Icon: "bed", SortOrder: 2,
-			Categories: []guidedCategory{
-				{Name: "Hospedaje", Percent: 100, Icon: "bed", SortOrder: 1},
-			},
-		},
-		{
-			Name: "Salidas", Percent: 40, Icon: "party", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Comida", Percent: 40, Icon: "utensils", SortOrder: 1},
-				{Name: "Actividades", Percent: 35, Icon: "map-pin", SortOrder: 2},
-				{Name: "Transporte local", Percent: 25, Icon: "car", SortOrder: 3},
-			},
-		},
+// getTravelCategories returns the flattened 30/30/40 travel-budget template.
+func getTravelCategories() []guidedCategory {
+	return []guidedCategory{
+		{Name: "Vuelos", Percent: 30, Icon: "plane", SortOrder: 1},
+		{Name: "Hospedaje", Percent: 30, Icon: "bed", SortOrder: 2},
+		{Name: "Comida", Percent: 16, Icon: "utensils", SortOrder: 3},
+		{Name: "Actividades", Percent: 14, Icon: "map-pin", SortOrder: 4},
+		{Name: "Transporte local", Percent: 10, Icon: "car", SortOrder: 5},
 	}
 }
 
-// getEventSections returns the 50/30/20 event budget template.
-func getEventSections() []guidedSection {
-	return []guidedSection{
-		{
-			Name: "Comida", Percent: 50, Icon: "utensils", SortOrder: 1,
-			Categories: []guidedCategory{
-				{Name: "Comida", Percent: 100, Icon: "utensils", SortOrder: 1},
-			},
-		},
-		{
-			Name: "Bebidas", Percent: 30, Icon: "wine", SortOrder: 2,
-			Categories: []guidedCategory{
-				{Name: "Bebidas", Percent: 100, Icon: "wine", SortOrder: 1},
-			},
-		},
-		{
-			Name: "Gestión", Percent: 20, Icon: "settings", SortOrder: 3,
-			Categories: []guidedCategory{
-				{Name: "Decoración", Percent: 40, Icon: "sparkles", SortOrder: 1},
-				{Name: "Logística", Percent: 60, Icon: "truck", SortOrder: 2},
-			},
-		},
+// getEventCategories returns the flattened 50/30/20 event-budget template.
+func getEventCategories() []guidedCategory {
+	return []guidedCategory{
+		{Name: "Comida", Percent: 50, Icon: "utensils", SortOrder: 1},
+		{Name: "Bebidas", Percent: 30, Icon: "wine", SortOrder: 2},
+		{Name: "Decoración", Percent: 8, Icon: "sparkles", SortOrder: 3},
+		{Name: "Logística", Percent: 12, Icon: "truck", SortOrder: 4},
 	}
 }
 
-// getSectionsForMode returns the guided template for the given mode.
-func getSectionsForMode(mode string) []guidedSection {
+// getCategoriesForMode returns the flat guided template for the given mode.
+func getCategoriesForMode(mode string) []guidedCategory {
 	switch mode {
 	case "balanced":
-		return getBalancedSections()
+		return getBalancedCategories()
 	case "debt-free":
-		return getDebtFreeSections()
+		return getDebtFreeCategories()
 	case "debt-payoff":
-		return getDebtPayoffSections()
+		return getDebtPayoffCategories()
 	case "travel":
-		return getTravelSections()
+		return getTravelCategories()
 	case "event":
-		return getEventSections()
+		return getEventCategories()
 	default:
-		return getBalancedSections()
+		return getBalancedCategories()
 	}
 }
 
@@ -207,84 +121,37 @@ func ListBudgets(c *fiber.Ctx) error {
 	}
 
 	limit, offset := parsePaginationParams(c)
-	uid := userID.String()
 
-	var (
-		budgets []models.Budget
-		collabs []struct {
-			BudgetID string `json:"budget_id"`
-		}
-	)
-
-	// Run the owned-budgets query and collaborator-IDs query in parallel.
-	g := new(errgroup.Group)
-
-	g.Go(func() error {
-		query := database.NewFilter().
-			Select("*").
-			Eq("user_id", uid).
-			Order("created_at", "desc").
-			Limit(limit).
-			Offset(offset).
-			Build()
-
-		body, statusCode, err := database.DB.Get("budgets", query)
-		if err != nil || statusCode != http.StatusOK {
-			return fiber.ErrInternalServerError
-		}
-
-		if err := json.Unmarshal(body, &budgets); err != nil {
-			return fiber.ErrInternalServerError
-		}
-		return nil
-	})
-
-	g.Go(func() error {
-		collabQuery := database.NewFilter().
-			Select("budget_id").
-			Eq("user_id", uid).
-			Build()
-
-		collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabQuery)
-		if collabErr != nil || collabStatus != http.StatusOK {
-			// Non-fatal: user may simply have no collaborations.
-			return nil
-		}
-
-		_ = json.Unmarshal(collabBody, &collabs)
-		return nil
-	})
-
-	if err := g.Wait(); err != nil {
+	// Single query returning both owned and collaborated budgets. This replaces
+	// the old 2-3 query pattern (owned list + collab IDs + collab budgets) that
+	// required two round-trips plus a second Unmarshal of budget rows.
+	reqCtx := c.Context()
+	rows, err := database.DB.Pool.Query(reqCtx, `
+		SELECT id, user_id, name, icon, monthly_income, currency,
+		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+		FROM budgets
+		WHERE user_id = $1
+		   OR id IN (SELECT budget_id FROM budget_collaborators WHERE user_id = $1)
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3
+	`, userID, limit, offset)
+	if err != nil {
 		return errInternal(c, "failed to fetch budgets")
 	}
+	defer rows.Close()
 
-	if budgets == nil {
-		budgets = make([]models.Budget, 0)
+	budgets := make([]models.Budget, 0)
+	for rows.Next() {
+		var b models.Budget
+		if err := rows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
+			&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+			&b.CreatedAt, &b.UpdatedAt); err != nil {
+			return errInternal(c, "failed to parse budget row")
+		}
+		budgets = append(budgets, b)
 	}
-
-	// Fetch the actual collaborative budgets (sequential; depends on collabs result).
-	if len(collabs) > 0 {
-		budgetIDs := make([]string, len(collabs))
-		for i, cb := range collabs {
-			budgetIDs[i] = cb.BudgetID
-		}
-
-		collabBudgetQuery := database.NewFilter().
-			Select("*").
-			In("id", budgetIDs).
-			Order("created_at", "desc").
-			Limit(limit).
-			Offset(offset).
-			Build()
-
-		collabBudgetBody, collabBudgetStatus, collabBudgetErr := database.DB.Get("budgets", collabBudgetQuery)
-		if collabBudgetErr == nil && collabBudgetStatus == http.StatusOK {
-			var collabBudgets []models.Budget
-			if err := json.Unmarshal(collabBudgetBody, &collabBudgets); err == nil {
-				budgets = append(budgets, collabBudgets...)
-			}
-		}
+	if err := rows.Err(); err != nil {
+		return errInternal(c, "failed to iterate budgets")
 	}
 
 	return c.JSON(budgets)
@@ -297,34 +164,27 @@ const maxBudgetsPerUser = 7
 // enforceUserBudgetLimit checks that the user hasn't reached the budget cap.
 // Returns an error with message "limit" when the cap is hit, or a generic
 // error on internal failures. Returns nil when under the limit.
+//
+// Uses a single UNION ALL query so both counts are computed server-side in one
+// round-trip instead of the previous 2-goroutine fan-out (which incurred two
+// network round-trips and two connection acquisitions per call).
 func enforceUserBudgetLimit(userID uuid.UUID) error {
-	uid := userID
-
-	var ownedCount, collabCount int
-
-	g, gctx := errgroup.WithContext(context.Background())
-
-	g.Go(func() error {
-		return database.DB.Pool.QueryRow(gctx,
-			`SELECT COUNT(*) FROM budgets WHERE user_id = $1`, uid).Scan(&ownedCount)
-	})
-
-	g.Go(func() error {
-		return database.DB.Pool.QueryRow(gctx,
-			`SELECT COUNT(*) FROM budget_collaborators WHERE user_id = $1`, uid).Scan(&collabCount)
-	})
-
-	if err := g.Wait(); err != nil {
+	var total int
+	err := database.DB.Pool.QueryRow(context.Background(),
+		`SELECT (
+			(SELECT COUNT(*) FROM budgets WHERE user_id = $1)
+			+ (SELECT COUNT(*) FROM budget_collaborators WHERE user_id = $1)
+		) AS total`, userID).Scan(&total)
+	if err != nil {
 		return err
 	}
-
-	if ownedCount+collabCount >= maxBudgetsPerUser {
+	if total >= maxBudgetsPerUser {
 		return fmt.Errorf("limit")
 	}
 	return nil
 }
 
-// CreateBudget creates a new budget and optionally seeds guided sections.
+// CreateBudget creates a new budget and optionally seeds guided categories.
 // On success it broadcasts a budget_created event via WebSocket.
 func CreateBudget(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
@@ -437,10 +297,10 @@ func CreateBudget(c *fiber.Ctx) error {
 		return errInternal(c, "failed to create budget")
 	}
 
-	// Seed guided sections for template-based modes.
+	// Seed guided categories for template-based modes.
 	if guidedModes[budget.Mode] {
-		if err := seedGuidedSections(budget.ID, budget.Mode, budget.MonthlyIncome, now); err != nil {
-			return errInternal(c, "failed to create guided sections")
+		if err := seedGuidedCategories(budget.ID, budget.Mode, budget.MonthlyIncome, now); err != nil {
+			return errInternal(c, "failed to create guided categories")
 		}
 	}
 
@@ -449,12 +309,13 @@ func CreateBudget(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(budget)
 }
 
-// seedGuidedSections creates template sections and categories based on the
-// budget mode. All inserts are batched inside a single database transaction
-// to avoid 14+ individual round-trips.
-func seedGuidedSections(budgetID uuid.UUID, mode string, monthlyIncome float64, now time.Time) error {
-	sections := getSectionsForMode(mode)
-	if len(sections) == 0 {
+// seedGuidedCategories creates the flat template categories for a guided
+// budget mode inside a single transaction. The 50-category cap is enforced at
+// the DB level; none of our built-in templates approach it, but the trigger
+// remains the last line of defence.
+func seedGuidedCategories(budgetID uuid.UUID, mode string, monthlyIncome float64, now time.Time) error {
+	categories := getCategoriesForMode(mode)
+	if len(categories) == 0 {
 		return nil
 	}
 
@@ -462,31 +323,15 @@ func seedGuidedSections(budgetID uuid.UUID, mode string, monthlyIncome float64, 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback(context.Background()) //nolint:errcheck
 
-	for _, gs := range sections {
-		sectionValue := math.Round(gs.Percent / 100 * monthlyIncome)
-		sectionID := uuid.New()
-
-		_, err := tx.Exec(context.Background(),
+	for _, gc := range categories {
+		catValue := math.Round(gc.Percent / 100 * monthlyIncome)
+		if _, err := tx.Exec(context.Background(),
 			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			sectionID, budgetID, gs.Name, sectionValue, gs.Icon, gs.SortOrder, now)
-		if err != nil {
+			uuid.New(), budgetID, gc.Name, catValue, gc.Icon, gc.SortOrder, now); err != nil {
 			return err
-		}
-
-		for _, gc := range gs.Categories {
-			catValue := math.Round(gc.Percent / 100 * sectionValue)
-			catID := uuid.New()
-
-			_, err := tx.Exec(context.Background(),
-				`INSERT INTO budget_subcategories (id, category_id, name, allocation_value, icon, sort_order, created_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				catID, sectionID, gc.Name, catValue, gc.Icon, gc.SortOrder, now)
-			if err != nil {
-				return err
-			}
 		}
 	}
 
@@ -608,6 +453,23 @@ func UpdateBudget(c *fiber.Ctx) error {
 
 	b := budgets[0]
 
+	// If the caller is lowering monthly_income, make sure the new value still
+	// covers the sum of existing category allocations. Without this check a
+	// user could drop income below their allocated amounts, leaving the budget
+	// in an inconsistent state that the category create/update guards would
+	// otherwise prevent.
+	if req.MonthlyIncome != nil && *req.MonthlyIncome < b.MonthlyIncome {
+		var totalAlloc float64
+		if err := database.DB.Pool.QueryRow(c.Context(),
+			`SELECT COALESCE(SUM(allocation_value), 0) FROM budget_categories WHERE budget_id = $1`,
+			budgetID).Scan(&totalAlloc); err != nil {
+			return errInternal(c, "failed to verify existing allocations")
+		}
+		if totalAlloc > *req.MonthlyIncome {
+			return errBadRequest(c, "monthly_income is less than total category allocations; reduce category allocations first")
+		}
+	}
+
 	// Apply partial updates.
 	if req.Name != nil {
 		b.Name = *req.Name
@@ -662,8 +524,8 @@ func UpdateBudget(c *fiber.Ctx) error {
 	return c.JSON(b)
 }
 
-// DeleteBudget deletes a budget and all associated data (expenses, sections,
-// categories, collaborators, invites). Only the owner can delete.
+// DeleteBudget deletes a budget and all associated data (expenses, categories,
+// collaborators, invites, links). Only the owner can delete.
 // On success it broadcasts a budget_deleted event via WebSocket.
 func DeleteBudget(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
@@ -688,37 +550,43 @@ func DeleteBudget(c *fiber.Ctx) error {
 		return errInternal(c, "failed to verify budget ownership")
 	}
 
-	var found []struct{ ID string `json:"id"` }
+	var found []struct {
+		ID string `json:"id"`
+	}
 	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
 		return errNotFound(c, "budget not found")
 	}
 
 	bid := budgetID.String()
 
-	// Delete budget in a transaction — CASCADE handles expenses, sections,
-	// categories, collaborators, and invites.
+	// Delete budget in a transaction — CASCADE handles expenses, categories,
+	// collaborators, and invites.
 	tx, err := database.DB.Pool.Begin(context.Background())
 	if err != nil {
 		return errInternal(c, "failed to start transaction")
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback(context.Background()) //nolint:errcheck
 
-	_, err = tx.Exec(context.Background(),
-		`DELETE FROM budgets WHERE id = $1 AND user_id = $2`, budgetID, userID)
-	if err != nil {
+	if _, err := tx.Exec(context.Background(),
+		`DELETE FROM budgets WHERE id = $1 AND user_id = $2`, budgetID, userID); err != nil {
 		return errInternal(c, "failed to delete budget")
 	}
 
 	// Also clean up budget_links where this user created them (created_by FK has no CASCADE).
-	_, err = tx.Exec(context.Background(),
-		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`, userID, budgetID)
-	if err != nil {
+	if _, err := tx.Exec(context.Background(),
+		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`,
+		userID, budgetID); err != nil {
 		return errInternal(c, "failed to clean up budget links")
 	}
 
 	if err := tx.Commit(context.Background()); err != nil {
 		return errInternal(c, "failed to commit deletion")
 	}
+
+	// Budget delete cascade-removes its links: purge the cache for this budget
+	// (it could be the source of some links) and for any budget that we
+	// couldn't identify without another query.
+	invalidateLinkTargetsCacheAll()
 
 	broadcast(bid, ws.MessageTypeBudgetDeleted, map[string]string{"id": bid})
 

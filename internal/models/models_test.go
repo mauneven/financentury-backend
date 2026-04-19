@@ -78,10 +78,9 @@ func TestExpense_UnmarshalJSON_CategoryID(t *testing.T) {
 }
 
 func TestExpense_UnmarshalJSON_SubcategoryID_FallbackPopulatesCategoryID(t *testing.T) {
-	// The Expense type has a custom UnmarshalJSON that falls back to
-	// "subcategory_id" when "category_id" is absent. This compatibility
-	// layer exists because the DB column is still named subcategory_id
-	// even though the Go/API field is category_id.
+	// The Expense type still has a compatibility UnmarshalJSON that falls back
+	// to "subcategory_id" when "category_id" is absent. This supports legacy
+	// payloads that might still carry the old column name.
 	catID := "11111111-1111-1111-1111-111111111111"
 	raw := `{
 		"id": "33333333-3333-3333-3333-333333333333",
@@ -209,7 +208,8 @@ func TestCreateExpenseRequest_UnmarshalJSON(t *testing.T) {
 }
 
 func TestCreateExpenseRequest_SubcategoryIDIgnored(t *testing.T) {
-	// Using the old "subcategory_id" key should NOT populate CategoryID.
+	// Using the old "subcategory_id" key should NOT populate CategoryID
+	// on the request type (only Expense has the compat UnmarshalJSON).
 	raw := `{
 		"subcategory_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
 		"amount": 100,
@@ -431,59 +431,60 @@ func TestUpdateBudgetRequest_OmitEmpty(t *testing.T) {
 	}
 }
 
-// ==================== Section JSON ====================
+// ==================== Category JSON ====================
 
-func TestSection_RoundTripJSON(t *testing.T) {
+func TestCategory_RoundTripJSON(t *testing.T) {
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
-	sectionID := uuid.New()
+	catID := uuid.New()
 	budgetID := uuid.New()
 
-	original := Section{
-		ID:                sectionID,
-		BudgetID:          budgetID,
-		Name:              "Necesidades",
-		AllocationPercent: 50,
-		Icon:              "home",
-		SortOrder:         1,
-		CreatedAt:         now,
+	original := Category{
+		ID:              catID,
+		BudgetID:        budgetID,
+		Name:            "Vivienda",
+		AllocationValue: 500000,
+		Icon:            "home",
+		SortOrder:       1,
+		CreatedAt:       now,
 	}
 
 	data, err := json.Marshal(original)
 	if err != nil {
-		t.Fatalf("failed to marshal Section: %v", err)
+		t.Fatalf("failed to marshal Category: %v", err)
 	}
 
-	var decoded Section
+	var decoded Category
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal Section: %v", err)
+		t.Fatalf("failed to unmarshal Category: %v", err)
 	}
 
 	if decoded.Name != original.Name {
 		t.Errorf("Name = %q, want %q", decoded.Name, original.Name)
 	}
-	if decoded.AllocationPercent != original.AllocationPercent {
-		t.Errorf("AllocationPercent = %v, want %v", decoded.AllocationPercent, original.AllocationPercent)
+	if decoded.AllocationValue != original.AllocationValue {
+		t.Errorf("AllocationValue = %v, want %v", decoded.AllocationValue, original.AllocationValue)
 	}
 	if decoded.Icon != original.Icon {
 		t.Errorf("Icon = %q, want %q", decoded.Icon, original.Icon)
 	}
+	if decoded.BudgetID != original.BudgetID {
+		t.Errorf("BudgetID = %s, want %s", decoded.BudgetID, original.BudgetID)
+	}
 }
-
-// ==================== Category JSON ====================
 
 func TestCategory_JSONKeys(t *testing.T) {
 	catID := uuid.New()
-	sectionID := uuid.New()
+	budgetID := uuid.New()
 	now := time.Now()
 
 	cat := Category{
-		ID:                catID,
-		CategoryID:        sectionID,
-		Name:              "Vivienda",
-		AllocationPercent: 56,
-		Icon:              "home",
-		SortOrder:         1,
-		CreatedAt:         now,
+		ID:              catID,
+		BudgetID:        budgetID,
+		Name:            "Vivienda",
+		AllocationValue: 56,
+		Icon:            "home",
+		SortOrder:       1,
+		CreatedAt:       now,
 	}
 
 	data, err := json.Marshal(cat)
@@ -496,26 +497,30 @@ func TestCategory_JSONKeys(t *testing.T) {
 		t.Fatalf("failed to unmarshal to map: %v", err)
 	}
 
-	// The parent reference field should serialize as "category_id"
-	if _, ok := m["category_id"]; !ok {
-		t.Error("Category should have 'category_id' key in JSON")
+	// Flat category: parent reference is "budget_id".
+	if _, ok := m["budget_id"]; !ok {
+		t.Error("Category should have 'budget_id' key in JSON")
+	}
+	if _, ok := m["category_id"]; ok {
+		t.Error("Category should NOT have 'category_id' key in the flat model")
 	}
 }
 
 // ==================== SummaryCategoryView JSON ====================
 
-func TestSummaryCategoryView_SectionIDMapping(t *testing.T) {
-	// SummaryCategoryView maps "section_id" in JSON to the SectionID field.
-	sectionID := uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+func TestSummaryCategoryView_BudgetIDKey(t *testing.T) {
+	// SummaryCategoryView now mirrors Category directly — parent reference is
+	// "budget_id" (the flat model has no sections).
+	budgetID := uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	scv := SummaryCategoryView{
-		ID:                uuid.New(),
-		SectionID:         sectionID,
-		Name:              "Vivienda",
-		AllocationPercent: 56,
-		Icon:              "home",
-		SortOrder:         1,
-		CreatedAt:         time.Now(),
+		ID:              uuid.New(),
+		BudgetID:        budgetID,
+		Name:            "Vivienda",
+		AllocationValue: 56,
+		Icon:            "home",
+		SortOrder:       1,
+		CreatedAt:       time.Now(),
 	}
 
 	data, err := json.Marshal(scv)
@@ -528,12 +533,12 @@ func TestSummaryCategoryView_SectionIDMapping(t *testing.T) {
 		t.Fatalf("failed to unmarshal to map: %v", err)
 	}
 
-	// Should have "section_id", not "category_id"
-	if _, ok := m["section_id"]; !ok {
-		t.Error("SummaryCategoryView should have 'section_id' key in JSON")
+	// Should have "budget_id"; "section_id" is gone entirely.
+	if _, ok := m["budget_id"]; !ok {
+		t.Error("SummaryCategoryView should have 'budget_id' key in JSON")
 	}
-	if _, ok := m["category_id"]; ok {
-		t.Error("SummaryCategoryView should NOT have 'category_id' key in JSON")
+	if _, ok := m["section_id"]; ok {
+		t.Error("SummaryCategoryView should NOT have 'section_id' key after flattening")
 	}
 }
 
@@ -598,20 +603,20 @@ func TestProfile_PasswordHashOmitted(t *testing.T) {
 	}
 }
 
-// ==================== SectionTrend JSON ====================
+// ==================== CategoryTrend JSON ====================
 
-func TestSectionTrend_JSONKeys(t *testing.T) {
-	// SectionTrend uses "category_id" and "category_name" JSON keys
-	// for frontend compatibility even though the Go fields are SectionID/SectionName.
-	st := SectionTrend{
-		SectionID:   uuid.New(),
-		SectionName: "Necesidades",
-		Months:      []MonthlyTrend{{Month: "2026-04-01", TotalSpent: 100}},
+func TestCategoryTrend_JSONKeys(t *testing.T) {
+	// CategoryTrend uses "category_id" and "category_name" JSON keys for
+	// per-category trend output.
+	ct := CategoryTrend{
+		CategoryID:   uuid.New(),
+		CategoryName: "Necesidades",
+		Months:       []MonthlyTrend{{Month: "2026-04-01", TotalSpent: 100}},
 	}
 
-	data, err := json.Marshal(st)
+	data, err := json.Marshal(ct)
 	if err != nil {
-		t.Fatalf("failed to marshal SectionTrend: %v", err)
+		t.Fatalf("failed to marshal CategoryTrend: %v", err)
 	}
 
 	var m map[string]interface{}
@@ -620,28 +625,24 @@ func TestSectionTrend_JSONKeys(t *testing.T) {
 	}
 
 	if _, ok := m["category_id"]; !ok {
-		t.Error("SectionTrend should have 'category_id' key for frontend compatibility")
+		t.Error("CategoryTrend should have 'category_id' key")
 	}
 	if _, ok := m["category_name"]; !ok {
-		t.Error("SectionTrend should have 'category_name' key for frontend compatibility")
+		t.Error("CategoryTrend should have 'category_name' key")
 	}
-	// Verify it does NOT use "section_id" / "section_name" in JSON
 	if _, ok := m["section_id"]; ok {
-		t.Error("SectionTrend should NOT use 'section_id' in JSON")
-	}
-	if _, ok := m["section_name"]; ok {
-		t.Error("SectionTrend should NOT use 'section_name' in JSON")
+		t.Error("CategoryTrend should NOT have 'section_id' key")
 	}
 }
 
 // ==================== TrendsResponse JSON ====================
 
 func TestTrendsResponse_JSONKeys(t *testing.T) {
-	// TrendsResponse uses "categories" JSON key for sections data.
+	// TrendsResponse uses "categories" JSON key for the per-category trends.
 	tr := TrendsResponse{
 		BudgetID: uuid.New(),
-		Sections: []SectionTrend{
-			{SectionID: uuid.New(), SectionName: "Test", Months: nil},
+		Categories: []CategoryTrend{
+			{CategoryID: uuid.New(), CategoryName: "Test", Months: nil},
 		},
 	}
 
@@ -656,10 +657,10 @@ func TestTrendsResponse_JSONKeys(t *testing.T) {
 	}
 
 	if _, ok := m["categories"]; !ok {
-		t.Error("TrendsResponse should use 'categories' JSON key for sections")
+		t.Error("TrendsResponse should use 'categories' JSON key")
 	}
 	if _, ok := m["sections"]; ok {
-		t.Error("TrendsResponse should NOT use 'sections' in JSON")
+		t.Error("TrendsResponse should NOT use 'sections' JSON key")
 	}
 }
 
@@ -731,7 +732,7 @@ func TestBudgetSummary_Structure(t *testing.T) {
 			Name:          "Test",
 			MonthlyIncome: 5000000,
 		},
-		Sections:    []SectionSummary{},
+		Categories:  []CategorySummary{},
 		TotalBudget: 5000000,
 		TotalSpent:  1000000,
 	}
@@ -746,11 +747,50 @@ func TestBudgetSummary_Structure(t *testing.T) {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 
-	expectedKeys := []string{"budget", "sections", "total_budget", "total_spent"}
+	expectedKeys := []string{"budget", "categories", "total_budget", "total_spent"}
 	for _, key := range expectedKeys {
 		if _, ok := m[key]; !ok {
 			t.Errorf("BudgetSummary JSON missing key %q", key)
 		}
+	}
+	if _, ok := m["sections"]; ok {
+		t.Error("BudgetSummary should NOT have 'sections' key after flattening")
+	}
+}
+
+// ==================== BudgetLink JSON ====================
+
+func TestBudgetLink_JSONShape(t *testing.T) {
+	// In the flat model BudgetLink has source_category_id as a required
+	// non-nullable UUID and no section-level fields.
+	l := BudgetLink{
+		ID:               uuid.New(),
+		SourceBudgetID:   uuid.New(),
+		TargetBudgetID:   uuid.New(),
+		SourceCategoryID: uuid.New(),
+		FilterMode:       "all",
+		CreatedBy:        uuid.New(),
+		CreatedAt:        time.Now(),
+	}
+
+	data, err := json.Marshal(l)
+	if err != nil {
+		t.Fatalf("failed to marshal BudgetLink: %v", err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("failed to unmarshal to map: %v", err)
+	}
+
+	if _, ok := m["source_category_id"]; !ok {
+		t.Error("BudgetLink should have 'source_category_id' key")
+	}
+	if _, ok := m["source_section_id"]; ok {
+		t.Error("BudgetLink should NOT have 'source_section_id' key (no sections in flat model)")
+	}
+	if _, ok := m["target_section_id"]; ok {
+		t.Error("BudgetLink should NOT have 'target_section_id' key")
 	}
 }
 

@@ -254,7 +254,7 @@ func TestIconValidation_OverMax(t *testing.T) {
 }
 
 func TestIconValidation_Empty(t *testing.T) {
-	// Empty icon is allowed in section/category creation.
+	// Empty icon is allowed in category creation.
 	icon := ""
 	if len(icon) > maxIconLength {
 		t.Error("empty icon should pass length check")
@@ -370,42 +370,42 @@ func TestBillingCutoffDayValidation_Invalid(t *testing.T) {
 	}
 }
 
-// ==================== getSectionsForMode ====================
+// ==================== getCategoriesForMode ====================
 
-func TestGetSectionsForMode_AllModes(t *testing.T) {
+func TestGetCategoriesForMode_AllModes(t *testing.T) {
 	modes := map[string]bool{
-		"balanced":   true,
-		"debt-free":  true,
+		"balanced":    true,
+		"debt-free":   true,
 		"debt-payoff": true,
-		"travel":     true,
-		"event":      true,
+		"travel":      true,
+		"event":       true,
 	}
 	for mode := range modes {
-		sections := getSectionsForMode(mode)
-		if len(sections) == 0 {
-			t.Errorf("getSectionsForMode(%q) returned empty sections", mode)
+		cats := getCategoriesForMode(mode)
+		if len(cats) == 0 {
+			t.Errorf("getCategoriesForMode(%q) returned empty categories", mode)
 		}
 	}
 }
 
-func TestGetSectionsForMode_Unknown_DefaultsToBalanced(t *testing.T) {
-	unknown := getSectionsForMode("unknown")
-	balanced := getBalancedSections()
+func TestGetCategoriesForMode_Unknown_DefaultsToBalanced(t *testing.T) {
+	unknown := getCategoriesForMode("unknown")
+	balanced := getBalancedCategories()
 	if len(unknown) != len(balanced) {
-		t.Errorf("unknown mode should default to balanced: got %d sections, want %d", len(unknown), len(balanced))
+		t.Errorf("unknown mode should default to balanced: got %d categories, want %d", len(unknown), len(balanced))
 	}
 	for i := range unknown {
 		if unknown[i].Name != balanced[i].Name {
-			t.Errorf("section %d: got %q, want %q", i, unknown[i].Name, balanced[i].Name)
+			t.Errorf("category %d: got %q, want %q", i, unknown[i].Name, balanced[i].Name)
 		}
 	}
 }
 
-func TestGetSectionsForMode_ManualDefaultsToBalanced(t *testing.T) {
-	manual := getSectionsForMode("manual")
-	balanced := getBalancedSections()
+func TestGetCategoriesForMode_ManualDefaultsToBalanced(t *testing.T) {
+	manual := getCategoriesForMode("manual")
+	balanced := getBalancedCategories()
 	if len(manual) != len(balanced) {
-		t.Errorf("manual mode should default to balanced: got %d sections, want %d", len(manual), len(balanced))
+		t.Errorf("manual mode should default to balanced: got %d categories, want %d", len(manual), len(balanced))
 	}
 }
 
@@ -562,5 +562,15 @@ func TestTrimName_NoTrimNeeded(t *testing.T) {
 func TestMaxBudgetsPerUser(t *testing.T) {
 	if maxBudgetsPerUser != 7 {
 		t.Errorf("maxBudgetsPerUser = %d, want 7", maxBudgetsPerUser)
+	}
+}
+
+// ==================== maxCategoriesPerBudget (50-category cap) ====================
+
+func TestMaxCategoriesPerBudget_Is50(t *testing.T) {
+	// The flat model enforces a hard cap of 50 categories per budget at both
+	// the API layer and via a DB trigger.
+	if maxCategoriesPerBudget != 50 {
+		t.Errorf("maxCategoriesPerBudget = %d, want 50", maxCategoriesPerBudget)
 	}
 }

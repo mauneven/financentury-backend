@@ -440,24 +440,18 @@ func Me(c *fiber.Ctx) error {
 		return errUnauthorized(c)
 	}
 
-	query := database.NewFilter().
-		Select("id,email,full_name,created_at,updated_at").
-		Eq("id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("profiles", query)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to fetch profile")
-	}
-
-	var profiles []models.Profile
-	if err := json.Unmarshal(body, &profiles); err != nil {
-		return errInternal(c, "failed to parse profile")
-	}
-
-	if len(profiles) == 0 {
+	reqCtx := c.Context()
+	var p models.Profile
+	var createdAt, updatedAt time.Time
+	if err := database.DB.Pool.QueryRow(reqCtx,
+		`SELECT id, email, full_name, created_at, updated_at
+		 FROM profiles WHERE id = $1`, userID,
+	).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt); err != nil {
+		log.Printf("Me: profile lookup failed for user %s: %v", userID, err)
 		return errNotFound(c, "profile not found")
 	}
+	p.CreatedAt = createdAt.Format(time.RFC3339Nano)
+	p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
 
 	// Fetch display orders (best-effort — don't fail auth if table is empty or missing).
 	type orderEntry struct {
@@ -465,7 +459,7 @@ func Me(c *fiber.Ctx) error {
 		OrderedIDs json.RawMessage `json:"ordered_ids"`
 	}
 	var orders []orderEntry
-	rows, qErr := database.DB.Pool.Query(context.Background(),
+	rows, qErr := database.DB.Pool.Query(reqCtx,
 		`SELECT scope_key, ordered_ids FROM display_orders WHERE user_id = $1`, userID)
 	if qErr == nil {
 		defer rows.Close()
@@ -480,7 +474,6 @@ func Me(c *fiber.Ctx) error {
 		orders = []orderEntry{}
 	}
 
-	p := profiles[0]
 	return c.JSON(fiber.Map{
 		"id":             p.ID,
 		"email":          p.Email,
@@ -511,36 +504,28 @@ func UpdateProfile(c *fiber.Ctx) error {
 		return errBadRequest(c, "name too long (max 100 characters)")
 	}
 
-	ctx := context.Background()
-	_, err := database.DB.Pool.Exec(ctx,
-		"UPDATE profiles SET full_name = $1, updated_at = NOW() WHERE id = $2",
-		req.FullName, userID.String(),
-	)
+	// UPDATE ... RETURNING folds the post-update fetch into a single
+	// round-trip, so we don't need a follow-up GET.
+	var p models.Profile
+	var createdAt, updatedAt time.Time
+	err := database.DB.Pool.QueryRow(c.Context(),
+		`UPDATE profiles SET full_name = $1, updated_at = NOW()
+		 WHERE id = $2
+		 RETURNING id, email, full_name, created_at, updated_at`,
+		req.FullName, userID,
+	).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt)
 	if err != nil {
+		log.Printf("UpdateProfile: failed for user %s: %v", userID, err)
 		return errInternal(c, "failed to update profile")
 	}
+	p.CreatedAt = createdAt.Format(time.RFC3339Nano)
+	p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
 
-	// Return updated profile.
-	query := database.NewFilter().
-		Select("id,email,full_name,created_at,updated_at").
-		Eq("id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("profiles", query)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to fetch updated profile")
-	}
-
-	var profiles []models.Profile
-	if err := json.Unmarshal(body, &profiles); err != nil || len(profiles) == 0 {
-		return errInternal(c, "failed to parse updated profile")
-	}
-
-	return c.JSON(profiles[0])
+	return c.JSON(p)
 }
 
 // DeleteAccount permanently removes the authenticated user and all their data.
-// This includes all owned budgets, sections, categories, expenses, invites,
+// This includes all owned budgets, categories, expenses, invites,
 // collaborator records, and the profile itself. Executes in a single transaction.
 func DeleteAccount(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
@@ -577,28 +562,9 @@ func DeleteAccount(c *fiber.Ctx) error {
 			return errInternal(c, "failed to delete expenses")
 		}
 
-		// Collect section IDs to delete nested subcategories.
-		secRows, err := tx.Query(ctx, "SELECT id FROM budget_categories WHERE budget_id = ANY($1::uuid[])", budgetIDs)
-		if err != nil {
-			return errInternal(c, "failed to fetch sections")
-		}
-		var sectionIDs []string
-		for secRows.Next() {
-			var id string
-			if scanErr := secRows.Scan(&id); scanErr == nil {
-				sectionIDs = append(sectionIDs, id)
-			}
-		}
-		secRows.Close()
-
-		if len(sectionIDs) > 0 {
-			if _, err = tx.Exec(ctx, "DELETE FROM budget_subcategories WHERE category_id = ANY($1::uuid[])", sectionIDs); err != nil {
-				return errInternal(c, "failed to delete subcategories")
-			}
-		}
-
+		// Delete flat categories for all owned budgets.
 		if _, err = tx.Exec(ctx, "DELETE FROM budget_categories WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
-			return errInternal(c, "failed to delete sections")
+			return errInternal(c, "failed to delete categories")
 		}
 
 		if _, err = tx.Exec(ctx, "DELETE FROM budget_invites WHERE budget_id = ANY($1::uuid[])", budgetIDs); err != nil {
@@ -624,6 +590,20 @@ func DeleteAccount(c *fiber.Ctx) error {
 		return errInternal(c, "failed to delete invites")
 	}
 
+	// Null out foreign-key references from other users' data so the profile
+	// delete below does not violate the non-CASCADE references. Without this,
+	// deleting a profile fails if the user accepted an invite on another
+	// budget or authored an expense as a collaborator on someone else's budget.
+	if _, err = tx.Exec(ctx, "UPDATE budget_invites SET used_by = NULL WHERE used_by = $1", uid); err != nil {
+		return errInternal(c, "failed to clear invite references")
+	}
+	if _, err = tx.Exec(ctx, "UPDATE budget_expenses SET created_by = NULL WHERE created_by = $1", uid); err != nil {
+		return errInternal(c, "failed to clear expense references")
+	}
+	if _, err = tx.Exec(ctx, "UPDATE budget_links SET created_by = NULL WHERE created_by = $1", uid); err != nil {
+		return errInternal(c, "failed to clear link references")
+	}
+
 	// Delete sessions.
 	if _, err = tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", uid); err != nil {
 		return errInternal(c, "failed to delete sessions")
@@ -637,6 +617,11 @@ func DeleteAccount(c *fiber.Ctx) error {
 	if err := tx.Commit(ctx); err != nil {
 		return errInternal(c, "failed to commit account deletion")
 	}
+
+	// Invalidate any cached session entries for this user so outstanding
+	// tokens are immediately rejected by the auth middleware rather than
+	// remaining valid until the cache TTL expires.
+	middleware.InvalidateUserSessionCache(uid)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

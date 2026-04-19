@@ -96,14 +96,15 @@ func ListExpenses(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	reqCtx := c.Context()
+	if err := verifyBudgetAccessCtx(reqCtx, budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
 	limit, offset := parsePaginationParams(c)
 
 	query := database.NewFilter().
-		Select("id,budget_id,subcategory_id,amount,description,expense_date,created_by,created_at,updated_at").
+		Select("id,budget_id,category_id,amount,description,expense_date,created_by,created_at,updated_at").
 		Eq("budget_id", budgetID.String()).
 		Gte("expense_date", expenseRetentionCutoff()).
 		Order("expense_date", "desc").
@@ -111,7 +112,7 @@ func ListExpenses(c *fiber.Ctx) error {
 		Offset(offset).
 		Build()
 
-	body, statusCode, err := database.DB.Get("budget_expenses", query)
+	body, statusCode, err := database.DB.GetCtx(reqCtx, "budget_expenses", query)
 	if err != nil || statusCode != http.StatusOK {
 		return errInternal(c, "failed to fetch expenses")
 	}
@@ -144,14 +145,16 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
+	reqCtx := c.Context()
+
 	// Verify access before any queries to prevent unauthenticated probing.
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
+	if err := verifyBudgetAccessCtx(reqCtx, budgetID, userID); err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
 	// Enforce per-budget expense limit using COUNT(*) instead of fetching all rows.
 	var expenseCount int
-	err := database.DB.Pool.QueryRow(context.Background(),
+	err := database.DB.Pool.QueryRow(reqCtx,
 		`SELECT COUNT(*) FROM budget_expenses WHERE budget_id = $1`, budgetID).Scan(&expenseCount)
 	if err != nil {
 		return errInternal(c, "failed to check expense count")
@@ -192,8 +195,11 @@ func CreateExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "expense_date cannot be more than 1 year in the future")
 	}
 
-	// Verify category belongs to this budget.
-	if err := verifyCategoryBelongsToBudget(req.CategoryID, budgetID); err != nil {
+	// Flat category model: single existence check.
+	var belongs bool
+	if err := database.DB.Pool.QueryRow(reqCtx,
+		`SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)`,
+		req.CategoryID, budgetID).Scan(&belongs); err != nil || !belongs {
 		return errBadRequest(c, "category does not belong to this budget")
 	}
 
@@ -213,24 +219,13 @@ func CreateExpense(c *fiber.Ctx) error {
 		UpdatedAt:   now,
 	}
 
-	payload := map[string]interface{}{
-		"id":             expenseID.String(),
-		"budget_id":      budgetID.String(),
-		"subcategory_id": req.CategoryID.String(),
-		"amount":         req.Amount,
-		"description":    req.Description,
-		"expense_date":   req.ExpenseDate,
-		"created_by":     userID.String(),
-		"created_at":     now.Format(time.RFC3339Nano),
-		"updated_at":     now.Format(time.RFC3339Nano),
-	}
-	payloadBytes, err := marshalJSON(payload)
-	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	_, statusCode, err := database.DB.Post("budget_expenses", payloadBytes)
-	if err != nil || statusCode != http.StatusCreated {
+	// Direct INSERT via pool avoids the HTTP-layer JSON round-trip of DB.Post.
+	if _, err := database.DB.Pool.Exec(reqCtx, `
+		INSERT INTO budget_expenses
+			(id, budget_id, category_id, amount, description, expense_date, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+	`, expenseID, budgetID, req.CategoryID, req.Amount, req.Description,
+		req.ExpenseDate, userID, now); err != nil {
 		return errInternal(c, "failed to create expense")
 	}
 
@@ -295,32 +290,36 @@ func UpdateExpense(c *fiber.Ctx) error {
 		}
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
+	reqCtx := c.Context()
 
-	// Fetch existing expense.
-	getQuery := database.NewFilter().
-		Select("*").
-		Eq("id", expenseID.String()).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_expenses", getQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to fetch expense")
-	}
-
-	var expenses []models.Expense
-	if err := json.Unmarshal(body, &expenses); err != nil || len(expenses) == 0 {
+	// Fused access-check + expense fetch. A single query enforces:
+	//   1. The expense belongs to the budget.
+	//   2. The user owns or collaborates on the budget.
+	var exp models.Expense
+	err := database.DB.Pool.QueryRow(reqCtx, `
+		SELECT e.id, e.budget_id, e.category_id, e.amount, e.description,
+		       e.expense_date, e.created_by, e.created_at, e.updated_at
+		FROM budget_expenses e
+		WHERE e.id = $1 AND e.budget_id = $2
+		  AND EXISTS (
+		    SELECT 1 FROM budgets WHERE id = $2 AND user_id = $3
+		    UNION ALL
+		    SELECT 1 FROM budget_collaborators WHERE budget_id = $2 AND user_id = $3
+		  )
+	`, expenseID, budgetID, userID).Scan(
+		&exp.ID, &exp.BudgetID, &exp.CategoryID, &exp.Amount, &exp.Description,
+		&exp.ExpenseDate, &exp.CreatedBy, &exp.CreatedAt, &exp.UpdatedAt,
+	)
+	if err != nil {
 		return errNotFound(c, "expense not found")
 	}
 
-	exp := expenses[0]
-
 	// Apply partial updates.
 	if req.CategoryID != nil {
-		if err := verifyCategoryBelongsToBudget(*req.CategoryID, budgetID); err != nil {
+		var belongs bool
+		if err := database.DB.Pool.QueryRow(reqCtx,
+			`SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)`,
+			*req.CategoryID, budgetID).Scan(&belongs); err != nil || !belongs {
 			return errBadRequest(c, "category does not belong to this budget")
 		}
 		exp.CategoryID = *req.CategoryID
@@ -338,25 +337,13 @@ func UpdateExpense(c *fiber.Ctx) error {
 	now := time.Now().UTC()
 	exp.UpdatedAt = now
 
-	updatePayload := map[string]interface{}{
-		"subcategory_id": exp.CategoryID.String(),
-		"amount":         exp.Amount,
-		"description":    exp.Description,
-		"expense_date":   exp.ExpenseDate,
-		"updated_at":     now.Format(time.RFC3339Nano),
-	}
-	updateBytes, err := marshalJSON(updatePayload)
-	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	patchQuery := database.NewFilter().
-		Eq("id", expenseID.String()).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	_, statusCode, err = database.DB.Patch("budget_expenses", patchQuery, updateBytes)
-	if err != nil || statusCode != http.StatusOK {
+	if _, err := database.DB.Pool.Exec(reqCtx, `
+		UPDATE budget_expenses
+		SET category_id = $1, amount = $2, description = $3,
+		    expense_date = $4, updated_at = $5
+		WHERE id = $6 AND budget_id = $7
+	`, exp.CategoryID, exp.Amount, exp.Description, exp.ExpenseDate, now,
+		expenseID, budgetID); err != nil {
 		return errInternal(c, "failed to update expense")
 	}
 
@@ -384,39 +371,27 @@ func DeleteExpense(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid expense ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
+	reqCtx := c.Context()
 
-	eid := expenseID.String()
-
-	// Verify expense exists.
-	checkQuery := database.NewFilter().
-		Select("id").
-		Eq("id", eid).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budget_expenses", checkQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to verify expense")
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
+	// Single query: deletes only if the budget is accessible to the user
+	// AND the expense belongs to that budget. RETURNING lets us detect a
+	// non-existent expense without a separate pre-check GET.
+	var deletedID uuid.UUID
+	err := database.DB.Pool.QueryRow(reqCtx, `
+		DELETE FROM budget_expenses
+		WHERE id = $1 AND budget_id = $2
+		  AND EXISTS (
+		    SELECT 1 FROM budgets WHERE id = $2 AND user_id = $3
+		    UNION ALL
+		    SELECT 1 FROM budget_collaborators WHERE budget_id = $2 AND user_id = $3
+		  )
+		RETURNING id
+	`, expenseID, budgetID, userID).Scan(&deletedID)
+	if err != nil {
 		return errNotFound(c, "expense not found")
 	}
 
-	// Delete the expense.
-	delQuery := database.NewFilter().
-		Eq("id", eid).
-		Eq("budget_id", budgetID.String()).
-		Build()
-
-	_, statusCode, err = database.DB.Delete("budget_expenses", delQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete expense")
-	}
+	eid := deletedID.String()
 
 	broadcast(budgetID.String(), ws.MessageTypeExpenseDeleted, map[string]string{"id": eid})
 	broadcastToLinkedTargets(budgetID, ws.MessageTypeExpenseDeleted, map[string]string{"id": eid})

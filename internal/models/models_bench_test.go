@@ -9,7 +9,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// sampleExpenseJSON returns a JSON string for an expense using subcategory_id.
+// sampleExpenseJSON_SubcategoryID returns a JSON string for an expense using
+// the legacy subcategory_id key.
 func sampleExpenseJSON_SubcategoryID() []byte {
 	return []byte(`{
 		"id": "33333333-3333-3333-3333-333333333333",
@@ -23,7 +24,8 @@ func sampleExpenseJSON_SubcategoryID() []byte {
 	}`)
 }
 
-// sampleExpenseJSON_CategoryID returns a JSON string for an expense using category_id.
+// sampleExpenseJSON_CatID returns a JSON string for an expense using
+// the canonical category_id key.
 func sampleExpenseJSON_CatID() []byte {
 	return []byte(`{
 		"id": "33333333-3333-3333-3333-333333333333",
@@ -95,7 +97,7 @@ func BenchmarkExpenseMarshalJSON(b *testing.B) {
 // expenses to measure throughput for bulk operations.
 func BenchmarkExpenseUnmarshalLargeArray(b *testing.B) {
 	// Build a JSON array of 1000 expenses.
-	single := `{"id":"33333333-3333-3333-3333-333333333333","budget_id":"22222222-2222-2222-2222-222222222222","subcategory_id":"11111111-1111-1111-1111-111111111111","amount":150.50,"description":"Groceries","expense_date":"2026-04-10","created_at":"2026-04-10T12:00:00Z","updated_at":"2026-04-10T12:00:00Z"}`
+	single := `{"id":"33333333-3333-3333-3333-333333333333","budget_id":"22222222-2222-2222-2222-222222222222","category_id":"11111111-1111-1111-1111-111111111111","amount":150.50,"description":"Groceries","expense_date":"2026-04-10","created_at":"2026-04-10T12:00:00Z","updated_at":"2026-04-10T12:00:00Z"}`
 	arr := []byte("[")
 	for i := 0; i < 1000; i++ {
 		if i > 0 {
@@ -117,20 +119,18 @@ func BenchmarkExpenseUnmarshalLargeArray(b *testing.B) {
 	}
 }
 
-// BenchmarkRoundAmount benchmarks the roundAmount helper from the summary
-// package. Since roundAmount is in the handlers package, we benchmark the
-// equivalent math here to compare pure computation cost.
-func BenchmarkRoundAmount(b *testing.B) {
-	// We inline the same logic: math.Round(v*100)/100
-	// This benchmark exists to establish a baseline for the rounding computation.
-	import_math_round := func(v float64) float64 {
+// BenchmarkRoundAmount_Local benchmarks an inline rounding helper equivalent
+// to the handlers-package roundAmount function so we have a baseline for the
+// rounding cost regardless of package.
+func BenchmarkRoundAmount_Local(b *testing.B) {
+	roundLocal := func(v float64) float64 {
 		return float64(int64(v*100+0.5)) / 100
 	}
 	values := []float64{0, 1234.5678, -99.999, 0.001, 100.0, 3.456, 2.344, 99.995}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, v := range values {
-			_ = import_math_round(v)
+			_ = roundLocal(v)
 		}
 	}
 }
@@ -213,47 +213,31 @@ func BenchmarkBudgetMarshalJSON(b *testing.B) {
 }
 
 // BenchmarkBudgetSummaryMarshalJSON benchmarks marshaling a realistic
-// BudgetSummary response with multiple sections and categories.
+// BudgetSummary response with multiple flat categories.
 func BenchmarkBudgetSummaryMarshalJSON(b *testing.B) {
 	now := time.Now()
-	sections := make([]SectionSummary, 4)
-	for i := range sections {
-		cats := make([]CategorySummary, 4)
-		for j := range cats {
-			cats[j] = CategorySummary{
-				Category: SummaryCategoryView{
-					ID:                uuid.New(),
-					SectionID:         uuid.New(),
-					Name:              fmt.Sprintf("Category %d-%d", i, j),
-					AllocationPercent: 25,
-					Icon:              "home",
-					SortOrder:         j,
-					CreatedAt:         now,
-				},
-				AllocatedAmount: 250000,
-				TotalSpent:      100000,
-				ExpenseCount:    15,
-			}
-		}
-		sections[i] = SectionSummary{
-			Section: Section{
-				ID:                uuid.New(),
-				BudgetID:          uuid.New(),
-				Name:              fmt.Sprintf("Section %d", i),
-				AllocationPercent: 25,
-				Icon:              "wallet",
-				SortOrder:         i,
-				CreatedAt:         now,
+	budgetID := uuid.New()
+	cats := make([]CategorySummary, 16)
+	for i := range cats {
+		cats[i] = CategorySummary{
+			Category: SummaryCategoryView{
+				ID:              uuid.New(),
+				BudgetID:        budgetID,
+				Name:            fmt.Sprintf("Category %d", i),
+				AllocationValue: 250000,
+				Icon:            "home",
+				SortOrder:       i,
+				CreatedAt:       now,
 			},
-			Categories:      cats,
-			AllocatedAmount: 1000000,
-			TotalSpent:      400000,
+			AllocatedAmount: 250000,
+			TotalSpent:      100000,
+			ExpenseCount:    15,
 		}
 	}
 
 	summary := BudgetSummary{
 		Budget: Budget{
-			ID:                  uuid.New(),
+			ID:                  budgetID,
 			UserID:              uuid.New(),
 			Name:                "Test Budget",
 			MonthlyIncome:       5000000,
@@ -264,7 +248,7 @@ func BenchmarkBudgetSummaryMarshalJSON(b *testing.B) {
 			CreatedAt:           now,
 			UpdatedAt:           now,
 		},
-		Sections:    sections,
+		Categories:  cats,
 		TotalBudget: 5000000,
 		TotalSpent:  1600000,
 	}

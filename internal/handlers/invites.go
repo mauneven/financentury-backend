@@ -311,10 +311,20 @@ func AcceptInvite(c *fiber.Ctx) error {
 		}
 	}
 
+	// Mark invite as used AND insert the collaborator in the SAME transaction
+	// so that if the collaborator insert fails (e.g., limit reached), the
+	// invite is NOT consumed. Without this, a failed insert would leave the
+	// invite permanently marked as used even though the user was never added.
+	tx, err := database.DB.Pool.Begin(context.Background())
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(context.Background())
+
 	// Atomically mark invite as used — prevents race condition where two
 	// concurrent requests both pass the used_by check.
 	var inviteID string
-	err = database.DB.Pool.QueryRow(context.Background(),
+	err = tx.QueryRow(context.Background(),
 		`UPDATE budget_invites SET used_by = $1, used_at = NOW()
 		 WHERE id = $2 AND used_by IS NULL
 		 RETURNING id`,
@@ -325,7 +335,7 @@ func AcceptInvite(c *fiber.Ctx) error {
 
 	// Atomically add collaborator only if under the limit (prevents race condition).
 	collabID := uuid.New()
-	tag, insertErr := database.DB.Pool.Exec(context.Background(),
+	tag, insertErr := tx.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (id, budget_id, user_id, role)
 		 SELECT $1, $2, $3, 'collaborator'
 		 WHERE (SELECT COUNT(*) FROM budget_collaborators WHERE budget_id = $2) < $4`,
@@ -337,6 +347,10 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "collaborator limit reached (max 5)",
 		})
+	}
+
+	if err := tx.Commit(context.Background()); err != nil {
+		return errInternal(c, "failed to commit invite acceptance")
 	}
 
 	// Return the budget data.

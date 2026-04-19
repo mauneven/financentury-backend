@@ -141,112 +141,10 @@ func TestPasswordComplexity_MissingDigit(t *testing.T) {
 	}
 }
 
-// ==================== SectionWithCategories Type ====================
+// ==================== MigrateBudget Flat Type ====================
 
-func TestSectionWithCategories_IsExported(t *testing.T) {
-	// Verify the SectionWithCategories struct can be instantiated.
-	swc := SectionWithCategories{}
-	if swc.Name != "" {
-		t.Error("default SectionWithCategories name should be empty")
-	}
-	if swc.Categories != nil {
-		t.Error("default SectionWithCategories categories should be nil")
-	}
-}
-
-// ==================== Guided Section Template Validation ====================
-
-func TestGuidedSections_UniqueNames(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":    getBalancedSections(),
-		"debt-free":   getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":      getTravelSections(),
-		"event":       getEventSections(),
-	}
-
-	for name, sections := range templates {
-		seen := make(map[string]bool)
-		for _, s := range sections {
-			if seen[s.Name] {
-				t.Errorf("%s: duplicate section name %q", name, s.Name)
-			}
-			seen[s.Name] = true
-		}
-	}
-}
-
-func TestGuidedSections_SortOrderSequential(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":    getBalancedSections(),
-		"debt-free":   getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":      getTravelSections(),
-		"event":       getEventSections(),
-	}
-
-	for name, sections := range templates {
-		for i, s := range sections {
-			expectedOrder := i + 1
-			if s.SortOrder != expectedOrder {
-				t.Errorf("%s: section %q sort_order = %d, want %d", name, s.Name, s.SortOrder, expectedOrder)
-			}
-		}
-	}
-}
-
-func TestGuidedSections_AllIconsNonEmpty(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":    getBalancedSections(),
-		"debt-free":   getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":      getTravelSections(),
-		"event":       getEventSections(),
-	}
-
-	for name, sections := range templates {
-		for _, s := range sections {
-			if s.Icon == "" {
-				t.Errorf("%s: section %q has empty icon", name, s.Name)
-			}
-			for _, c := range s.Categories {
-				if c.Icon == "" {
-					t.Errorf("%s: category %q has empty icon", name, c.Name)
-				}
-			}
-		}
-	}
-}
-
-func TestGuidedSections_NoNamesExceedMax(t *testing.T) {
-	templates := map[string][]guidedSection{
-		"balanced":    getBalancedSections(),
-		"debt-free":   getDebtFreeSections(),
-		"debt-payoff": getDebtPayoffSections(),
-		"travel":      getTravelSections(),
-		"event":       getEventSections(),
-	}
-
-	for name, sections := range templates {
-		for _, s := range sections {
-			if len(s.Name) > maxNameLength {
-				t.Errorf("%s: section name %q exceeds max length", name, s.Name)
-			}
-			if len(s.Icon) > maxIconLength {
-				t.Errorf("%s: section icon %q exceeds max length", name, s.Icon)
-			}
-			for _, c := range s.Categories {
-				if len(c.Name) > maxNameLength {
-					t.Errorf("%s: category name %q exceeds max length", name, c.Name)
-				}
-			}
-		}
-	}
-}
-
-// ==================== MigrateRequest Types ====================
-
-func TestMigrateRequest_StructFields(t *testing.T) {
+func TestMigrateBudget_FlatCategoriesShape(t *testing.T) {
+	// The flat MigrateBudget has Categories directly (no Sections tier).
 	req := MigrateRequest{
 		Budgets: []MigrateBudget{
 			{
@@ -254,14 +152,9 @@ func TestMigrateRequest_StructFields(t *testing.T) {
 				MonthlyIncome: 5000000,
 				Currency:      "COP",
 				Mode:          "manual",
-				Sections: []MigrateSection{
-					{
-						Name:              "Section 1",
-						AllocationValue: 100,
-						Categories: []MigrateCategory{
-							{Name: "Cat 1", AllocationValue: 100, LocalID: "cat-1"},
-						},
-					},
+				Categories: []MigrateCategory{
+					{Name: "Cat 1", AllocationValue: 100, LocalID: "cat-1"},
+					{Name: "Cat 2", AllocationValue: 50, LocalID: "cat-2"},
 				},
 				Expenses: []MigrateExpense{
 					{LocalCategoryID: "cat-1", Amount: 100, Description: "Test"},
@@ -273,11 +166,14 @@ func TestMigrateRequest_StructFields(t *testing.T) {
 	if len(req.Budgets) != 1 {
 		t.Error("should have 1 budget")
 	}
-	if len(req.Budgets[0].Sections) != 1 {
-		t.Error("should have 1 section")
+	if len(req.Budgets[0].Categories) != 2 {
+		t.Error("should have 2 categories")
 	}
 	if len(req.Budgets[0].Expenses) != 1 {
 		t.Error("should have 1 expense")
+	}
+	if req.Budgets[0].Categories[0].LocalID != "cat-1" {
+		t.Errorf("LocalID = %q, want cat-1", req.Budgets[0].Categories[0].LocalID)
 	}
 }
 

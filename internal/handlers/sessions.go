@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/the-financial-workspace/backend/internal/database"
+	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
@@ -117,6 +118,11 @@ func RevokeSession(c *fiber.Ctx) error {
 		return errInternal(c, "failed to revoke session")
 	}
 
+	// Invalidate the session cache entry for the revoked token so the next
+	// request using that token is rejected immediately instead of waiting for
+	// the 60-second cache TTL to expire.
+	middleware.InvalidateSessionCache(rowTokenHash)
+
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
@@ -134,6 +140,10 @@ func SignOut(c *fiber.Ctx) error {
 	); err != nil {
 		log.Printf("[sessions] failed to revoke session on sign-out: %v", err)
 	}
+
+	// Invalidate the session cache entry so the revoked token is rejected on
+	// the next request (instead of succeeding for up to 60s due to cache TTL).
+	middleware.InvalidateSessionCache(tokenHash)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

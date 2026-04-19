@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,13 +27,17 @@ type Client struct {
 var DB *Client
 
 // Init initializes the global database client from a PostgreSQL connection URL.
+//
+// Pool sizing defaults are tuned for a web service handling concurrent
+// summary / trends requests (which fan out to several parallel queries via
+// errgroup). Override via DB_MAX_CONNS / DB_MIN_CONNS env vars when needed.
 func Init(databaseURL string) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		panic(fmt.Sprintf("invalid DATABASE_URL: %v", err))
 	}
-	cfg.MinConns = 5
-	cfg.MaxConns = 20
+	cfg.MinConns = envInt32("DB_MIN_CONNS", 10)
+	cfg.MaxConns = envInt32("DB_MAX_CONNS", 50)
 	cfg.MaxConnLifetime = 30 * time.Minute
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
@@ -40,6 +46,16 @@ func Init(databaseURL string) {
 		panic(fmt.Sprintf("failed to connect to database: %v", err))
 	}
 	DB = &Client{Pool: pool}
+}
+
+// envInt32 reads an environment variable as int32 with a default fallback.
+func envInt32(key string, def int32) int32 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 32); err == nil && n > 0 {
+			return int32(n)
+		}
+	}
+	return def
 }
 
 // Close releases the connection pool.
@@ -206,8 +222,15 @@ func selectColumns(raw string) string {
 // CRUD methods — same public API as the previous PostgREST client
 // ---------------------------------------------------------------------------
 
-// Get performs a SELECT and returns results as a JSON array.
+// Get performs a SELECT and returns results as a JSON array, using
+// context.Background() for the underlying query. Prefer GetCtx in handlers
+// so a cancelled HTTP request propagates to the DB.
 func (c *Client) Get(table, query string) ([]byte, int, error) {
+	return c.GetCtx(context.Background(), table, query)
+}
+
+// GetCtx is the context-aware variant of Get.
+func (c *Client) GetCtx(ctx context.Context, table, query string) ([]byte, int, error) {
 	p := parseQuery(query)
 	where, args := p.buildWhere(1)
 	limitOffset, loArgs := p.buildLimitOffset(len(args) + 1)
@@ -219,7 +242,7 @@ func (c *Client) Get(table, query string) ([]byte, int, error) {
 	sql := fmt.Sprintf("SELECT COALESCE(json_agg(to_json(t)), '[]'::json) FROM (%s) t", inner)
 
 	var result json.RawMessage
-	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+	if err := c.Pool.QueryRow(ctx, sql, args...).Scan(&result); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("query %s failed: %w", table, err)
 	}
 	return result, http.StatusOK, nil
@@ -227,6 +250,11 @@ func (c *Client) Get(table, query string) ([]byte, int, error) {
 
 // Post performs an INSERT and returns the created row(s) as a JSON array.
 func (c *Client) Post(table string, body []byte) ([]byte, int, error) {
+	return c.PostCtx(context.Background(), table, body)
+}
+
+// PostCtx is the context-aware variant of Post.
+func (c *Client) PostCtx(ctx context.Context, table string, body []byte) ([]byte, int, error) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err)
@@ -248,7 +276,7 @@ func (c *Client) Post(table string, body []byte) ([]byte, int, error) {
 		quoteIdent(table), strings.Join(cols, ", "), strings.Join(phs, ", "))
 
 	var result json.RawMessage
-	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+	if err := c.Pool.QueryRow(ctx, sql, args...).Scan(&result); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("insert into %s failed: %w", table, err)
 	}
 	return result, http.StatusCreated, nil
@@ -256,6 +284,11 @@ func (c *Client) Post(table string, body []byte) ([]byte, int, error) {
 
 // Patch performs an UPDATE on rows matching the query and returns them as JSON.
 func (c *Client) Patch(table, query string, body []byte) ([]byte, int, error) {
+	return c.PatchCtx(context.Background(), table, query, body)
+}
+
+// PatchCtx is the context-aware variant of Patch.
+func (c *Client) PatchCtx(ctx context.Context, table, query string, body []byte) ([]byte, int, error) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("invalid JSON body: %w", err)
@@ -279,7 +312,7 @@ func (c *Client) Patch(table, query string, body []byte) ([]byte, int, error) {
 		quoteIdent(table), strings.Join(sets, ", "), where)
 
 	var result json.RawMessage
-	if err := c.Pool.QueryRow(context.Background(), sql, args...).Scan(&result); err != nil {
+	if err := c.Pool.QueryRow(ctx, sql, args...).Scan(&result); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("update %s failed: %w", table, err)
 	}
 	return result, http.StatusOK, nil
@@ -287,11 +320,16 @@ func (c *Client) Patch(table, query string, body []byte) ([]byte, int, error) {
 
 // Delete removes rows matching the query.
 func (c *Client) Delete(table, query string) ([]byte, int, error) {
+	return c.DeleteCtx(context.Background(), table, query)
+}
+
+// DeleteCtx is the context-aware variant of Delete.
+func (c *Client) DeleteCtx(ctx context.Context, table, query string) ([]byte, int, error) {
 	p := parseQuery(query)
 	where, args := p.buildWhere(1)
 
 	sql := fmt.Sprintf("DELETE FROM %s %s", quoteIdent(table), where)
-	if _, err := c.Pool.Exec(context.Background(), sql, args...); err != nil {
+	if _, err := c.Pool.Exec(ctx, sql, args...); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("delete from %s failed: %w", table, err)
 	}
 	return nil, http.StatusNoContent, nil

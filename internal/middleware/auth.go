@@ -19,6 +19,7 @@ import (
 type sessionCacheEntry struct {
 	revokedAt *time.Time
 	sessionID string
+	userID    string
 	cachedAt  time.Time
 }
 
@@ -28,10 +29,64 @@ var sessionCache sync.Map
 // sessionCacheTTL is how long a cache entry is considered fresh.
 const sessionCacheTTL = 60 * time.Second
 
+// sessionCacheMaxAge is the maximum time an entry may remain in the cache
+// (even if re-queried recently). Used by the background evictor to bound
+// memory growth from long-lived or abandoned tokens.
+const sessionCacheMaxAge = 10 * time.Minute
+
 // InvalidateSessionCache removes a cached session entry so the next request
 // for that token will re-query the database. Call this when revoking a session.
 func InvalidateSessionCache(tokenHash string) {
 	sessionCache.Delete(tokenHash)
+}
+
+// InvalidateUserSessionCache removes all cached session entries for a given
+// user so that any subsequent request using those tokens is re-validated
+// against the database. Call this when deleting a user or wiping all their
+// sessions.
+func InvalidateUserSessionCache(userID string) {
+	if userID == "" {
+		return
+	}
+	sessionCache.Range(func(key, value interface{}) bool {
+		entry, ok := value.(sessionCacheEntry)
+		if !ok {
+			return true
+		}
+		if entry.userID == userID {
+			sessionCache.Delete(key)
+		}
+		return true
+	})
+}
+
+// startSessionCacheEvictor launches a background goroutine that periodically
+// purges expired entries from sessionCache, bounding memory growth. An
+// attacker presenting many distinct tokens (valid signature, any user id)
+// could otherwise fill the cache indefinitely.
+func startSessionCacheEvictor() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			sessionCache.Range(func(key, value interface{}) bool {
+				entry, ok := value.(sessionCacheEntry)
+				if !ok {
+					sessionCache.Delete(key)
+					return true
+				}
+				if now.Sub(entry.cachedAt) > sessionCacheMaxAge {
+					sessionCache.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
+}
+
+func init() {
+	startSessionCacheEvictor()
 }
 
 // Claims represents the JWT claims issued by the backend.
@@ -120,15 +175,28 @@ func Protected() fiber.Handler {
 			var revokedAt *time.Time
 			var lastActive time.Time
 			var sessionID string
+			var sessionUserID string
 			err := database.DB.Pool.QueryRow(context.Background(),
-				`SELECT id, revoked_at, last_active_at FROM user_sessions WHERE token_hash = $1`,
+				`SELECT id, user_id::text, revoked_at, last_active_at FROM user_sessions WHERE token_hash = $1`,
 				tokenHash,
-			).Scan(&sessionID, &revokedAt, &lastActive)
+			).Scan(&sessionID, &sessionUserID, &revokedAt, &lastActive)
 			if err == nil {
+				// Security: ensure the token's user_id claim matches the
+				// user_id stored with the session row. Without this check a
+				// token rebound to a different user (via a custom JWT with
+				// the correct signing key, e.g. during an incident response
+				// where the key leaked) could still authenticate.
+				if sessionUserID != userID.String() {
+					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+						"error": "session user mismatch",
+					})
+				}
+
 				// Store result in cache.
 				sessionCache.Store(tokenHash, sessionCacheEntry{
 					revokedAt: revokedAt,
 					sessionID: sessionID,
+					userID:    sessionUserID,
 					cachedAt:  time.Now(),
 				})
 

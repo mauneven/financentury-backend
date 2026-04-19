@@ -32,9 +32,6 @@ func TestMessageTypeConstants(t *testing.T) {
 		"MessageTypeBudgetCreated":   "budget_created",
 		"MessageTypeBudgetUpdated":   "budget_updated",
 		"MessageTypeBudgetDeleted":   "budget_deleted",
-		"MessageTypeSectionCreated":  "section_created",
-		"MessageTypeSectionUpdated":  "section_updated",
-		"MessageTypeSectionDeleted":  "section_deleted",
 		"MessageTypeCategoryCreated": "category_created",
 		"MessageTypeCategoryUpdated": "category_updated",
 		"MessageTypeCategoryDeleted": "category_deleted",
@@ -48,9 +45,6 @@ func TestMessageTypeConstants(t *testing.T) {
 		"MessageTypeBudgetCreated":   MessageTypeBudgetCreated,
 		"MessageTypeBudgetUpdated":   MessageTypeBudgetUpdated,
 		"MessageTypeBudgetDeleted":   MessageTypeBudgetDeleted,
-		"MessageTypeSectionCreated":  MessageTypeSectionCreated,
-		"MessageTypeSectionUpdated":  MessageTypeSectionUpdated,
-		"MessageTypeSectionDeleted":  MessageTypeSectionDeleted,
 		"MessageTypeCategoryCreated": MessageTypeCategoryCreated,
 		"MessageTypeCategoryUpdated": MessageTypeCategoryUpdated,
 		"MessageTypeCategoryDeleted": MessageTypeCategoryDeleted,
@@ -496,8 +490,8 @@ func TestHub_BroadcastToBudget_SetsBudgetID(t *testing.T) {
 
 	// BroadcastToBudget should set the BudgetID on the message.
 	hub.BroadcastToBudget("budget-xyz", Message{
-		Type: MessageTypeSectionCreated,
-		Data: map[string]string{"name": "New Section"},
+		Type: MessageTypeCategoryCreated,
+		Data: map[string]string{"name": "New Category"},
 	})
 
 	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -513,8 +507,8 @@ func TestHub_BroadcastToBudget_SetsBudgetID(t *testing.T) {
 	if received.BudgetID != "budget-xyz" {
 		t.Errorf("BudgetID = %q, want %q", received.BudgetID, "budget-xyz")
 	}
-	if received.Type != MessageTypeSectionCreated {
-		t.Errorf("Type = %q, want %q", received.Type, MessageTypeSectionCreated)
+	if received.Type != MessageTypeCategoryCreated {
+		t.Errorf("Type = %q, want %q", received.Type, MessageTypeCategoryCreated)
 	}
 }
 
