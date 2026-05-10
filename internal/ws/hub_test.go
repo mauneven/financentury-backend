@@ -2,6 +2,7 @@ package ws
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -265,7 +266,8 @@ func TestHub_BroadcastToBudget_DoesNotDeliverToUnsubscribedClient(t *testing.T) 
 		t.Error("unsubscribed client should not receive the broadcast")
 	}
 	// Expect a timeout error, which is correct.
-	if netErr, ok := err.(net.Error); ok && !netErr.Timeout() {
+	var netErr net.Error
+	if errors.As(err, &netErr) && !netErr.Timeout() {
 		t.Errorf("expected timeout error, got: %v", err)
 	}
 }
@@ -562,5 +564,334 @@ func TestHub_MultipleClients_OnlySubscribedReceive(t *testing.T) {
 	_, _, err = clientConn2.ReadMessage()
 	if err == nil {
 		t.Error("client2 should not have received budget-a message")
+	}
+}
+
+// ==================== Budget bucket optimization ====================
+//
+// These tests verify the PERF: per-budget bucket index. A broadcast must
+// only reach clients that have the budget in their BudgetIDs set, and the
+// bucket count must track subscribers cleanly across register, unregister,
+// subscribe, and unsubscribe.
+
+func TestHub_BudgetSubscriberCount_EmptyByDefault(t *testing.T) {
+	hub := NewHub()
+	if n := hub.BudgetSubscriberCount("never-subscribed"); n != 0 {
+		t.Errorf("empty bucket should have 0 subscribers, got %d", n)
+	}
+}
+
+func TestHub_BudgetBucket_TracksRegisteredClients(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, _, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"budget-1": true, "budget-2": true},
+	}
+	hub.Register(client)
+	time.Sleep(50 * time.Millisecond)
+
+	if n := hub.BudgetSubscriberCount("budget-1"); n != 1 {
+		t.Errorf("budget-1 should have 1 subscriber, got %d", n)
+	}
+	if n := hub.BudgetSubscriberCount("budget-2"); n != 1 {
+		t.Errorf("budget-2 should have 1 subscriber, got %d", n)
+	}
+	if n := hub.BudgetSubscriberCount("budget-3"); n != 0 {
+		t.Errorf("budget-3 should have 0 subscribers, got %d", n)
+	}
+}
+
+func TestHub_BudgetBucket_ReleasedOnUnregister(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, _, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"budget-1": true},
+	}
+	hub.Register(client)
+	time.Sleep(50 * time.Millisecond)
+
+	hub.Unregister(client)
+	time.Sleep(50 * time.Millisecond)
+
+	if n := hub.BudgetSubscriberCount("budget-1"); n != 0 {
+		t.Errorf("after unregister budget-1 should have 0, got %d", n)
+	}
+}
+
+func TestHub_SubscribeToBudget_UpdatesBucket(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, clientConn, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"initial": true},
+	}
+	hub.Register(client)
+	time.Sleep(50 * time.Millisecond)
+
+	// Subscribing after registration must index the client in the new
+	// bucket so broadcasts to "late-added" reach it.
+	hub.SubscribeToBudget(client, "late-added")
+	time.Sleep(50 * time.Millisecond)
+
+	if n := hub.BudgetSubscriberCount("late-added"); n != 1 {
+		t.Errorf("late-added should have 1 subscriber after SubscribeToBudget, got %d", n)
+	}
+
+	hub.BroadcastToBudget("late-added", Message{Type: MessageTypeExpenseCreated})
+
+	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := clientConn.ReadMessage(); err != nil {
+		t.Errorf("subscriber should have received broadcast to late-added: %v", err)
+	}
+}
+
+func TestHub_UnsubscribeFromBudget_StopsDelivery(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, clientConn, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"budget-x": true},
+	}
+	hub.Register(client)
+	time.Sleep(50 * time.Millisecond)
+
+	hub.UnsubscribeFromBudget(client, "budget-x")
+	time.Sleep(50 * time.Millisecond)
+
+	if n := hub.BudgetSubscriberCount("budget-x"); n != 0 {
+		t.Errorf("after unsubscribe budget-x should have 0 subscribers, got %d", n)
+	}
+
+	// A broadcast must not reach the now-unsubscribed client.
+	hub.BroadcastToBudget("budget-x", Message{Type: MessageTypeExpenseCreated})
+
+	clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, _, err := clientConn.ReadMessage(); err == nil {
+		t.Error("unsubscribed client must not receive broadcast")
+	}
+}
+
+// ==================== Slow-client handling ====================
+//
+// If a client cannot drain its send buffer, the hub must (a) not block the
+// broadcast loop and (b) evict the slow client. With the dedup flag the hub
+// schedules at most one Unregister for a stalled client.
+
+func TestHub_SlowClient_IsEjectedOnBufferOverflow(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, _, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	// Construct the client manually so we can fill its send buffer
+	// without draining it. We do NOT call hub.Register because that
+	// would spawn a writePump that drains the channel.
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "slow-user",
+		BudgetIDs: map[string]bool{"budget-slow": true},
+		send:      make(chan []byte, sendBufSize),
+	}
+
+	// Splice the client into the hub by hand so no writePump is started.
+	hub.mu.Lock()
+	hub.clients[client] = true
+	hub.budgetBuckets["budget-slow"] = map[*Client]struct{}{client: {}}
+	hub.mu.Unlock()
+
+	// Fill the send buffer exactly to capacity.
+	for i := 0; i < sendBufSize; i++ {
+		client.send <- []byte("prefill")
+	}
+
+	// Now broadcast; the first broadcast should trigger the eject path.
+	for i := 0; i < 5; i++ {
+		hub.BroadcastToBudget("budget-slow", Message{Type: MessageTypeExpenseCreated})
+	}
+
+	// Give the hub time to process the Unregister goroutine.
+	time.Sleep(100 * time.Millisecond)
+
+	if hub.ClientCount() != 0 {
+		t.Errorf("slow client should have been evicted, still have %d clients", hub.ClientCount())
+	}
+	if n := hub.BudgetSubscriberCount("budget-slow"); n != 0 {
+		t.Errorf("bucket should be empty after slow-client eviction, got %d", n)
+	}
+}
+
+// ==================== Concurrency stress: register / subscribe / broadcast ====================
+//
+// Hammer all three paths from many goroutines at once. With -race this
+// verifies we have no lock-order inversion or torn reads on BudgetIDs /
+// budgetBuckets.
+
+func TestHub_ConcurrentRegisterSubscribeBroadcast_NoRace(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	const numClients = 8
+	const numBudgets = 4
+	const opsPerClient = 50
+
+	conns := make([]*websocket.Conn, 0, numClients)
+	cleanups := make([]func(), 0, numClients)
+	defer func() {
+		for _, cl := range cleanups {
+			cl()
+		}
+	}()
+
+	clients := make([]*Client, 0, numClients)
+	for i := 0; i < numClients; i++ {
+		sc, _, cl := startTestWSPair(t)
+		conns = append(conns, sc)
+		cleanups = append(cleanups, cl)
+		c := &Client{
+			Conn:      sc,
+			UserID:    "user-stress",
+			BudgetIDs: map[string]bool{"b0": true},
+		}
+		clients = append(clients, c)
+		hub.Register(c)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(c *Client) {
+			defer wg.Done()
+			for j := 0; j < opsPerClient; j++ {
+				bid := "b" + string(rune('0'+(j%numBudgets)))
+				hub.SubscribeToBudget(c, bid)
+				hub.BroadcastToBudget(bid, Message{Type: MessageTypeExpenseCreated})
+				hub.UnsubscribeFromBudget(c, bid)
+			}
+		}(clients[i])
+	}
+	wg.Wait()
+
+	// Drain anything left in each client's write path by unregistering
+	// sequentially. This also exercises the unregister cleanup under load.
+	for _, c := range clients {
+		hub.Unregister(c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if hub.ClientCount() != 0 {
+		t.Errorf("after all unregisters ClientCount = %d, want 0", hub.ClientCount())
+	}
+	_ = conns
+}
+
+// ==================== Lock ordering / deadlock probe ====================
+//
+// Rapidly interleave Subscribe (grabs client.mu -> h.mu) with Broadcast
+// (grabs h.mu only) and ClientCount (grabs h.mu only). A lock inversion
+// would surface as a deadlock; we bound the test with a timer.
+
+func TestHub_NoDeadlock_SubscribeVsBroadcast(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, _, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"initial": true},
+	}
+	hub.Register(client)
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			hub.SubscribeToBudget(client, "bx")
+			hub.UnsubscribeFromBudget(client, "bx")
+		}
+		close(done)
+	}()
+
+	bdone := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			hub.BroadcastToBudget("bx", Message{Type: MessageTypeExpenseCreated})
+			_ = hub.ClientCount()
+			_ = hub.BudgetSubscriberCount("bx")
+		}
+		close(bdone)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe/Unsubscribe loop did not finish; possible deadlock")
+	}
+	select {
+	case <-bdone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Broadcast loop did not finish; possible deadlock")
+	}
+
+	hub.Unregister(client)
+	time.Sleep(20 * time.Millisecond)
+}
+
+// ==================== Unregister cleans up buckets even if BudgetIDs is stale ====================
+
+func TestHub_Unregister_CleansBucketsWithStaleBudgetIDs(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	serverConn, _, cleanup := startTestWSPair(t)
+	defer cleanup()
+
+	client := &Client{
+		Conn:      serverConn,
+		UserID:    "user-1",
+		BudgetIDs: map[string]bool{"b1": true, "b2": true},
+	}
+	hub.Register(client)
+	time.Sleep(20 * time.Millisecond)
+
+	// Corrupt client.BudgetIDs behind the hub's back. The hub must NOT
+	// rely on this map to find bucket memberships.
+	client.mu.Lock()
+	client.BudgetIDs = map[string]bool{} // clear it
+	client.mu.Unlock()
+
+	hub.Unregister(client)
+	time.Sleep(20 * time.Millisecond)
+
+	if n := hub.BudgetSubscriberCount("b1"); n != 0 {
+		t.Errorf("b1 should be empty after unregister (stale BudgetIDs), got %d", n)
+	}
+	if n := hub.BudgetSubscriberCount("b2"); n != 0 {
+		t.Errorf("b2 should be empty after unregister (stale BudgetIDs), got %d", n)
 	}
 }

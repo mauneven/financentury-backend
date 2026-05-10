@@ -1,12 +1,14 @@
 package handlers
 
 import (
-	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -35,8 +37,10 @@ func ListCategories(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
 	rows, err := database.DB.Pool.Query(reqCtx, `
-		SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
+		SELECT id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
 		FROM budget_categories
 		WHERE budget_id = $1
 		ORDER BY sort_order ASC, created_at ASC
@@ -98,25 +102,32 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
-
-	// Validate and insert atomically: lock the budget row so concurrent
-	// category creates on the same budget can't collectively break the
-	// allocation or count ceilings.
+	// PERF: validate and insert atomically, combining ownership-verification
+	// with the lock acquisition. The previous flow did
+	//   1) SELECT EXISTS (ownership)  2) BEGIN  3) SELECT ... FOR UPDATE
+	// which is now just
+	//   1) BEGIN  2) SELECT monthly_income ... WHERE id=$1 AND user_id=$2 FOR UPDATE
+	// saving one round-trip. If the budget doesn't belong to the user the
+	// FOR UPDATE returns no rows and we 404 — same semantics as before.
+	reqCtx := c.Context()
 	now := time.Now().UTC()
 	catID := uuid.New()
 
-	tx, err := database.DB.Pool.Begin(context.Background())
+	tx, err := database.DB.Pool.Begin(reqCtx)
 	if err != nil {
 		return errInternal(c, "failed to start transaction")
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(reqCtx) //nolint:errcheck
 
 	var currentIncome float64
-	if err := tx.QueryRow(context.Background(),
-		`SELECT monthly_income FROM budgets WHERE id = $1 FOR UPDATE`, budgetID).Scan(&currentIncome); err != nil {
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	if err := tx.QueryRow(reqCtx,
+		`SELECT monthly_income::float8 FROM budgets WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+		budgetID, userID).Scan(&currentIncome); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "budget not found")
+		}
 		return errInternal(c, "failed to fetch budget")
 	}
 
@@ -124,13 +135,16 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value exceeds budget income")
 	}
 
-	// Check both the category count and the existing allocation total under
-	// the lock — one round-trip covers both invariants.
+	// Check the category count, existing allocation total, and current max
+	// sort_order under the lock — one round-trip covers all three invariants.
 	var categoryCount int
 	var totalAlloc float64
-	if err := tx.QueryRow(context.Background(),
-		`SELECT COUNT(*), COALESCE(SUM(allocation_value), 0)
-		 FROM budget_categories WHERE budget_id = $1`, budgetID).Scan(&categoryCount, &totalAlloc); err != nil {
+	var maxSortOrder int
+	// FIX: SUM(allocation_value) is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	if err := tx.QueryRow(reqCtx,
+		`SELECT COUNT(*), COALESCE(SUM(allocation_value), 0)::float8, COALESCE(MAX(sort_order), 0)
+		 FROM budget_categories WHERE budget_id = $1`, budgetID).Scan(&categoryCount, &totalAlloc, &maxSortOrder); err != nil {
 		return errInternal(c, "failed to check existing categories")
 	}
 
@@ -141,16 +155,29 @@ func CreateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "total allocation would exceed budget income")
 	}
 
-	if _, err := tx.Exec(context.Background(),
+	// When the client omits sort_order (or sends 0), append the new category
+	// at the end so freshly-created categories don't all collide at position 0.
+	sortOrder := req.SortOrder
+	if sortOrder <= 0 {
+		sortOrder = maxSortOrder + 1
+	}
+
+	if _, err := tx.Exec(reqCtx,
 		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		catID, budgetID, req.Name, req.AllocationValue, req.Icon, req.SortOrder, now); err != nil {
+		catID, budgetID, req.Name, req.AllocationValue, req.Icon, sortOrder, now); err != nil {
 		return errInternal(c, "failed to create category")
 	}
 
-	if err := tx.Commit(context.Background()); err != nil {
+	if err := tx.Commit(reqCtx); err != nil {
 		return errInternal(c, "failed to commit category creation")
 	}
+
+	// PERF: category changes invalidate the summary (allocations change).
+	// Linked targets also see this category in their linked_categories view,
+	// so purge their caches too.
+	invalidateBudget(budgetID)
+	invalidateLinkedTargets(budgetID)
 
 	cat := models.Category{
 		ID:              catID,
@@ -158,7 +185,7 @@ func CreateCategory(c *fiber.Ctx) error {
 		Name:            req.Name,
 		AllocationValue: req.AllocationValue,
 		Icon:            req.Icon,
-		SortOrder:       req.SortOrder,
+		SortOrder:       sortOrder,
 		CreatedAt:       now,
 	}
 
@@ -214,77 +241,109 @@ func UpdateCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "allocation_value must be positive")
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
+	// PERF: hot path (PATCH from the slider fires rapidly). The old flow ran
+	//   verifyBudgetOwnership + SELECT category + BEGIN + (if amount)
+	//   SELECT monthly_income FOR UPDATE + SELECT SUM(other allocations)
+	//   + UPDATE + COMMIT
+	// i.e. 5-7 round-trips. Now we fuse ownership verification and the
+	// income-lock + other-total check into a single query, and use
+	// UPDATE ... RETURNING so we don't need an initial SELECT of the
+	// category row. Fast path (no allocation change) drops from 3 to 1 query.
+	reqCtx := c.Context()
+
+	// Fast path: no allocation change. Single UPDATE with ownership fused
+	// into the WHERE clause via a sub-select on budgets(user_id).
+	if req.AllocationValue == nil {
+		var cat models.Category
+		// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
+		// without ::float8 cast.
+		err := database.DB.Pool.QueryRow(reqCtx, `
+			UPDATE budget_categories
+			SET name = COALESCE($1, name),
+			    icon = COALESCE($2, icon),
+			    sort_order = COALESCE($3, sort_order)
+			WHERE id = $4 AND budget_id = $5
+			  AND EXISTS (SELECT 1 FROM budgets WHERE id = $5 AND user_id = $6)
+			RETURNING id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
+		`, req.Name, req.Icon, req.SortOrder, catID, budgetID, userID).Scan(
+			&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue, &cat.Icon,
+			&cat.SortOrder, &cat.CreatedAt,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errNotFound(c, "category not found")
+			}
+			return errInternal(c, "failed to update category")
+		}
+
+		invalidateBudget(budgetID)
+		invalidateLinkedTargets(budgetID)
+		broadcast(budgetID.String(), ws.MessageTypeCategoryUpdated, cat)
+		broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryUpdated, cat)
+		return c.JSON(cat)
 	}
 
-	// Fetch the existing category, verifying it belongs to the budget.
-	var cat models.Category
-	if err := database.DB.Pool.QueryRow(c.Context(), `
-		SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
-		FROM budget_categories
-		WHERE id = $1 AND budget_id = $2
-	`, catID, budgetID).Scan(
-		&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue, &cat.Icon,
-		&cat.SortOrder, &cat.CreatedAt,
-	); err != nil {
-		return errNotFound(c, "category not found")
-	}
-
-	// Apply partial updates in memory first.
-	if req.Name != nil {
-		cat.Name = *req.Name
-	}
-	if req.AllocationValue != nil {
-		cat.AllocationValue = *req.AllocationValue
-	}
-	if req.Icon != nil {
-		cat.Icon = *req.Icon
-	}
-	if req.SortOrder != nil {
-		cat.SortOrder = *req.SortOrder
-	}
-
-	// Persist inside a transaction that locks the budget row so concurrent
-	// allocation changes on the same budget cannot collectively exceed income.
-	tx, err := database.DB.Pool.Begin(context.Background())
+	// Slow path: allocation change requires the budget-row lock so concurrent
+	// allocation writers serialize on us. Ownership is fused into the lock
+	// SELECT, and the OTHER-allocations SUM is computed in the same query
+	// (saves one round-trip vs the previous separate SELECT).
+	tx, err := database.DB.Pool.Begin(reqCtx)
 	if err != nil {
 		return errInternal(c, "failed to start transaction")
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(reqCtx) //nolint:errcheck
 
-	if req.AllocationValue != nil {
-		var currentIncome float64
-		if err := tx.QueryRow(context.Background(),
-			`SELECT monthly_income FROM budgets WHERE id = $1 FOR UPDATE`, budgetID).Scan(&currentIncome); err != nil {
-			return errInternal(c, "failed to fetch budget")
+	var currentIncome, otherTotal float64
+	// FIX: monthly_income and SUM(allocation_value) are NUMERIC — pgx binary format
+	// can't scan NUMERIC→float64 without ::float8 casts.
+	if err := tx.QueryRow(reqCtx, `
+		SELECT b.monthly_income::float8,
+		       COALESCE((SELECT SUM(allocation_value)
+		                   FROM budget_categories
+		                  WHERE budget_id = $1 AND id <> $2), 0)::float8
+		FROM budgets b
+		WHERE b.id = $1 AND b.user_id = $3
+		FOR UPDATE OF b
+	`, budgetID, catID, userID).Scan(&currentIncome, &otherTotal); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "budget not found")
 		}
-
-		var otherTotal float64
-		if err := tx.QueryRow(context.Background(),
-			`SELECT COALESCE(SUM(allocation_value), 0) FROM budget_categories
-			 WHERE budget_id = $1 AND id <> $2`, budgetID, catID).Scan(&otherTotal); err != nil {
-			return errInternal(c, "failed to check existing allocations")
-		}
-
-		if otherTotal+*req.AllocationValue > currentIncome {
-			return errBadRequest(c, "total allocation would exceed budget income")
-		}
+		return errInternal(c, "failed to fetch budget")
 	}
 
-	if _, err := tx.Exec(context.Background(),
-		`UPDATE budget_categories
-		 SET name = $1, allocation_value = $2, icon = $3, sort_order = $4
-		 WHERE id = $5 AND budget_id = $6`,
-		cat.Name, cat.AllocationValue, cat.Icon, cat.SortOrder,
-		catID, budgetID); err != nil {
+	if otherTotal+*req.AllocationValue > currentIncome {
+		return errBadRequest(c, "total allocation would exceed budget income")
+	}
+
+	// UPDATE ... RETURNING gives us the fresh row in one round-trip. COALESCE
+	// applies partial updates directly in SQL so we don't need to pre-fetch.
+	var cat models.Category
+	// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	if err := tx.QueryRow(reqCtx, `
+		UPDATE budget_categories
+		SET name = COALESCE($1, name),
+		    allocation_value = $2,
+		    icon = COALESCE($3, icon),
+		    sort_order = COALESCE($4, sort_order)
+		WHERE id = $5 AND budget_id = $6
+		RETURNING id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
+	`, req.Name, *req.AllocationValue, req.Icon, req.SortOrder, catID, budgetID).Scan(
+		&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue, &cat.Icon,
+		&cat.SortOrder, &cat.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "category not found")
+		}
 		return errInternal(c, "failed to update category")
 	}
 
-	if err := tx.Commit(context.Background()); err != nil {
+	if err := tx.Commit(reqCtx); err != nil {
 		return errInternal(c, "failed to commit category update")
 	}
 
+	invalidateBudget(budgetID)
+	invalidateLinkedTargets(budgetID)
 	broadcast(budgetID.String(), ws.MessageTypeCategoryUpdated, cat)
 	broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryUpdated, cat)
 
@@ -308,23 +367,27 @@ func DeleteCategory(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid category ID")
 	}
 
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
-
-	// DELETE ... RETURNING verifies existence + ownership + deletion in one
-	// round-trip. budget_id is rechecked in the WHERE clause so an attacker
-	// cannot target categories in a budget they own via a different budget ID.
+	// PERF: fused ownership + delete. The previous version did a separate
+	// verifyBudgetOwnership SELECT before the DELETE...RETURNING; now a
+	// single DELETE with EXISTS(budgets WHERE user_id=...) enforces both
+	// invariants in one round-trip. No rows -> 404.
 	var deletedID uuid.UUID
 	if err := database.DB.Pool.QueryRow(c.Context(), `
 		DELETE FROM budget_categories
 		WHERE id = $1 AND budget_id = $2
+		  AND EXISTS (SELECT 1 FROM budgets WHERE id = $2 AND user_id = $3)
 		RETURNING id
-	`, catID, budgetID).Scan(&deletedID); err != nil {
-		return errNotFound(c, "category not found")
+	`, catID, budgetID, userID).Scan(&deletedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "category not found")
+		}
+		return errInternal(c, "failed to delete category")
 	}
 
 	cid := deletedID.String()
+
+	invalidateBudget(budgetID)
+	invalidateLinkedTargets(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeCategoryDeleted, map[string]string{"id": cid})
 	broadcastToLinkedTargets(budgetID, ws.MessageTypeCategoryDeleted, map[string]string{"id": cid})

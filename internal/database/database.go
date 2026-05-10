@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,16 +37,94 @@ func Init(databaseURL string) {
 	if err != nil {
 		panic(fmt.Sprintf("invalid DATABASE_URL: %v", err))
 	}
-	cfg.MinConns = envInt32("DB_MIN_CONNS", 10)
-	cfg.MaxConns = envInt32("DB_MAX_CONNS", 50)
-	cfg.MaxConnLifetime = 30 * time.Minute
+	// PERF: Pool sizing. Supabase's session-mode pooler enforces a per-
+	// client connection cap; opening 50 connections from a single backend
+	// caused pooler-level exhaustion and refused connections. The defaults
+	// below keep idle load light (MinConns=2) while respecting the pooler
+	// ceiling (MaxConns=10). Environments with dedicated headroom can
+	// raise both via DB_MIN_CONNS / DB_MAX_CONNS without code changes.
+	cfg.MinConns = envInt32("DB_MIN_CONNS", 2)
+	cfg.MaxConns = envInt32("DB_MAX_CONNS", 10)
+
+	// PERF: MaxConnLifetime = 1h rotates connections hourly so we pick up
+	// any upstream-side TCP re-keying or Supabase-level config reloads
+	// without accumulating long-lived idle connections. The previous 30m
+	// value caused more reconnect churn than necessary for a session-
+	// pooled setup.
+	cfg.MaxConnLifetime = 1 * time.Hour
+	// PERF: MaxConnIdleTime = 5 min keeps the pool lean. Idle conns on
+	// the Supabase pooler count against the project's conn quota; releasing
+	// them lets other tenants and admin sessions in.
 	cfg.MaxConnIdleTime = 5 * time.Minute
+	// PERF: HealthCheckPeriod = 30s catches half-dead conns (e.g. NAT
+	// timeout on cloud runners) before the next query hits them.
 	cfg.HealthCheckPeriod = 30 * time.Second
+
+	// PERF: Pick the right query-exec mode based on the pooler port.
+	// Supabase's session pooler (5432) forwards the full Postgres wire
+	// protocol and supports prepared statements, so we default to
+	// QueryExecModeCacheStatement for planner reuse. The transaction
+	// pooler (6543) multiplexes sessions per query and cannot guarantee
+	// the same backend across a prepare/execute pair — QueryExecModeExec
+	// is the only safe choice there.
+	//
+	// We honour an explicit DB_EXEC_MODE override for ops who need to
+	// force a particular mode regardless of port (e.g. direct 5432 URL
+	// that still routes through a transaction pooler sidecar).
+	cfg.ConnConfig.DefaultQueryExecMode = pickQueryExecMode(databaseURL)
+
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect to database: %v", err))
 	}
+	// pgxpool.NewWithConfig is lazy — it does not actually open a connection
+	// until the first query. Without an active probe a misconfigured
+	// DATABASE_URL (paused project, wrong pooler host, expired creds) only
+	// surfaces hundreds of milliseconds into the first user request as a
+	// 500. Run a bounded Ping at startup so the process either prints a
+	// clear, attributable error and crashes immediately, or proceeds with a
+	// connection that has actually been validated end-to-end.
+	// 15s tolerates Supabase pooler cold-start (free-tier projects can take
+	// 10s+ to wake) while still failing fast on a genuinely broken URL.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		panic(fmt.Sprintf("database ping failed: %v", err))
+	}
 	DB = &Client{Pool: pool}
+}
+
+// pickQueryExecMode picks the safest DefaultQueryExecMode for the given
+// PostgreSQL URL. See Init for the decision matrix. Exposed for tests.
+//
+// PERF: This matters because using QueryExecModeCacheStatement against a
+// transaction pooler causes sporadic "prepared statement does not exist"
+// errors under load, whereas QueryExecModeExec on the session pooler
+// foregoes plan caching and bloats server-side CPU for repeated queries.
+func pickQueryExecMode(databaseURL string) pgx.QueryExecMode {
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("DB_EXEC_MODE"))); v != "" {
+		switch v {
+		case "cache_statement", "cachestatement":
+			return pgx.QueryExecModeCacheStatement
+		case "cache_describe", "cachedescribe":
+			return pgx.QueryExecModeCacheDescribe
+		case "describe_exec", "describeexec":
+			return pgx.QueryExecModeDescribeExec
+		case "exec":
+			return pgx.QueryExecModeExec
+		case "simple", "simpleprotocol":
+			return pgx.QueryExecModeSimpleProtocol
+		}
+	}
+	// Heuristic on port: 6543 is Supabase's transaction pooler. Anything
+	// else — direct 5432, session pooler 5432, other providers — can use
+	// full prepared-statement caching.
+	u, err := url.Parse(databaseURL)
+	if err == nil && u.Port() == "6543" {
+		return pgx.QueryExecModeExec
+	}
+	return pgx.QueryExecModeCacheStatement
 }
 
 // envInt32 reads an environment variable as int32 with a default fallback.

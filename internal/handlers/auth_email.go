@@ -12,9 +12,10 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // --- Per-email login rate limiter ---
@@ -22,7 +23,7 @@ import (
 // tracking failed login attempts per email address in memory.
 
 const (
-	maxLoginAttemptsPerEmail = 5               // max attempts before lockout
+	maxLoginAttemptsPerEmail = 5                // max attempts before lockout
 	loginAttemptWindow       = 15 * time.Minute // sliding window duration
 )
 
@@ -253,9 +254,9 @@ func Register(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"token": token,
 		"user": fiber.Map{
-			"id":         profileID,
-			"email":      req.Email,
-			"full_name":  req.Name,
+			"id":        profileID,
+			"email":     req.Email,
+			"full_name": req.Name,
 		},
 	})
 }
@@ -344,9 +345,9 @@ func Login(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"token": token,
 		"user": fiber.Map{
-			"id":         profile.ID,
-			"email":      profile.Email,
-			"full_name":  profile.FullName,
+			"id":        profile.ID,
+			"email":     profile.Email,
+			"full_name": profile.FullName,
 		},
 	})
 }

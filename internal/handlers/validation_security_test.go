@@ -163,11 +163,16 @@ func TestAmountValidation_NegativeMaxFloat64(t *testing.T) {
 
 func TestAmountValidation_NaN(t *testing.T) {
 	amount := math.NaN()
-	// NaN comparisons: NaN > 0 is false, NaN <= maxAmountValue is false.
-	if amount > 0 {
+	// NaN comparisons always return false; we assert that explicitly via
+	// math.IsNaN so static analyzers don't flag the literal `> 0` /
+	// `<= maxAmountValue` checks as suspect (SA4012).
+	if !math.IsNaN(amount) {
+		t.Fatal("amount should be NaN")
+	}
+	if amount > 0 == true { //nolint:staticcheck // SA4012: NaN compare-false is the property under test.
 		t.Error("NaN should fail amount > 0 check")
 	}
-	if amount <= maxAmountValue {
+	if amount <= maxAmountValue == true { //nolint:staticcheck // SA4012.
 		t.Error("NaN should fail amount <= maxAmountValue check")
 	}
 }
@@ -201,9 +206,9 @@ func TestUUIDParsing_MalformedUUIDs(t *testing.T) {
 		"not-a-uuid",
 		"12345",
 		"gggggggg-gggg-gggg-gggg-gggggggggggg",
-		"00000000-0000-0000-0000-00000000000", // too short
+		"00000000-0000-0000-0000-00000000000",   // too short
 		"00000000-0000-0000-0000-0000000000000", // too long
-		"00000000_0000_0000_0000_000000000000", // wrong separator
+		"00000000_0000_0000_0000_000000000000",  // wrong separator
 	}
 
 	for _, id := range malformed {
@@ -282,8 +287,11 @@ func TestCurrencyValidation_SpecialChars(t *testing.T) {
 
 func TestAllocationPercent_NaN(t *testing.T) {
 	pct := math.NaN()
-	// NaN >= 0 is false, so it would fail validation.
-	if pct >= 0 && pct <= 100 {
+	if !math.IsNaN(pct) {
+		t.Fatal("pct should be NaN")
+	}
+	// NaN >= 0 is false; the comparison itself is the property under test.
+	if pct >= 0 && pct <= 100 == true { //nolint:staticcheck // SA4012.
 		t.Error("NaN should fail allocation percent validation")
 	}
 }

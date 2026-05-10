@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 )
@@ -93,12 +95,21 @@ func Migrate(c *fiber.Ctx) error {
 		budget, err := migrateSingleBudget(userID, mb)
 		if err != nil {
 			// Return the error as-is (it's already a *fiber.Error or bad-request).
-			if fiberErr, ok := err.(*fiber.Error); ok {
+			fiberErr := &fiber.Error{}
+			if errors.As(err, &fiberErr) {
 				return c.Status(fiberErr.Code).JSON(models.ErrorResponse{Error: fiberErr.Message})
 			}
 			return errInternal(c, err.Error())
 		}
 		createdBudgets = append(createdBudgets, budget)
+	}
+
+	// Drop any stale cached summary/trends/resume for each newly-created
+	// budget. New IDs normally wouldn't collide with existing cache keys,
+	// but invalidating is cheap and guarantees the first post-migration
+	// dashboard load sees fresh DB state.
+	for _, b := range createdBudgets {
+		invalidateBudget(b.ID)
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
@@ -185,7 +196,7 @@ func migrateSingleBudget(userID uuid.UUID, mb MigrateBudget) (models.Budget, err
 	if err != nil {
 		return models.Budget{}, fiber.NewError(fiber.StatusInternalServerError, "failed to start migration transaction")
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 1. Budget row.
 	_, err = tx.Exec(ctx, `

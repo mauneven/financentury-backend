@@ -2,8 +2,11 @@ package database
 
 import (
 	"net/url"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ==================== Filter.Eq — URL Escaping ====================
@@ -325,4 +328,67 @@ func TestQuoteIdent(t *testing.T) {
 
 func TestClose_DoesNotPanic(t *testing.T) {
 	Close()
+}
+
+// ==================== pickQueryExecMode ====================
+
+func TestPickQueryExecMode_TransactionPoolerPort(t *testing.T) {
+	// Clear any override so we exercise the port heuristic.
+	os.Unsetenv("DB_EXEC_MODE")
+
+	got := pickQueryExecMode("postgres://user:pw@host:6543/db?sslmode=require")
+	if got != pgx.QueryExecModeExec {
+		t.Errorf("port 6543 should pick QueryExecModeExec, got %v", got)
+	}
+}
+
+func TestPickQueryExecMode_SessionPoolerPort(t *testing.T) {
+	os.Unsetenv("DB_EXEC_MODE")
+
+	got := pickQueryExecMode("postgres://user:pw@host:5432/db?sslmode=require")
+	if got != pgx.QueryExecModeCacheStatement {
+		t.Errorf("port 5432 should pick CacheStatement, got %v", got)
+	}
+}
+
+func TestPickQueryExecMode_DefaultPortUsesCacheStatement(t *testing.T) {
+	os.Unsetenv("DB_EXEC_MODE")
+
+	// No explicit port => treated as "not transaction pooler".
+	got := pickQueryExecMode("postgres://user:pw@host/db?sslmode=disable")
+	if got != pgx.QueryExecModeCacheStatement {
+		t.Errorf("no port should pick CacheStatement, got %v", got)
+	}
+}
+
+func TestPickQueryExecMode_EnvOverride(t *testing.T) {
+	// The env override must win even when the URL points at a session
+	// pooler.
+	cases := map[string]pgx.QueryExecMode{
+		"exec":            pgx.QueryExecModeExec,
+		"cache_statement": pgx.QueryExecModeCacheStatement,
+		"cache_describe":  pgx.QueryExecModeCacheDescribe,
+		"describe_exec":   pgx.QueryExecModeDescribeExec,
+		"simple":          pgx.QueryExecModeSimpleProtocol,
+		"simpleprotocol":  pgx.QueryExecModeSimpleProtocol,
+		"CACHE_STATEMENT": pgx.QueryExecModeCacheStatement, // case-insensitive
+	}
+	for v, want := range cases {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("DB_EXEC_MODE", v)
+			got := pickQueryExecMode("postgres://u:p@host:5432/db")
+			if got != want {
+				t.Errorf("DB_EXEC_MODE=%q: got %v, want %v", v, got, want)
+			}
+		})
+	}
+}
+
+func TestPickQueryExecMode_InvalidEnvFallsBackToPort(t *testing.T) {
+	t.Setenv("DB_EXEC_MODE", "banana")
+	// Invalid override => use the port heuristic.
+	got := pickQueryExecMode("postgres://u:p@host:6543/db")
+	if got != pgx.QueryExecModeExec {
+		t.Errorf("unknown DB_EXEC_MODE should fall back to port heuristic, got %v", got)
+	}
 }

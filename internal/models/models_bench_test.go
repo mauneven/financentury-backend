@@ -9,9 +9,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// sampleExpenseJSON_SubcategoryID returns a JSON string for an expense using
+// sampleExpenseJSONSubcategoryID returns a JSON string for an expense using
 // the legacy subcategory_id key.
-func sampleExpenseJSON_SubcategoryID() []byte {
+func sampleExpenseJSONSubcategoryID() []byte {
 	return []byte(`{
 		"id": "33333333-3333-3333-3333-333333333333",
 		"budget_id": "22222222-2222-2222-2222-222222222222",
@@ -24,9 +24,9 @@ func sampleExpenseJSON_SubcategoryID() []byte {
 	}`)
 }
 
-// sampleExpenseJSON_CatID returns a JSON string for an expense using
+// sampleExpenseJSONCatID returns a JSON string for an expense using
 // the canonical category_id key.
-func sampleExpenseJSON_CatID() []byte {
+func sampleExpenseJSONCatID() []byte {
 	return []byte(`{
 		"id": "33333333-3333-3333-3333-333333333333",
 		"budget_id": "22222222-2222-2222-2222-222222222222",
@@ -59,7 +59,7 @@ func sampleExpense() Expense {
 // BenchmarkExpenseUnmarshalJSON benchmarks unmarshaling with subcategory_id
 // (exercises the custom UnmarshalJSON fallback path).
 func BenchmarkExpenseUnmarshalJSON(b *testing.B) {
-	data := sampleExpenseJSON_SubcategoryID()
+	data := sampleExpenseJSONSubcategoryID()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var exp Expense
@@ -72,7 +72,7 @@ func BenchmarkExpenseUnmarshalJSON(b *testing.B) {
 // BenchmarkExpenseUnmarshalJSON_CategoryID benchmarks unmarshaling with
 // category_id (the canonical path with no fallback needed).
 func BenchmarkExpenseUnmarshalJSON_CategoryID(b *testing.B) {
-	data := sampleExpenseJSON_CatID()
+	data := sampleExpenseJSONCatID()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var exp Expense
@@ -139,7 +139,7 @@ func BenchmarkRoundAmount_Local(b *testing.B) {
 // (using a plain struct without custom UnmarshalJSON) against the custom
 // Expense.UnmarshalJSON to measure the overhead of the subcategory_id fallback.
 func BenchmarkExpenseUnmarshal_StandardVsCustom(b *testing.B) {
-	data := sampleExpenseJSON_CatID()
+	data := sampleExpenseJSONCatID()
 
 	// plainExpense is a copy of Expense without custom UnmarshalJSON.
 	type plainExpense struct {

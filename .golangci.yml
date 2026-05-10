@@ -1,0 +1,65 @@
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - revive
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - nilerr
+    - errorlint
+    - gocritic
+    - copyloopvar
+
+  settings:
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+          disabled: true
+        - name: exported
+          disabled: true
+        - name: unused-parameter
+          disabled: true
+    errcheck:
+      exclude-functions:
+        - (*github.com/gofiber/fiber/v2.Ctx).JSON
+        - (*github.com/gofiber/fiber/v2.Ctx).Status
+        - (*github.com/gofiber/fiber/v2.Ctx).SendString
+        - (*github.com/gofiber/fiber/v2.Ctx).Set
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/the-financial-workspace)
+      custom-order: true
+    goimports:
+      local-prefixes:
+        - github.com/the-financial-workspace

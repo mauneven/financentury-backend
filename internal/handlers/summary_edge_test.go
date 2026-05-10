@@ -17,14 +17,14 @@ func TestRoundAmount_VerySmallCloseToZero(t *testing.T) {
 	}{
 		{0.001, 0.0},
 		{0.004, 0.0},
-		{0.005, 0.01},  // rounds up
+		{0.005, 0.01}, // rounds up
 		{0.009, 0.01},
-		{-0.001, 0.0},  // negative very small
+		{-0.001, 0.0}, // negative very small
 		{-0.004, 0.0},
 		{-0.005, -0.01}, // rounds away from zero
 		{-0.009, -0.01},
-		{1e-10, 0.0},   // extremely small positive
-		{-1e-10, 0.0},  // extremely small negative
+		{1e-10, 0.0},  // extremely small positive
+		{-1e-10, 0.0}, // extremely small negative
 	}
 	for _, tc := range cases {
 		got := roundAmount(tc.input)
@@ -333,8 +333,8 @@ func BenchmarkSortMonthlyTrends_100(b *testing.B) {
 	for i := 0; i < 100; i++ {
 		day := 100 - i
 		year := 2026
-		month := (day%12) + 1
-		dom := (day%28) + 1
+		month := (day % 12) + 1
+		dom := (day % 28) + 1
 		dateStr := time.Date(year, time.Month(month), dom, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 		base[i] = models.MonthlyTrend{Month: dateStr, TotalSpent: float64(i)}
 	}

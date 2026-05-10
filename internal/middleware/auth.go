@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 )
 
@@ -24,15 +25,30 @@ type sessionCacheEntry struct {
 }
 
 // sessionCache is a package-level in-memory cache keyed by token hash.
+//
+// PERF: This cache is the single biggest cost-saver in the request path.
+// Every authenticated request runs through Protected(), so a miss means an
+// extra round-trip to Postgres on top of the actual handler's queries. At
+// ~100+ requests/min per active user that adds up quickly on Supabase's
+// metered connections. The cache turns that into at most one DB query per
+// token per sessionCacheTTL.
 var sessionCache sync.Map
 
 // sessionCacheTTL is how long a cache entry is considered fresh.
-const sessionCacheTTL = 60 * time.Second
+//
+// PERF: Bumped from 60s to 5min. Revocation is explicit (SignOut,
+// RevokeSession, DeleteAccount all call InvalidateSessionCache /
+// InvalidateUserSessionCache) so a longer TTL is safe: a revoked token is
+// booted immediately, and a stale-but-valid token was already accepted for
+// the full 7-day JWT lifetime anyway. The 5-minute ceiling only affects
+// delayed discovery of out-of-band session state changes (e.g. admin-issued
+// DB updates), which is acceptable.
+const sessionCacheTTL = 5 * time.Minute
 
 // sessionCacheMaxAge is the maximum time an entry may remain in the cache
 // (even if re-queried recently). Used by the background evictor to bound
 // memory growth from long-lived or abandoned tokens.
-const sessionCacheMaxAge = 10 * time.Minute
+const sessionCacheMaxAge = 30 * time.Minute
 
 // InvalidateSessionCache removes a cached session entry so the next request
 // for that token will re-query the database. Call this when revoking a session.
@@ -61,9 +77,14 @@ func InvalidateUserSessionCache(userID string) {
 }
 
 // startSessionCacheEvictor launches a background goroutine that periodically
-// purges expired entries from sessionCache, bounding memory growth. An
-// attacker presenting many distinct tokens (valid signature, any user id)
-// could otherwise fill the cache indefinitely.
+// purges expired entries from sessionCache, bounding memory growth.
+//
+// SECURITY: this is the only mechanism bounding cache size. Entries are
+// evicted strictly by max-age (sessionCacheMaxAge), independent of TTL, so
+// abandoned-but-valid tokens cannot sit in memory indefinitely. Store-side
+// flooding is also mitigated upstream: entries are only written after a
+// successful JWT signature verification *and* a matching user_sessions row,
+// so an attacker without the signing key cannot inflate the cache.
 func startSessionCacheEvictor() {
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
@@ -147,25 +168,52 @@ func Protected() fiber.Handler {
 			})
 		}
 
-		// Store token hash for session tracking and revocation check.
+		// SECURITY: cache key is sha256(entire JWT). Any modification to
+		// header/payload/signature changes the hash, so an attacker who
+		// flips the user_id claim cannot reuse another user's cache entry
+		// — the forged token produces a different key that misses the
+		// cache and hits the DB path, where signature validation has
+		// already rejected it above.
 		h := sha256.Sum256([]byte(tokenStr))
 		tokenHash := hex.EncodeToString(h[:])
 		c.Locals("token_hash", tokenHash)
 
-		// Check if this token's session has been revoked. Uses an in-memory
-		// TTL cache so the DB query runs at most once per minute per session.
-		// Also update last_active_at lazily (fire-and-forget if stale > 5 min).
+		// PERF: Check if this token's session has been revoked. Uses an
+		// in-memory TTL cache (sessionCacheTTL = 5 min) so the DB query runs
+		// at most once per 5 min per session. Revocation endpoints
+		// (SignOut, RevokeSession, DeleteAccount) call InvalidateSessionCache
+		// / InvalidateUserSessionCache to boot tokens from the cache
+		// immediately, so a longer TTL does not weaken the revocation
+		// guarantee. last_active_at is also updated lazily (fire-and-forget
+		// if stale > 5 min) so reads don't incur a write round-trip every
+		// request.
 		if database.DB != nil {
-			// Try the cache first.
+			// Try the cache first. Fast path: no DB hit.
 			if cached, ok := sessionCache.Load(tokenHash); ok {
 				entry := cached.(sessionCacheEntry)
+				// SECURITY: enforce TTL on cache hits. Expired entries fall
+				// through to the DB path; we never serve a stale entry on a
+				// miss — revocation state could have flipped since cachedAt.
 				if time.Since(entry.cachedAt) < sessionCacheTTL {
 					if entry.revokedAt != nil {
 						return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 							"error": "session has been revoked",
 						})
 					}
-					// Cache hit and not revoked — skip DB query.
+					// SECURITY: re-check the cached session's user_id against
+					// the token's claim on every cache hit. Without this an
+					// attacker who possesses a valid signing key (or a token
+					// hash collision — infeasible for sha256, but defense in
+					// depth) could rebind a cached entry to a different user
+					// by crafting a JWT with a different user_id claim.
+					// Identical check to the miss-path below; we repeat it
+					// here so the cache path is never weaker than the DB path.
+					if entry.userID != "" && entry.userID != userID.String() {
+						return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+							"error": "session user mismatch",
+						})
+					}
+					// Cache hit and not revoked — skip DB query entirely.
 					c.Locals("user_id", userID)
 					c.Locals("email", claims.Email)
 					return c.Next()
@@ -181,11 +229,12 @@ func Protected() fiber.Handler {
 				tokenHash,
 			).Scan(&sessionID, &sessionUserID, &revokedAt, &lastActive)
 			if err == nil {
-				// Security: ensure the token's user_id claim matches the
+				// SECURITY: ensure the token's user_id claim matches the
 				// user_id stored with the session row. Without this check a
 				// token rebound to a different user (via a custom JWT with
 				// the correct signing key, e.g. during an incident response
-				// where the key leaked) could still authenticate.
+				// where the key leaked) could still authenticate. Mirrored
+				// on the cache-hit path above.
 				if sessionUserID != userID.String() {
 					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 						"error": "session user mismatch",

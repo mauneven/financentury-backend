@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
@@ -80,6 +81,13 @@ func ListSessions(c *fiber.Ctx) error {
 
 // RevokeSession revokes a specific session by marking it with revoked_at.
 // Users can only revoke their own sessions, not the current one.
+//
+// PERF: Collapsed the previous SELECT-then-UPDATE sequence (2 queries) into
+// a single UPDATE ... RETURNING. The WHERE clause enforces ownership, the
+// not-yet-revoked constraint, and the "not the current session" guard in
+// one shot. Zero rows returned → either not found, already revoked, or the
+// caller tried to revoke their own session; we disambiguate with a single
+// follow-up EXISTS only in the zero-row case.
 func RevokeSession(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -95,33 +103,42 @@ func RevokeSession(c *fiber.Ctx) error {
 
 	ctx := context.Background()
 
-	// Check that the session belongs to this user and is not the current one.
-	var rowTokenHash string
+	// Atomic UPDATE ... RETURNING. The `token_hash <> $3` predicate blocks
+	// the caller from revoking the token they're currently using.
+	var revokedTokenHash string
 	err := database.DB.Pool.QueryRow(ctx,
-		`SELECT token_hash FROM user_sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
-		sessionID.String(), userID.String(),
-	).Scan(&rowTokenHash)
-
+		`UPDATE user_sessions
+		 SET revoked_at = NOW()
+		 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+		   AND token_hash <> $3
+		 RETURNING token_hash`,
+		sessionID.String(), userID.String(), tokenHash,
+	).Scan(&revokedTokenHash)
 	if err != nil {
+		// Zero rows: distinguish "current session" from "not found". One
+		// cheap EXISTS query is still strictly fewer round-trips than the
+		// old SELECT+UPDATE in the happy path.
+		var isCurrent bool
+		_ = database.DB.Pool.QueryRow(ctx,
+			`SELECT EXISTS(
+			   SELECT 1 FROM user_sessions
+			   WHERE id = $1 AND user_id = $2 AND token_hash = $3
+			 )`,
+			sessionID.String(), userID.String(), tokenHash,
+		).Scan(&isCurrent)
+		if isCurrent {
+			return errBadRequest(c, "cannot revoke current session")
+		}
 		return errNotFound(c, "session not found")
 	}
 
-	if rowTokenHash == tokenHash {
-		return errBadRequest(c, "cannot revoke current session")
-	}
-
-	_, err = database.DB.Pool.Exec(ctx,
-		`UPDATE user_sessions SET revoked_at = NOW() WHERE id = $1`,
-		sessionID.String(),
-	)
-	if err != nil {
-		return errInternal(c, "failed to revoke session")
-	}
-
-	// Invalidate the session cache entry for the revoked token so the next
-	// request using that token is rejected immediately instead of waiting for
-	// the 60-second cache TTL to expire.
-	middleware.InvalidateSessionCache(rowTokenHash)
+	// SECURITY: invalidate the session cache entry for the revoked token
+	// AFTER the DB UPDATE commits, so the next request using that token is
+	// rejected immediately instead of being served from a stale cache entry
+	// for up to sessionCacheTTL. Order matters: invalidating before the
+	// UPDATE would race — a concurrent request could repopulate the cache
+	// from the still-unrevoked row.
+	middleware.InvalidateSessionCache(revokedTokenHash)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -141,8 +158,10 @@ func SignOut(c *fiber.Ctx) error {
 		log.Printf("[sessions] failed to revoke session on sign-out: %v", err)
 	}
 
-	// Invalidate the session cache entry so the revoked token is rejected on
-	// the next request (instead of succeeding for up to 60s due to cache TTL).
+	// SECURITY: invalidate the cache entry AFTER the UPDATE so the revoked
+	// token is rejected on the next request. If we invalidated first, a
+	// concurrent request could repopulate the cache from the still-
+	// unrevoked row during the window between the Delete and the Exec.
 	middleware.InvalidateSessionCache(tokenHash)
 
 	return c.SendStatus(fiber.StatusNoContent)

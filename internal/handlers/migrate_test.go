@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -46,7 +47,8 @@ func TestValidateMigrateCategory_EmptyName(t *testing.T) {
 	if err == nil {
 		t.Fatal("empty name should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -77,7 +79,8 @@ func TestValidateMigrateCategory_IconTooLong(t *testing.T) {
 	if err == nil {
 		t.Fatal("long icon should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -155,7 +158,8 @@ func TestValidateMigrateExpense_ZeroAmount(t *testing.T) {
 	if err == nil {
 		t.Fatal("zero amount should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -178,7 +182,8 @@ func TestValidateMigrateExpense_AmountExceedsMax(t *testing.T) {
 	if err == nil {
 		t.Fatal("amount exceeding max should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -203,7 +208,8 @@ func TestValidateMigrateExpense_DescriptionTooLong(t *testing.T) {
 	if err == nil {
 		t.Fatal("long description should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -225,7 +231,8 @@ func TestValidateMigrateExpense_InvalidDate(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid date should fail validation")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -282,7 +289,8 @@ func TestMigrate_RejectsBudgetWithTooManyCategories(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when exceeding category cap, got nil")
 	}
-	fiberErr, ok := err.(*fiber.Error)
+	fiberErr := &fiber.Error{}
+	ok := errors.As(err, &fiberErr)
 	if !ok {
 		t.Fatalf("expected *fiber.Error, got %T", err)
 	}
@@ -315,10 +323,16 @@ func TestMigrate_AllowsExactCategoryCap(t *testing.T) {
 		Mode:          "manual",
 		Categories:    cats,
 	}
+	// migrateSingleBudget reaches database.DB.Pool after validation. Panic from
+	// the nil pool means validation passed (which is what we're testing). Any
+	// returned fiber error must not be the cap error.
+	defer func() {
+		_ = recover()
+	}()
 	_, err := migrateSingleBudget(uuid.Nil, mb)
-	// If a DB error surfaces, it should NOT be the "too many categories" one.
 	if err != nil {
-		if fiberErr, ok := err.(*fiber.Error); ok {
+		fiberErr := &fiber.Error{}
+		if errors.As(err, &fiberErr) {
 			if strings.Contains(fiberErr.Message, "too many categories") {
 				t.Errorf("exactly %d categories should not trip the cap, got: %q",
 					maxMigrateCategoriesPerBudget, fiberErr.Message)

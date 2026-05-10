@@ -2,6 +2,7 @@ package routes
 
 import (
 	"github.com/gofiber/fiber/v2"
+
 	"github.com/the-financial-workspace/backend/internal/handlers"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 )

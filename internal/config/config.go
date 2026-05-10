@@ -49,7 +49,7 @@ func Load() (*Config, error) {
 		frontendURL = "http://localhost:3000"
 	}
 
-	port := 8080
+	port := 3000
 	if p := os.Getenv("PORT"); p != "" {
 		parsed, err := strconv.Atoi(p)
 		if err != nil {

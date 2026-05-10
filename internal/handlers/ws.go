@@ -12,6 +12,7 @@ import (
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -48,7 +49,7 @@ func WebSocketUpgrade() fiber.Handler {
 func WebSocketHandler() fiber.Handler {
 	return websocket.New(func(c *websocket.Conn) {
 		// Set a short deadline for the auth message.
-		_ = c.Conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 		// Read the first message which must be the auth payload.
 		_, msg, err := c.ReadMessage()
@@ -87,7 +88,7 @@ func WebSocketHandler() fiber.Handler {
 
 		// Limit incoming WebSocket message size to prevent memory exhaustion
 		// from oversized or malicious payloads.
-		c.Conn.SetReadLimit(4096)
+		c.SetReadLimit(4096)
 
 		client := &ws.Client{
 			Conn:   c.Conn,
@@ -103,9 +104,9 @@ func WebSocketHandler() fiber.Handler {
 		defer wsHub.Unregister(client)
 
 		// Configure pong handler to reset the read deadline on each pong.
-		_ = c.Conn.SetReadDeadline(time.Now().Add(ws.PongWait()))
-		c.Conn.SetPongHandler(func(string) error {
-			return c.Conn.SetReadDeadline(time.Now().Add(ws.PongWait()))
+		_ = c.SetReadDeadline(time.Now().Add(ws.PongWait()))
+		c.SetPongHandler(func(string) error {
+			return c.SetReadDeadline(time.Now().Add(ws.PongWait()))
 		})
 
 		// Start a goroutine to send periodic pings.

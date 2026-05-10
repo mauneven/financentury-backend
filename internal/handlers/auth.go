@@ -13,6 +13,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
@@ -57,7 +58,10 @@ func isAllowedRedirectURI(redirectURI string) bool {
 	if err != nil {
 		return false
 	}
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1")) {
+	isHTTPS := parsed.Scheme == "https"
+	isLocalHTTP := parsed.Scheme == "http" &&
+		(parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1")
+	if !isHTTPS && !isLocalHTTP {
 		return false
 	}
 	if parsed.Path != "/auth/callback" {
@@ -134,7 +138,7 @@ func GoogleLogin(c *fiber.Ctx) error {
 	if err != nil {
 		return errInternal(c, "failed to exchange authorization code")
 	}
-	defer tokenResp.Body.Close()
+	defer func() { _ = tokenResp.Body.Close() }()
 
 	tokenBody, err := io.ReadAll(io.LimitReader(tokenResp.Body, maxOAuthResponseSize))
 	if err != nil {
@@ -168,7 +172,7 @@ func GoogleLogin(c *fiber.Ctx) error {
 	if err != nil {
 		return errInternal(c, "failed to fetch user info from Google")
 	}
-	defer userInfoResp.Body.Close()
+	defer func() { _ = userInfoResp.Body.Close() }()
 
 	userInfoBody, err := io.ReadAll(io.LimitReader(userInfoResp.Body, maxOAuthResponseSize))
 	if err != nil {
@@ -217,9 +221,9 @@ func GoogleLogin(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"token": token,
 		"user": fiber.Map{
-			"id":         profile.ID,
-			"email":      profile.Email,
-			"full_name":  profile.FullName,
+			"id":        profile.ID,
+			"email":     profile.Email,
+			"full_name": profile.FullName,
 		},
 	})
 }
@@ -257,7 +261,7 @@ func GoogleMobileLogin(c *fiber.Ctx) error {
 	if err != nil {
 		return errInternal(c, "failed to verify id_token with Google")
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthResponseSize))
 	if err != nil {
@@ -417,16 +421,23 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 	}
 
 	var created []models.Profile
-	if err := json.Unmarshal(respBody, &created); err != nil || len(created) == 0 {
-		// POST returned 201 but response couldn't be parsed — return
-		// a locally constructed profile with the ID we generated.
+	parseErr := json.Unmarshal(respBody, &created)
+	if parseErr != nil || len(created) == 0 {
+		// POST returned 201 but response couldn't be parsed — log the parse
+		// error then return a locally constructed profile with the ID we
+		// generated. Falling back to a synthetic profile is intentional: the
+		// row exists (status 201) and we would rather continue the sign-in
+		// than fail on a serialization edge case.
+		if parseErr != nil {
+			log.Printf("[auth] post-insert profile parse failed (ignored, using fallback): %v", parseErr)
+		}
 		return models.Profile{
 			ID:        profileID,
 			Email:     userInfo.Email,
 			FullName:  userInfo.Name,
 			CreatedAt: now.Format(time.RFC3339Nano),
 			UpdatedAt: now.Format(time.RFC3339Nano),
-		}, nil
+		}, nil //nolint:nilerr // intentional fallback — see comment above
 	}
 	return created[0], nil
 }
@@ -434,6 +445,13 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 // Me returns the authenticated user's profile from the profiles table,
 // including their display order preferences to avoid a separate GET.
 // This endpoint must be behind the Protected middleware.
+//
+// PERF: Profile lookup and display_orders aggregation are now folded into a
+// single query. The previous path ran two sequential round-trips (profile
+// SELECT + display_orders SELECT). The rewritten query uses a correlated
+// sub-SELECT with json_agg so the result arrives as one row on one
+// round-trip. /auth/me is called on every cold-start and token refresh, so
+// this saves 1 DB query per call on the hottest authenticated endpoint.
 func Me(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -443,42 +461,43 @@ func Me(c *fiber.Ctx) error {
 	reqCtx := c.Context()
 	var p models.Profile
 	var createdAt, updatedAt time.Time
-	if err := database.DB.Pool.QueryRow(reqCtx,
-		`SELECT id, email, full_name, created_at, updated_at
-		 FROM profiles WHERE id = $1`, userID,
-	).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt); err != nil {
+	var ordersJSON []byte
+	// PERF: single query — profile columns + aggregated display_orders as
+	// JSON. COALESCE keeps the result shape stable when the user has no
+	// saved orders (returns []). The sub-SELECT is cheaper than a LEFT JOIN
+	// LATERAL because we never need the full cross-product.
+	err := database.DB.Pool.QueryRow(reqCtx,
+		`SELECT p.id, p.email, p.full_name, p.created_at, p.updated_at,
+		        COALESCE((
+		          SELECT json_agg(json_build_object(
+		            'scope_key', d.scope_key,
+		            'ordered_ids', d.ordered_ids
+		          ))
+		          FROM display_orders d
+		          WHERE d.user_id = p.id
+		        ), '[]'::json) AS display_orders
+		 FROM profiles p
+		 WHERE p.id = $1`, userID,
+	).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt, &ordersJSON)
+	if err != nil {
 		log.Printf("Me: profile lookup failed for user %s: %v", userID, err)
 		return errNotFound(c, "profile not found")
 	}
 	p.CreatedAt = createdAt.Format(time.RFC3339Nano)
 	p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
 
-	// Fetch display orders (best-effort — don't fail auth if table is empty or missing).
-	type orderEntry struct {
-		ScopeKey   string          `json:"scope_key"`
-		OrderedIDs json.RawMessage `json:"ordered_ids"`
-	}
-	var orders []orderEntry
-	rows, qErr := database.DB.Pool.Query(reqCtx,
-		`SELECT scope_key, ordered_ids FROM display_orders WHERE user_id = $1`, userID)
-	if qErr == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var o orderEntry
-			if scanErr := rows.Scan(&o.ScopeKey, &o.OrderedIDs); scanErr == nil {
-				orders = append(orders, o)
-			}
-		}
-	}
-	if orders == nil {
-		orders = []orderEntry{}
+	// Ship the aggregated display_orders as raw JSON so we don't round-trip
+	// through Go structs just to serialize them again.
+	ordersMsg := json.RawMessage(ordersJSON)
+	if len(ordersMsg) == 0 {
+		ordersMsg = json.RawMessage("[]")
 	}
 
 	return c.JSON(fiber.Map{
 		"id":             p.ID,
 		"email":          p.Email,
 		"full_name":      p.FullName,
-		"display_orders": orders,
+		"display_orders": ordersMsg,
 	})
 }
 
@@ -618,9 +637,14 @@ func DeleteAccount(c *fiber.Ctx) error {
 		return errInternal(c, "failed to commit account deletion")
 	}
 
-	// Invalidate any cached session entries for this user so outstanding
-	// tokens are immediately rejected by the auth middleware rather than
-	// remaining valid until the cache TTL expires.
+	// SECURITY: after the transaction commits, nuke ALL cached session
+	// entries for this user so every outstanding token is rejected on its
+	// next request. The user's session rows have been DELETEd, so the DB
+	// path would also reject them (no matching row → 401 semantics depend
+	// on the middleware's fallthrough, but the cache path is the hot path
+	// to guard). Invalidating after Commit avoids a race where a concurrent
+	// request could repopulate the cache from still-extant rows between
+	// cache-delete and tx-commit.
 	middleware.InvalidateUserSessionCache(uid)
 
 	return c.SendStatus(fiber.StatusNoContent)

@@ -1,12 +1,13 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -14,6 +15,18 @@ import (
 
 // ListCollaborators returns all collaborators for a budget (owner or
 // collaborator). Each collaborator record is enriched with profile info.
+//
+// PERF: Runs in two queries total (down from three on the old
+// verifyBudgetAccess + budget GET + collab GET path):
+//  1. Combined UNION ALL of (budget owner if user has access) + (all
+//     collaborator rows). One round-trip authorises the caller and lists
+//     everyone.
+//  2. Batch profile fetch by `id IN (...)` for the owner + collaborator
+//     user_ids — one round-trip regardless of how many collaborators there
+//     are (capped at 5 + 1 owner = 6).
+//
+// Not called on every request, so the profile fetch stays on the JSON-agg
+// wrapper via database.DB.GetCtx.
 func ListCollaborators(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -123,6 +136,13 @@ func ListCollaborators(c *fiber.Ctx) error {
 // RemoveCollaborator removes a collaborator from a budget. Only the budget
 // owner can perform this action.
 // On success it broadcasts a collaborator_removed event via WebSocket.
+//
+// PERF: Collapsed the previous verify-ownership + verify-collab-exists +
+// delete-collab sequence (3 DB round-trips) into one atomic DELETE on the
+// collaborators table that enforces ownership via an EXISTS subquery and
+// returns the deleted row id. A separate, smaller EXISTS probe runs only
+// if the DELETE affected zero rows, to disambiguate "not owner" from
+// "not found" — preserving the pre-optimisation error surface.
 func RemoveCollaborator(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -139,55 +159,57 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid user ID")
 	}
 
-	// Only the budget owner can remove collaborators.
-	if err := verifyBudgetOwnership(budgetID, userID); err != nil {
-		return errForbidden(c, "only the budget owner can remove collaborators")
-	}
-
-	// Prevent the owner from removing themselves as a collaborator.
+	// Prevent the owner from removing themselves as a collaborator (owner
+	// is never a collaborator row anyway, but the explicit check preserves
+	// the existing error surface for API consumers).
 	if targetUserID == userID {
 		return errBadRequest(c, "cannot remove yourself as the budget owner")
 	}
 
-	// Verify the collaborator exists.
-	checkQuery := database.NewFilter().
-		Select("id").
-		Eq("budget_id", budgetID.String()).
-		Eq("user_id", targetUserID.String()).
-		Build()
+	reqCtx := c.Context()
 
-	body, statusCode, err := database.DB.Get("budget_collaborators", checkQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to verify collaborator")
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
+	// PERF: single atomic DELETE. The EXISTS subquery enforces owner-only
+	// semantics and the primary WHERE enforces collab identity. RETURNING
+	// id tells us whether a row was actually deleted.
+	var deletedID uuid.UUID
+	err := database.DB.Pool.QueryRow(reqCtx,
+		`DELETE FROM budget_collaborators
+		 WHERE budget_id = $1 AND user_id = $2
+		   AND EXISTS(SELECT 1 FROM budgets WHERE id = $1 AND user_id = $3)
+		 RETURNING id`,
+		budgetID, targetUserID, userID,
+	).Scan(&deletedID)
+	if err != nil {
+		// Zero-row case: disambiguate owner-mismatch vs collab-not-found so
+		// the error surface matches the pre-optimisation behaviour.
+		var isOwner bool
+		_ = database.DB.Pool.QueryRow(reqCtx,
+			`SELECT EXISTS(SELECT 1 FROM budgets WHERE id = $1 AND user_id = $2)`,
+			budgetID, userID,
+		).Scan(&isOwner)
+		if !isOwner {
+			return errForbidden(c, "only the budget owner can remove collaborators")
+		}
 		return errNotFound(c, "collaborator not found")
 	}
 
-	// Delete the collaborator.
-	delQuery := database.NewFilter().
-		Eq("budget_id", budgetID.String()).
-		Eq("user_id", targetUserID.String()).
-		Build()
-
-	_, statusCode, err = database.DB.Delete("budget_collaborators", delQuery)
-	if err != nil || statusCode >= 300 {
-		return errInternal(c, "failed to delete collaborator")
-	}
-
 	// Clean up links created by the removed collaborator for this budget.
-	_, cleanupErr := database.DB.Pool.Exec(context.Background(),
+	_, cleanupErr := database.DB.Pool.Exec(reqCtx,
 		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`,
 		targetUserID, budgetID)
 	if cleanupErr != nil {
 		// Log but don't fail the request — collaborator removal succeeded.
 		// Links will be orphaned but won't cause data integrity issues.
+		log.Printf("[collaborators] link cleanup failed for budget %s user %s: %v",
+			budgetID, targetUserID, cleanupErr)
 	}
 	// Invalidate every cached entry: we don't know which source budgets the
 	// removed collaborator had links on without another query.
 	invalidateLinkTargetsCacheAll()
+	// The summary cache keys a spending_by_user row per collaborator, and the
+	// removed user's expenses stay but attribution changes, so drop the
+	// budget's cached summary/trends/resume too.
+	invalidateBudget(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeCollabRemoved, map[string]string{
 		"user_id": targetUserID.String(),

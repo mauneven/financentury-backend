@@ -27,17 +27,17 @@ func TestIsValidDate_InvalidDates(t *testing.T) {
 	invalid := []string{
 		"",
 		"2026",
-		"2026-13-01",   // month 13
-		"2026-00-01",   // month 0
-		"2026-01-32",   // day 32
-		"2026-02-29",   // 2026 is not a leap year
+		"2026-13-01", // month 13
+		"2026-00-01", // month 0
+		"2026-01-32", // day 32
+		"2026-02-29", // 2026 is not a leap year
 		"not-a-date",
-		"01-01-2026",   // wrong order
-		"2026/01/01",   // wrong separator
-		"2026-1-1",     // missing leading zeros
+		"01-01-2026",           // wrong order
+		"2026/01/01",           // wrong separator
+		"2026-1-1",             // missing leading zeros
 		"2026-01-01T00:00:00Z", // datetime, not date
-		" 2026-01-01",  // leading space
-		"2026-01-01 ",  // trailing space
+		" 2026-01-01",          // leading space
+		"2026-01-01 ",          // trailing space
 	}
 	for _, d := range invalid {
 		if isValidDate(d) {
@@ -454,15 +454,15 @@ func TestIsValidCurrencyCode_Valid(t *testing.T) {
 
 func TestIsValidCurrencyCode_Invalid(t *testing.T) {
 	invalid := []string{
-		"",      // empty
-		"US",    // too short
-		"EURO",  // too long
-		"usd",   // lowercase
-		"Usd",   // mixed case
-		"123",   // digits
-		"U$D",   // special chars
-		"   ",   // spaces
-		"AB ",   // trailing space
+		"",     // empty
+		"US",   // too short
+		"EURO", // too long
+		"usd",  // lowercase
+		"Usd",  // mixed case
+		"123",  // digits
+		"U$D",  // special chars
+		"   ",  // spaces
+		"AB ",  // trailing space
 	}
 	for _, c := range invalid {
 		if isValidCurrencyCode(c) {

@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -28,7 +32,7 @@ var (
 )
 
 type linkTargetsCacheEntry struct {
-	ids       []string
+	ids       []uuid.UUID
 	expiresAt time.Time
 }
 
@@ -127,16 +131,24 @@ func CreateLink(c *fiber.Ctx) error {
 		return errBadRequest(c, "filter_mode must be 'all' or 'mine'")
 	}
 
+	// Required-field checks happen before any DB work so callers get crisp
+	// 400s instead of a downstream 404 from a missing UUID being treated as
+	// a lookup miss.
+	if req.SourceBudgetID == uuid.Nil {
+		return errBadRequest(c, "source_budget_id is required")
+	}
+	if req.SourceCategoryID == uuid.Nil {
+		return errBadRequest(c, "source_category_id is required")
+	}
+
 	// No self-linking.
 	if req.SourceBudgetID == budgetID {
 		return errBadRequest(c, "cannot link a budget to itself")
 	}
 
-	if req.SourceCategoryID == uuid.Nil {
-		return errBadRequest(c, "source_category_id is required")
-	}
-
-	// User must have access to both budgets.
+	// User must have access to both budgets. These two verifications are
+	// kept as separate calls so the error message distinguishes "target
+	// not found" vs "source not found" — fusing them would lose that.
 	if err := verifyBudgetAccess(budgetID, userID); err != nil {
 		return errNotFound(c, "target budget not found")
 	}
@@ -147,54 +159,47 @@ func CreateLink(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Verify same currency.
-	var targetCurrency, sourceCurrency string
-	err := database.DB.Pool.QueryRow(ctx,
-		"SELECT currency FROM budgets WHERE id = $1", budgetID).Scan(&targetCurrency)
+	// PERF: one round-trip now covers all four of the downstream invariants
+	// (currencies match, source category exists, link-count below cap, no
+	// reverse link). Previously this was four separate SELECTs issued in
+	// sequence; the combined form still returns per-check booleans/values
+	// so the handler can emit the precise 400/404 for each failure.
+	var (
+		targetCurrency, sourceCurrency string
+		categoryExists, reverseExists  bool
+		linkCount                      int
+	)
+	err := database.DB.Pool.QueryRow(ctx, `
+		SELECT
+			(SELECT currency FROM budgets WHERE id = $1),
+			(SELECT currency FROM budgets WHERE id = $2),
+			EXISTS(SELECT 1 FROM budget_categories WHERE id = $3 AND budget_id = $2),
+			(SELECT COUNT(*) FROM budget_links WHERE target_budget_id = $1),
+			EXISTS(SELECT 1 FROM budget_links
+			         WHERE source_budget_id = $1 AND target_budget_id = $2)
+	`, budgetID, req.SourceBudgetID, req.SourceCategoryID).Scan(
+		&targetCurrency, &sourceCurrency, &categoryExists, &linkCount, &reverseExists,
+	)
 	if err != nil {
-		return errInternal(c, "failed to fetch target budget")
-	}
-	err = database.DB.Pool.QueryRow(ctx,
-		"SELECT currency FROM budgets WHERE id = $1", req.SourceBudgetID).Scan(&sourceCurrency)
-	if err != nil {
-		return errInternal(c, "failed to fetch source budget")
+		log.Printf("[links] preflight failed: %v", err)
+		return errInternal(c, "failed to verify link preconditions")
 	}
 	if targetCurrency != sourceCurrency {
 		return errBadRequest(c, "budgets must have the same currency")
 	}
-
-	// Verify source category exists in source budget.
-	var categoryExists bool
-	err = database.DB.Pool.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)",
-		req.SourceCategoryID, req.SourceBudgetID).Scan(&categoryExists)
-	if err != nil || !categoryExists {
+	if !categoryExists {
 		return errNotFound(c, "source category not found in source budget")
 	}
-
-	// Enforce per-budget link limit.
-	var linkCount int
-	err = database.DB.Pool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM budget_links WHERE target_budget_id = $1", budgetID).Scan(&linkCount)
-	if err == nil && linkCount >= maxLinksPerBudget {
+	if linkCount >= maxLinksPerBudget {
 		return errBadRequest(c, "maximum number of links reached")
-	}
-
-	// Prevent circular links (A→B and B→A).
-	var reverseExists bool
-	err = database.DB.Pool.QueryRow(ctx,
-		`SELECT EXISTS(
-			SELECT 1 FROM budget_links
-			WHERE source_budget_id = $1 AND target_budget_id = $2
-		)`, budgetID, req.SourceBudgetID).Scan(&reverseExists)
-	if err != nil {
-		return errInternal(c, "failed to check for circular links")
 	}
 	if reverseExists {
 		return errBadRequest(c, "cannot create circular link between budgets")
 	}
 
-	// Insert the link.
+	// Insert the link. The `(target_budget_id, source_category_id)` UNIQUE
+	// constraint surfaces as a pgconn.PgError with code 23505; translate
+	// that to a clear 400 instead of a generic 500.
 	var link models.BudgetLink
 	err = database.DB.Pool.QueryRow(ctx, `
 		INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
@@ -204,11 +209,19 @@ func CreateLink(c *fiber.Ctx) error {
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
 		&link.SourceCategoryID, &link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return errBadRequest(c, "this category is already linked to the target budget")
+		}
 		log.Printf("[links] insert failed: %v", err)
 		return errInternal(c, "failed to create link")
 	}
 
 	invalidateLinkTargetsCache(req.SourceBudgetID)
+
+	// PERF: new link changes the linked_categories view on the target budget's
+	// summary.
+	invalidateBudget(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeLinkCreated, link)
 	broadcast(req.SourceBudgetID.String(), ws.MessageTypeLinkCreated, link)
@@ -233,10 +246,6 @@ func UpdateLink(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid link id")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
-
 	var req struct {
 		FilterMode string `json:"filter_mode"`
 	}
@@ -250,17 +259,32 @@ func UpdateLink(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// PERF: fuse access check into the UPDATE via EXISTS on budgets. The
+	// previous version fired verifyBudgetAccess first (one extra round-trip);
+	// now a single UPDATE...RETURNING either matches all three invariants
+	// (link id, budget id, access) or returns no rows (404).
 	var link models.BudgetLink
 	err := database.DB.Pool.QueryRow(ctx, `
 		UPDATE budget_links SET filter_mode = $1
 		WHERE id = $2 AND target_budget_id = $3
+		  AND EXISTS (
+		    SELECT 1 FROM budgets WHERE id = $3 AND user_id = $4
+		    UNION ALL
+		    SELECT 1 FROM budget_collaborators WHERE budget_id = $3 AND user_id = $4
+		  )
 		RETURNING id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by, created_at
-	`, req.FilterMode, linkID, budgetID,
+	`, req.FilterMode, linkID, budgetID, userID,
 	).Scan(&link.ID, &link.SourceBudgetID, &link.TargetBudgetID,
 		&link.SourceCategoryID, &link.FilterMode, &link.CreatedBy, &link.CreatedAt)
 	if err != nil {
-		return errNotFound(c, "link not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "link not found")
+		}
+		log.Printf("[links] update failed id=%s budget=%s: %v", linkID, budgetID, err)
+		return errInternal(c, "failed to update link")
 	}
+
+	invalidateBudget(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeLinkUpdated, link)
 
@@ -284,30 +308,35 @@ func DeleteLink(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid link id")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Fetch source_budget_id before deleting for WS notification.
+	// PERF: fuse the access check into the DELETE...RETURNING. Previously
+	// this fired verifyBudgetAccess first and then a separate DELETE — two
+	// round-trips. The combined form gates on access via EXISTS; no rows
+	// means "link not found OR no access" which is always safe to report
+	// as 404 (don't leak link existence to non-members).
 	var sourceBudgetID uuid.UUID
-	err := database.DB.Pool.QueryRow(ctx,
-		"SELECT source_budget_id FROM budget_links WHERE id = $1 AND target_budget_id = $2",
-		linkID, budgetID).Scan(&sourceBudgetID)
+	err := database.DB.Pool.QueryRow(ctx, `
+		DELETE FROM budget_links
+		WHERE id = $1 AND target_budget_id = $2
+		  AND EXISTS (
+		    SELECT 1 FROM budgets WHERE id = $2 AND user_id = $3
+		    UNION ALL
+		    SELECT 1 FROM budget_collaborators WHERE budget_id = $2 AND user_id = $3
+		  )
+		RETURNING source_budget_id
+	`, linkID, budgetID, userID).Scan(&sourceBudgetID)
 	if err != nil {
-		return errNotFound(c, "link not found")
-	}
-
-	_, err = database.DB.Pool.Exec(ctx,
-		"DELETE FROM budget_links WHERE id = $1 AND target_budget_id = $2",
-		linkID, budgetID)
-	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "link not found")
+		}
+		log.Printf("[links] delete failed id=%s budget=%s: %v", linkID, budgetID, err)
 		return errInternal(c, "failed to delete link")
 	}
 
 	invalidateLinkTargetsCache(sourceBudgetID)
+	invalidateBudget(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeLinkDeleted, fiber.Map{"id": linkID})
 	broadcast(sourceBudgetID.String(), ws.MessageTypeLinkDeleted, fiber.Map{"id": linkID})
@@ -336,25 +365,22 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Get current budget's currency.
-	var currency string
-	err := database.DB.Pool.QueryRow(ctx,
-		"SELECT currency FROM budgets WHERE id = $1", budgetID).Scan(&currency)
-	if err != nil {
-		return errInternal(c, "failed to fetch budget")
-	}
-
-	// Fetch all other budgets the user has access to with the same currency.
+	// PERF: fetch linkable budgets in a single round-trip by inlining the
+	// source budget's currency as a scalar subquery. Previously we ran two
+	// queries (SELECT currency, then SELECT matching budgets); now it's one.
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
 	rows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, user_id, name, icon, monthly_income, currency,
+		SELECT id, user_id, name, icon, monthly_income::float8, currency,
 		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
 		FROM budgets
-		WHERE currency = $1 AND id != $2
-		  AND (user_id = $3 OR id IN (
-		    SELECT budget_id FROM budget_collaborators WHERE user_id = $3
+		WHERE currency = (SELECT currency FROM budgets WHERE id = $1)
+		  AND id != $1
+		  AND (user_id = $2 OR id IN (
+		    SELECT budget_id FROM budget_collaborators WHERE user_id = $2
 		  ))
 		ORDER BY name
-	`, currency, budgetID, userID)
+	`, budgetID, userID)
 	if err != nil {
 		return errInternal(c, "failed to fetch linkable budgets")
 	}
@@ -365,7 +391,9 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 		Categories []models.Category `json:"categories"`
 	}
 
-	var budgets []linkableBudget
+	// Pre-allocated as a zero-length slice so an empty result marshals as
+	// `[]` (not `null`) without needing a special-case early return.
+	budgets := make([]linkableBudget, 0)
 	budgetIDs := make([]uuid.UUID, 0)
 
 	for rows.Next() {
@@ -380,7 +408,7 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 	}
 
 	if len(budgets) == 0 {
-		return c.JSON([]struct{}{})
+		return c.JSON(budgets)
 	}
 
 	// Build budget index map.
@@ -390,8 +418,10 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 	}
 
 	// Fetch categories for all budgets in one batched query.
+	// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
 	catRows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, budget_id, name, allocation_value, icon, sort_order, created_at
+		SELECT id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
 		FROM budget_categories
 		WHERE budget_id = ANY($1)
 		ORDER BY sort_order, created_at
@@ -417,10 +447,14 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 	return c.JSON(budgets)
 }
 
-// fetchTargetBudgetIDs returns all target budget IDs that have links from the given source budget.
-// Used for cross-budget WS broadcasting. Results are cached for linkTargetsCacheTTL
-// to avoid hammering the DB from every mutation when most budgets have no links.
-func fetchTargetBudgetIDs(sourceBudgetID uuid.UUID) ([]string, error) {
+// fetchTargetBudgetIDs returns all target budget IDs that have links from the
+// given source budget. Used for cross-budget WS broadcasting and cache
+// invalidation. Results are cached for linkTargetsCacheTTL to avoid hammering
+// the DB from every mutation when most budgets have no links.
+//
+// ctx is honoured for the uncached DB round-trip so cancelled HTTP requests
+// propagate through.
+func fetchTargetBudgetIDs(ctx context.Context, sourceBudgetID uuid.UUID) ([]uuid.UUID, error) {
 	if database.DB == nil || database.DB.Pool == nil {
 		return nil, nil
 	}
@@ -433,20 +467,20 @@ func fetchTargetBudgetIDs(sourceBudgetID uuid.UUID) ([]string, error) {
 		return entry.ids, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	rows, err := database.DB.Pool.Query(ctx,
-		"SELECT DISTINCT target_budget_id::text FROM budget_links WHERE source_budget_id = $1",
+	rows, err := database.DB.Pool.Query(queryCtx,
+		"SELECT DISTINCT target_budget_id FROM budget_links WHERE source_budget_id = $1",
 		sourceBudgetID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var ids []string
+	var ids []uuid.UUID
 	for rows.Next() {
-		var id string
+		var id uuid.UUID
 		if err := rows.Scan(&id); err == nil {
 			ids = append(ids, id)
 		}

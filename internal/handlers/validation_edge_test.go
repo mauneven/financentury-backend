@@ -200,7 +200,7 @@ func TestAllocationPercent_ExactBoundaries(t *testing.T) {
 		{-0.001, false},
 		{100.001, false},
 		{50.0, true},
-		{-0.0, true}, // negative zero equals zero in IEEE 754
+		{math.Copysign(0, -1), true}, // negative zero equals zero in IEEE 754
 	}
 	for _, tc := range cases {
 		isValid := tc.pct >= 0 && tc.pct <= 100

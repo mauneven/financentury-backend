@@ -11,6 +11,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -273,42 +274,32 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errBadRequest(c, "invite has expired")
 	}
 
-	// Prevent owner from joining their own budget.
-	ownerQuery := database.NewFilter().
-		Select("id").
-		Eq("id", invite.BudgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	ownerBody, ownerStatus, ownerErr := database.DB.Get("budgets", ownerQuery)
-	if ownerErr == nil && ownerStatus == http.StatusOK {
-		var ownerFound []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(ownerBody, &ownerFound); err == nil && len(ownerFound) > 0 {
-			return errBadRequest(c, "you are already the owner of this budget")
-		}
+	// PERF: Fold three pre-check queries (is_owner, already_collab, per-user
+	// budget count) into a single round-trip. The old path ran two separate
+	// Filter-built SELECTs + enforceUserBudgetLimit's UNION-COUNT = three
+	// sequential DB hits before the transaction even opened. Each check is
+	// a cheap indexed probe, so batching them is strictly faster and avoids
+	// the JSON-aggregate overhead of GetCtx.
+	var isOwner, alreadyCollab bool
+	var userBudgetTotal int
+	if err := database.DB.Pool.QueryRow(c.Context(),
+		`SELECT
+		   EXISTS(SELECT 1 FROM budgets WHERE id = $1 AND user_id = $2),
+		   EXISTS(SELECT 1 FROM budget_collaborators WHERE budget_id = $1 AND user_id = $2),
+		   (SELECT COUNT(*) FROM budgets WHERE user_id = $2)
+		     + (SELECT COUNT(*) FROM budget_collaborators WHERE user_id = $2)`,
+		invite.BudgetID, userID,
+	).Scan(&isOwner, &alreadyCollab, &userBudgetTotal); err != nil {
+		return errInternal(c, "failed to validate invite")
 	}
-
-	// Enforce per-user budget limit before adding a new collaboration.
-	if err := enforceUserBudgetLimit(userID); err != nil {
-		if err.Error() == "limit" {
-			return errBadRequest(c, "budget limit reached (max 7)")
-		}
-		return errInternal(c, "failed to check budget count")
+	if isOwner {
+		return errBadRequest(c, "you are already the owner of this budget")
 	}
-
-	// Prevent duplicate collaborator.
-	collabCheckQuery := database.NewFilter().
-		Select("id").
-		Eq("budget_id", invite.BudgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	collabBody, collabStatus, collabErr := database.DB.Get("budget_collaborators", collabCheckQuery)
-	if collabErr == nil && collabStatus == http.StatusOK {
-		var collabFound []struct{ ID string `json:"id"` }
-		if err := json.Unmarshal(collabBody, &collabFound); err == nil && len(collabFound) > 0 {
-			return errBadRequest(c, "you are already a collaborator on this budget")
-		}
+	if alreadyCollab {
+		return errBadRequest(c, "you are already a collaborator on this budget")
+	}
+	if userBudgetTotal >= maxBudgetsPerUser {
+		return errBadRequest(c, "budget limit reached (max 7)")
 	}
 
 	// Mark invite as used AND insert the collaborator in the SAME transaction
@@ -319,7 +310,7 @@ func AcceptInvite(c *fiber.Ctx) error {
 	if err != nil {
 		return errInternal(c, "failed to start transaction")
 	}
-	defer tx.Rollback(context.Background())
+	defer func() { _ = tx.Rollback(context.Background()) }()
 
 	// Atomically mark invite as used — prevents race condition where two
 	// concurrent requests both pass the used_by check.
@@ -353,19 +344,28 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errInternal(c, "failed to commit invite acceptance")
 	}
 
-	// Return the budget data.
-	budgetQuery := database.NewFilter().
-		Select("*").
-		Eq("id", invite.BudgetID.String()).
-		Build()
+	// A new collaborator just joined: any cached summary for this budget
+	// could still be holding a stale collaborator list / spending_by_user
+	// view, so purge it before the accepting user's first dashboard load.
+	invalidateBudget(invite.BudgetID)
 
-	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
-	if budgetErr != nil || budgetStatus != http.StatusOK {
-		return errInternal(c, "failed to fetch budget")
-	}
-
-	var budgets []models.Budget
-	if err := json.Unmarshal(budgetBody, &budgets); err != nil || len(budgets) == 0 {
+	// PERF: Fetch the budget via a direct pgx QueryRow instead of
+	// database.DB.Get, which wraps the SELECT in a json_agg(to_json(...))
+	// subquery. Both are one round-trip, but the direct scan avoids the
+	// JSON encode/decode round-trip on the hot path where we only need a
+	// single row by primary key.
+	var budget models.Budget
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	err = database.DB.Pool.QueryRow(c.Context(),
+		`SELECT id, user_id, name, icon, monthly_income::float8, currency,
+		        billing_period_months, billing_cutoff_day, mode,
+		        created_at, updated_at
+		 FROM budgets WHERE id = $1`, invite.BudgetID,
+	).Scan(&budget.ID, &budget.UserID, &budget.Name, &budget.Icon,
+		&budget.MonthlyIncome, &budget.Currency, &budget.BillingPeriodMonths,
+		&budget.BillingCutoffDay, &budget.Mode, &budget.CreatedAt, &budget.UpdatedAt)
+	if err != nil {
 		return errNotFound(c, "budget not found")
 	}
 
@@ -373,5 +373,5 @@ func AcceptInvite(c *fiber.Ctx) error {
 		"user_id": userID.String(),
 	})
 
-	return c.JSON(budgets[0])
+	return c.JSON(budget)
 }

@@ -1,18 +1,23 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 )
 
 // SaveDisplayOrder upserts a display order for the authenticated user.
 // PUT /api/display-orders
+//
+// PERF: the whole call is already a single round-trip — INSERT ... ON
+// CONFLICT DO UPDATE ... RETURNING *. The list of ordered IDs is stored as
+// a JSONB column, so there's no per-item loop; the full array is shipped in
+// one statement. No further DB-cost reduction is available here.
 func SaveDisplayOrder(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -34,10 +39,10 @@ func SaveDisplayOrder(c *fiber.Ctx) error {
 		return errBadRequest(c, "too many ordered_ids")
 	}
 
-	// Validate each ID is a valid UUID
+	// Validate each ID is a valid UUID, or — if it's a composite key like
+	// "linked-..." — stays under the 200-char length ceiling.
 	for _, id := range req.OrderedIDs {
 		if _, err := uuid.Parse(id); err != nil {
-			// Allow non-UUID keys (e.g. "linked-..." composite keys)
 			if len(id) > 200 {
 				return errBadRequest(c, "ordered_id too long")
 			}
@@ -51,7 +56,11 @@ func SaveDisplayOrder(c *fiber.Ctx) error {
 
 	now := time.Now().UTC()
 	var o models.DisplayOrder
-	err = database.DB.Pool.QueryRow(context.Background(),
+	// PERF: use c.Context() so a cancelled HTTP request (e.g. client
+	// disconnect during a drag-drop reorder) propagates to the DB instead
+	// of holding a pool connection for a query whose result will be
+	// discarded.
+	err = database.DB.Pool.QueryRow(c.Context(),
 		`INSERT INTO display_orders (id, user_id, scope_key, ordered_ids, updated_at)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (user_id, scope_key)

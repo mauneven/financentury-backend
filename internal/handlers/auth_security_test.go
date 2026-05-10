@@ -184,13 +184,13 @@ func TestEmailValidation_BasicCheck(t *testing.T) {
 
 	cases := []tc{
 		{"user@example.com", true},
-		{"user@example", false},     // no dot
-		{"@.", true},                 // passes the simple check (has @ and .)
-		{".@.", true},                // passes the simple check
-		{"user@.com", true},         // passes the simple check
-		{"", false},                 // no @ or .
-		{"nodomain@", false},        // no dot
-		{"no-at-sign.com", false},   // no @
+		{"user@example", false},   // no dot
+		{"@.", true},              // passes the simple check (has @ and .)
+		{".@.", true},             // passes the simple check
+		{"user@.com", true},       // passes the simple check
+		{"", false},               // no @ or .
+		{"nodomain@", false},      // no dot
+		{"no-at-sign.com", false}, // no @
 		{"a@b.c", true},
 	}
 

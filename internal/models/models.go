@@ -12,7 +12,7 @@ type Profile struct {
 	ID           uuid.UUID `json:"id"`
 	Email        string    `json:"email"`
 	FullName     string    `json:"full_name"`
-	PasswordHash string    `json:"-"`                        // never sent to client
+	PasswordHash string    `json:"-"` // never sent to client
 	AuthProvider string    `json:"auth_provider,omitempty"`
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`

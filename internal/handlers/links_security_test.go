@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
@@ -46,14 +48,14 @@ func tokenForUser(userID uuid.UUID, email string) string {
 
 // Static UUIDs used across tests.
 var (
-	ownerUserID   = uuid.MustParse("11111111-1111-1111-1111-111111111111")
-	collabUserID  = uuid.MustParse("22222222-2222-2222-2222-222222222222")
-	thirdUserID   = uuid.MustParse("33333333-3333-3333-3333-333333333333")
-	budgetAID     = uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-	budgetBID     = uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-	budgetCID     = uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
-	categoryA1ID  = uuid.MustParse("a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1")
-	categoryB1ID  = uuid.MustParse("b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1")
+	ownerUserID  = uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	collabUserID = uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	thirdUserID  = uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	budgetAID    = uuid.MustParse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	budgetBID    = uuid.MustParse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	budgetCID    = uuid.MustParse("cccccccc-cccc-cccc-cccc-cccccccccccc")
+	categoryA1ID = uuid.MustParse("a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1")
+	categoryB1ID = uuid.MustParse("b1b1b1b1-b1b1-b1b1-b1b1-b1b1b1b1b1b1")
 )
 
 // seedLinkTestData inserts the minimal set of rows needed by most link
@@ -65,14 +67,14 @@ func seedLinkTestData(t *testing.T) {
 	pool := database.DB.Pool
 
 	// Clean up first (in dependency order).
-	pool.Exec(nil, "DELETE FROM budget_links")
-	pool.Exec(nil, "DELETE FROM budget_expenses")
-	pool.Exec(nil, "DELETE FROM budget_categories")
-	pool.Exec(nil, "DELETE FROM budget_collaborators")
-	pool.Exec(nil, "DELETE FROM budget_invites")
-	pool.Exec(nil, "DELETE FROM budgets")
-	pool.Exec(nil, "DELETE FROM user_sessions")
-	pool.Exec(nil, "DELETE FROM profiles")
+	pool.Exec(context.Background(), "DELETE FROM budget_links")
+	pool.Exec(context.Background(), "DELETE FROM budget_expenses")
+	pool.Exec(context.Background(), "DELETE FROM budget_categories")
+	pool.Exec(context.Background(), "DELETE FROM budget_collaborators")
+	pool.Exec(context.Background(), "DELETE FROM budget_invites")
+	pool.Exec(context.Background(), "DELETE FROM budgets")
+	pool.Exec(context.Background(), "DELETE FROM user_sessions")
+	pool.Exec(context.Background(), "DELETE FROM profiles")
 
 	// Profiles.
 	for _, u := range []struct {
@@ -84,7 +86,7 @@ func seedLinkTestData(t *testing.T) {
 		{collabUserID, "collab@test.com", "Collaborator"},
 		{thirdUserID, "third@test.com", "Third"},
 	} {
-		_, err := pool.Exec(nil,
+		_, err := pool.Exec(context.Background(),
 			`INSERT INTO profiles (id, email, full_name, password_hash, auth_provider)
 			 VALUES ($1, $2, $3, 'hash', 'email')`,
 			u.id, u.email, u.name)
@@ -103,7 +105,7 @@ func seedLinkTestData(t *testing.T) {
 		{budgetBID, collabUserID, "Budget B"},
 		{budgetCID, thirdUserID, "Budget C"},
 	} {
-		_, err := pool.Exec(nil,
+		_, err := pool.Exec(context.Background(),
 			`INSERT INTO budgets (id, user_id, name, monthly_income, currency, billing_period_months, billing_cutoff_day, mode)
 			 VALUES ($1, $2, $3, 5000000, 'USD', 1, 1, 'manual')`,
 			b.id, b.owner, b.name)
@@ -121,7 +123,7 @@ func seedLinkTestData(t *testing.T) {
 		{categoryA1ID, budgetAID, "Category A1"},
 		{categoryB1ID, budgetBID, "Category B1"},
 	} {
-		_, err := pool.Exec(nil,
+		_, err := pool.Exec(context.Background(),
 			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 			 VALUES ($1, $2, $3, 50, 'home', 1)`,
 			c.id, c.budgetID, c.name)
@@ -180,7 +182,7 @@ func TestCreateLink_InvalidFilterMode(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B (as collaborator).
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -268,11 +270,11 @@ func TestCreateLink_CurrencyMismatchRejected(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Change budget B to a different currency.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`UPDATE budgets SET currency = 'EUR' WHERE id = $1`, budgetBID)
 
 	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -306,7 +308,7 @@ func TestCreateLink_Success(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -366,7 +368,7 @@ func TestCreateLink_MaxLinksPerBudgetEnforced(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -375,12 +377,12 @@ func TestCreateLink_MaxLinksPerBudgetEnforced(t *testing.T) {
 	// source category to satisfy the unique constraint.
 	for i := 0; i < maxLinksPerBudget; i++ {
 		catID := uuid.New()
-		database.DB.Pool.Exec(nil,
+		database.DB.Pool.Exec(context.Background(),
 			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 			 VALUES ($1, $2, $3, 10, 'tag', $4)`,
 			catID, budgetBID, "DummyCategory"+string(rune('0'+i)), i+10)
 
-		database.DB.Pool.Exec(nil,
+		database.DB.Pool.Exec(context.Background(),
 			`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 			 VALUES ($1, $2, $3, 'all', $4)`,
 			budgetBID, budgetAID, catID, ownerUserID)
@@ -415,7 +417,7 @@ func TestCreateLink_MissingSourceCategoryID(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -478,13 +480,13 @@ func TestUpdateLink_Success(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B and create a link.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
 
 	linkID := uuid.New()
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
 		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
@@ -523,13 +525,13 @@ func TestUpdateLink_InvalidFilterMode(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedLinkTestData(t)
 
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
 
 	linkID := uuid.New()
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
 		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
@@ -559,13 +561,13 @@ func TestDeleteLink_Success(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedLinkTestData(t)
 
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
 
 	linkID := uuid.New()
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (id, source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, $4, 'all', $5)`,
 		linkID, budgetBID, budgetAID, categoryB1ID, ownerUserID)
@@ -585,7 +587,7 @@ func TestDeleteLink_Success(t *testing.T) {
 
 	// Verify it's actually gone.
 	var count int
-	database.DB.Pool.QueryRow(nil,
+	database.DB.Pool.QueryRow(context.Background(),
 		"SELECT COUNT(*) FROM budget_links WHERE id = $1", linkID).Scan(&count)
 	if count != 0 {
 		t.Errorf("link still exists after delete, count = %d", count)
@@ -620,7 +622,7 @@ func TestCreateLink_CategoryMustBelongToSourceBudget(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Give owner access to budget B.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role) VALUES ($1, $2, 'collaborator')
 		 ON CONFLICT DO NOTHING`,
 		budgetBID, ownerUserID)
@@ -675,7 +677,7 @@ func TestDBConstraint_DifferentBudgets(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Attempt to insert a link where source == target directly via SQL.
-	_, err := database.DB.Pool.Exec(nil,
+	_, err := database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $1, $2, 'all', $3)`,
 		budgetAID, categoryA1ID, ownerUserID)
@@ -693,7 +695,7 @@ func TestDBConstraint_FilterMode(t *testing.T) {
 	_, _ = setupLinkSecurityEnv(t)
 	seedLinkTestData(t)
 
-	_, err := database.DB.Pool.Exec(nil,
+	_, err := database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'invalid', $4)`,
 		budgetBID, budgetAID, categoryB1ID, ownerUserID)
@@ -712,7 +714,7 @@ func TestDBConstraint_UniqueLink(t *testing.T) {
 	seedLinkTestData(t)
 
 	// Insert first link.
-	_, err := database.DB.Pool.Exec(nil,
+	_, err := database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'all', $4)`,
 		budgetBID, budgetAID, categoryB1ID, ownerUserID)
@@ -721,7 +723,7 @@ func TestDBConstraint_UniqueLink(t *testing.T) {
 	}
 
 	// Duplicate should fail.
-	_, err = database.DB.Pool.Exec(nil,
+	_, err = database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_links (source_budget_id, target_budget_id, source_category_id, filter_mode, created_by)
 		 VALUES ($1, $2, $3, 'all', $4)`,
 		budgetBID, budgetAID, categoryB1ID, ownerUserID)

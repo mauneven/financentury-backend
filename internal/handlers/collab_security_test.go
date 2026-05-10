@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 )
@@ -23,14 +24,14 @@ func seedCollabTestData(t *testing.T) {
 	pool := database.DB.Pool
 
 	// Clean up (dependency order).
-	pool.Exec(nil, "DELETE FROM budget_links")
-	pool.Exec(nil, "DELETE FROM budget_expenses")
-	pool.Exec(nil, "DELETE FROM budget_categories")
-	pool.Exec(nil, "DELETE FROM budget_collaborators")
-	pool.Exec(nil, "DELETE FROM budget_invites")
-	pool.Exec(nil, "DELETE FROM budgets")
-	pool.Exec(nil, "DELETE FROM user_sessions")
-	pool.Exec(nil, "DELETE FROM profiles")
+	pool.Exec(context.Background(), "DELETE FROM budget_links")
+	pool.Exec(context.Background(), "DELETE FROM budget_expenses")
+	pool.Exec(context.Background(), "DELETE FROM budget_categories")
+	pool.Exec(context.Background(), "DELETE FROM budget_collaborators")
+	pool.Exec(context.Background(), "DELETE FROM budget_invites")
+	pool.Exec(context.Background(), "DELETE FROM budgets")
+	pool.Exec(context.Background(), "DELETE FROM user_sessions")
+	pool.Exec(context.Background(), "DELETE FROM profiles")
 
 	// Profiles.
 	for _, u := range []struct {
@@ -42,7 +43,7 @@ func seedCollabTestData(t *testing.T) {
 		{collabUserID, "collab@test.com", "Collaborator"},
 		{thirdUserID, "third@test.com", "Third"},
 	} {
-		_, err := pool.Exec(nil,
+		_, err := pool.Exec(context.Background(),
 			`INSERT INTO profiles (id, email, full_name, password_hash, auth_provider)
 			 VALUES ($1, $2, $3, 'hash', 'email')`,
 			u.id, u.email, u.name)
@@ -52,7 +53,7 @@ func seedCollabTestData(t *testing.T) {
 	}
 
 	// Budget A owned by owner.
-	_, err := pool.Exec(nil,
+	_, err := pool.Exec(context.Background(),
 		`INSERT INTO budgets (id, user_id, name, monthly_income, currency, billing_period_months, billing_cutoff_day, mode)
 		 VALUES ($1, $2, 'Budget A', 5000000, 'USD', 1, 1, 'manual')`,
 		budgetAID, ownerUserID)
@@ -61,7 +62,7 @@ func seedCollabTestData(t *testing.T) {
 	}
 
 	// Budget B owned by collab user.
-	_, err = pool.Exec(nil,
+	_, err = pool.Exec(context.Background(),
 		`INSERT INTO budgets (id, user_id, name, monthly_income, currency, billing_period_months, billing_cutoff_day, mode)
 		 VALUES ($1, $2, 'Budget B', 3000000, 'USD', 1, 1, 'manual')`,
 		budgetBID, collabUserID)
@@ -79,7 +80,7 @@ func TestRemoveCollaborator_OnlyOwnerCanRemove(t *testing.T) {
 	seedCollabTestData(t)
 
 	// Add collabUser as collaborator on budget A.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
@@ -129,7 +130,7 @@ func TestRemoveCollaborator_OwnerSuccess(t *testing.T) {
 	app, _ := setupLinkSecurityEnv(t)
 	seedCollabTestData(t)
 
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
@@ -149,7 +150,7 @@ func TestRemoveCollaborator_OwnerSuccess(t *testing.T) {
 
 	// Verify the collaborator is actually removed.
 	var count int
-	database.DB.Pool.QueryRow(nil,
+	database.DB.Pool.QueryRow(context.Background(),
 		"SELECT COUNT(*) FROM budget_collaborators WHERE budget_id = $1 AND user_id = $2",
 		budgetAID, collabUserID).Scan(&count)
 	if count != 0 {
@@ -168,21 +169,21 @@ func TestRemoveCollaborator_PreservesExpenseData(t *testing.T) {
 	pool := database.DB.Pool
 
 	// Add collab as collaborator.
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
 
 	// Create a flat category in budget A.
 	categoryID := uuid.New()
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 		 VALUES ($1, $2, 'Test Cat', 100, 'tag', 1)`,
 		categoryID, budgetAID)
 
 	// Collaborator creates an expense.
 	expenseID := uuid.New()
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_expenses (id, budget_id, category_id, amount, description, expense_date, created_by)
 		 VALUES ($1, $2, $3, 150.00, 'Collab expense', '2026-04-10', $4)`,
 		expenseID, budgetAID, categoryID, collabUserID)
@@ -203,7 +204,7 @@ func TestRemoveCollaborator_PreservesExpenseData(t *testing.T) {
 
 	// Verify the expense is still there.
 	var count int
-	pool.QueryRow(nil,
+	pool.QueryRow(context.Background(),
 		"SELECT COUNT(*) FROM budget_expenses WHERE id = $1", expenseID).Scan(&count)
 	if count != 1 {
 		t.Errorf("expense should be preserved after collaborator removal, got count = %d", count)
@@ -221,14 +222,14 @@ func TestCollaborator_CannotDeleteOwnerCategory(t *testing.T) {
 	pool := database.DB.Pool
 
 	// Add collab as collaborator on budget A.
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
 
 	// Owner creates a category.
 	categoryID := uuid.New()
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order)
 		 VALUES ($1, $2, 'Owner Category', 100, 'home', 1)`,
 		categoryID, budgetAID)
@@ -263,11 +264,11 @@ func TestAcceptInvite_CollaboratorLimitReached(t *testing.T) {
 	// Add 5 collaborators to budget A.
 	for i := 0; i < maxCollaboratorsPerBudget; i++ {
 		uid := uuid.New()
-		pool.Exec(nil,
+		pool.Exec(context.Background(),
 			`INSERT INTO profiles (id, email, full_name, password_hash, auth_provider)
 			 VALUES ($1, $2, $3, 'hash', 'email')`,
 			uid, fmt.Sprintf("user%d@test.com", i), fmt.Sprintf("User %d", i))
-		pool.Exec(nil,
+		pool.Exec(context.Background(),
 			`INSERT INTO budget_collaborators (budget_id, user_id, role)
 			 VALUES ($1, $2, 'collaborator')`,
 			budgetAID, uid)
@@ -277,7 +278,7 @@ func TestAcceptInvite_CollaboratorLimitReached(t *testing.T) {
 	inviteToken := "test-invite-limit-token"
 	inviteID := uuid.New()
 	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, expiresAt)
@@ -310,7 +311,7 @@ func TestAcceptInvite_Expired(t *testing.T) {
 	inviteToken := "test-expired-invite-token"
 	inviteID := uuid.New()
 	expiredAt := time.Now().UTC().Add(-24 * time.Hour) // expired yesterday
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, expiredAt)
@@ -327,7 +328,9 @@ func TestAcceptInvite_Expired(t *testing.T) {
 		t.Errorf("expired invite: status = %d, want 400, body: %s", resp.StatusCode, string(body))
 	}
 
-	var errResp struct{ Error string `json:"error"` }
+	var errResp struct {
+		Error string `json:"error"`
+	}
 	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &errResp); err == nil {
 		if !strings.Contains(errResp.Error, "expired") {
@@ -351,7 +354,7 @@ func TestAcceptInvite_AlreadyUsed(t *testing.T) {
 	inviteID := uuid.New()
 	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
 	usedAt := time.Now().UTC()
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, used_by, used_at, expires_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, collabUserID, usedAt, expiresAt)
@@ -382,7 +385,7 @@ func TestAcceptInvite_OwnerCannotAccept(t *testing.T) {
 	inviteToken := "test-owner-accept-token"
 	inviteID := uuid.New()
 	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, expiresAt)
@@ -412,7 +415,7 @@ func TestAcceptInvite_DuplicateCollaborator(t *testing.T) {
 	pool := database.DB.Pool
 
 	// Add thirdUser as collaborator already.
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, thirdUserID)
@@ -420,7 +423,7 @@ func TestAcceptInvite_DuplicateCollaborator(t *testing.T) {
 	inviteToken := "test-dupe-collab-token"
 	inviteID := uuid.New()
 	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, expiresAt)
@@ -493,7 +496,7 @@ func TestAcceptInvite_Success(t *testing.T) {
 	inviteToken := "test-success-accept-token"
 	inviteID := uuid.New()
 	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour)
-	pool.Exec(nil,
+	pool.Exec(context.Background(),
 		`INSERT INTO budget_invites (id, budget_id, invite_token, created_by, expires_at)
 		 VALUES ($1, $2, $3, $4, $5)`,
 		inviteID, budgetAID, inviteToken, ownerUserID, expiresAt)
@@ -542,7 +545,7 @@ func TestCreateInvite_OnlyOwner(t *testing.T) {
 	seedCollabTestData(t)
 
 	// Add collab as collaborator on budget A.
-	database.DB.Pool.Exec(nil,
+	database.DB.Pool.Exec(context.Background(),
 		`INSERT INTO budget_collaborators (budget_id, user_id, role)
 		 VALUES ($1, $2, 'collaborator')`,
 		budgetAID, collabUserID)
@@ -575,11 +578,11 @@ func TestCreateInvite_CollaboratorLimitAtCreation(t *testing.T) {
 	// Add 5 collaborators (the max).
 	for i := 0; i < maxCollaboratorsPerBudget; i++ {
 		uid := uuid.New()
-		pool.Exec(nil,
+		pool.Exec(context.Background(),
 			`INSERT INTO profiles (id, email, full_name, password_hash, auth_provider)
 			 VALUES ($1, $2, $3, 'hash', 'email')`,
 			uid, fmt.Sprintf("fill%d@test.com", i), fmt.Sprintf("Fill %d", i))
-		pool.Exec(nil,
+		pool.Exec(context.Background(),
 			`INSERT INTO budget_collaborators (budget_id, user_id, role)
 			 VALUES ($1, $2, 'collaborator')`,
 			budgetAID, uid)

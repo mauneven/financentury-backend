@@ -2,15 +2,16 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
-	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
 	"github.com/the-financial-workspace/backend/internal/ws"
@@ -126,8 +127,10 @@ func ListBudgets(c *fiber.Ctx) error {
 	// the old 2-3 query pattern (owned list + collab IDs + collab budgets) that
 	// required two round-trips plus a second Unmarshal of budget rows.
 	reqCtx := c.Context()
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
 	rows, err := database.DB.Pool.Query(reqCtx, `
-		SELECT id, user_id, name, icon, monthly_income, currency,
+		SELECT id, user_id, name, icon, monthly_income::float8, currency,
 		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
 		FROM budgets
 		WHERE user_id = $1
@@ -273,27 +276,16 @@ func CreateBudget(c *fiber.Ctx) error {
 		UpdatedAt:           now,
 	}
 
-	budgetPayload := map[string]interface{}{
-		"id":                    budget.ID.String(),
-		"user_id":               budget.UserID.String(),
-		"name":                  budget.Name,
-		"icon":                  budget.Icon,
-		"monthly_income":        budget.MonthlyIncome,
-		"currency":              budget.Currency,
-		"billing_period_months": budget.BillingPeriodMonths,
-		"billing_cutoff_day":    budget.BillingCutoffDay,
-		"mode":                  budget.Mode,
-		"created_at":            now.Format(time.RFC3339Nano),
-		"updated_at":            now.Format(time.RFC3339Nano),
-	}
-
-	payloadBytes, err := marshalJSON(budgetPayload)
-	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	_, statusCode, err := database.DB.Post("budgets", payloadBytes)
-	if err != nil || statusCode != http.StatusCreated {
+	// PERF: direct pgx INSERT avoids the extra JSON marshal + DB.Post round-trip
+	// through the generic HTTP-style wrapper. One query, only the columns we need.
+	if _, err := database.DB.Pool.Exec(c.Context(), `
+		INSERT INTO budgets
+			(id, user_id, name, icon, monthly_income, currency,
+			 billing_period_months, billing_cutoff_day, mode, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+	`, budget.ID, budget.UserID, budget.Name, budget.Icon, budget.MonthlyIncome,
+		budget.Currency, budget.BillingPeriodMonths, budget.BillingCutoffDay,
+		budget.Mode, now); err != nil {
 		return errInternal(c, "failed to create budget")
 	}
 
@@ -304,6 +296,10 @@ func CreateBudget(c *fiber.Ctx) error {
 		}
 	}
 
+	// PERF: invalidate any cached summary for the new budget so the first
+	// dashboard load after creation doesn't serve a pre-seed shell.
+	invalidateBudget(budgetID)
+
 	broadcast(budgetID.String(), ws.MessageTypeBudgetCreated, budget)
 
 	return c.Status(fiber.StatusCreated).JSON(budget)
@@ -313,29 +309,64 @@ func CreateBudget(c *fiber.Ctx) error {
 // budget mode inside a single transaction. The 50-category cap is enforced at
 // the DB level; none of our built-in templates approach it, but the trigger
 // remains the last line of defence.
+//
+// Allocations are rounded to 2 decimals (matching the NUMERIC(18,2) column
+// precision) using floor semantics for all but the last entry. The last
+// category absorbs the remainder so the sum lands exactly at monthlyIncome
+// without ever exceeding it — otherwise rounding could push total_allocation
+// above monthly_income and violate the invariant that Create/UpdateCategory
+// enforce.
 func seedGuidedCategories(budgetID uuid.UUID, mode string, monthlyIncome float64, now time.Time) error {
 	categories := getCategoriesForMode(mode)
 	if len(categories) == 0 {
 		return nil
 	}
 
-	tx, err := database.DB.Pool.Begin(context.Background())
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	// PERF: build the full column arrays in memory, then fire a single
+	// INSERT ... SELECT FROM UNNEST(...) statement. Previously we opened a
+	// transaction and issued one INSERT per template row (5-10 round-trips
+	// per budget create); now it's a single query — no transaction needed
+	// because we insert all rows atomically in one statement.
+	ids := make([]uuid.UUID, len(categories))
+	names := make([]string, len(categories))
+	values := make([]float64, len(categories))
+	icons := make([]string, len(categories))
+	sortOrders := make([]int32, len(categories))
 
-	for _, gc := range categories {
-		catValue := math.Round(gc.Percent / 100 * monthlyIncome)
-		if _, err := tx.Exec(context.Background(),
-			`INSERT INTO budget_categories (id, budget_id, name, allocation_value, icon, sort_order, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			uuid.New(), budgetID, gc.Name, catValue, gc.Icon, gc.SortOrder, now); err != nil {
-			return err
+	var allocated float64
+	lastIdx := len(categories) - 1
+	for i, gc := range categories {
+		var catValue float64
+		if i == lastIdx {
+			// Last entry consumes whatever is left of the income so the sum
+			// lands exactly at monthlyIncome (and never above). Guard against
+			// FP drift pushing it very slightly negative.
+			catValue = math.Round((monthlyIncome-allocated)*100) / 100
+			if catValue < 0 {
+				catValue = 0
+			}
+		} else {
+			// Floor to 2 decimals so the running total never drifts above
+			// the pro-rata share.
+			catValue = math.Floor(gc.Percent/100*monthlyIncome*100) / 100
 		}
+		allocated += catValue
+
+		ids[i] = uuid.New()
+		names[i] = gc.Name
+		values[i] = catValue
+		icons[i] = gc.Icon
+		sortOrders[i] = int32(gc.SortOrder)
 	}
 
-	return tx.Commit(context.Background())
+	_, err := database.DB.Pool.Exec(context.Background(), `
+		INSERT INTO budget_categories
+			(id, budget_id, name, allocation_value, icon, sort_order, created_at)
+		SELECT id, $2, name, allocation_value, icon, sort_order, $7
+		FROM UNNEST($1::uuid[], $3::text[], $4::numeric[], $5::text[], $6::int[])
+		AS t(id, name, allocation_value, icon, sort_order)
+	`, ids, budgetID, names, values, icons, sortOrders, now)
+	return err
 }
 
 // GetBudget returns a single budget by ID (owner or collaborator).
@@ -350,26 +381,35 @@ func GetBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	if err := verifyBudgetAccess(budgetID, userID); err != nil {
-		return errNotFound(c, "budget not found")
-	}
-
-	query := database.NewFilter().
-		Select("*").
-		Eq("id", budgetID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budgets", query)
-	if err != nil || statusCode != http.StatusOK {
+	// PERF: fused access-check + fetch. Previously this ran verifyBudgetAccess
+	// (1 query) followed by DB.Get (another query + JSON agg round-trip). Now
+	// one SELECT gates on owner OR collaborator via EXISTS and returns only
+	// the columns the response serializes — no more SELECT *. If the row is
+	// missing, pgx.ErrNoRows maps to 404.
+	var b models.Budget
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	err := database.DB.Pool.QueryRow(c.Context(), `
+		SELECT id, user_id, name, icon, monthly_income::float8, currency,
+		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+		FROM budgets
+		WHERE id = $1
+		  AND (user_id = $2
+		       OR EXISTS (SELECT 1 FROM budget_collaborators
+		                  WHERE budget_id = $1 AND user_id = $2))
+	`, budgetID, userID).Scan(
+		&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome, &b.Currency,
+		&b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+		&b.CreatedAt, &b.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "budget not found")
+		}
 		return errInternal(c, "failed to fetch budget")
 	}
 
-	var budgets []models.Budget
-	if err := json.Unmarshal(body, &budgets); err != nil || len(budgets) == 0 {
-		return errNotFound(c, "budget not found")
-	}
-
-	return c.JSON(budgets[0])
+	return c.JSON(b)
 }
 
 // UpdateBudget updates an existing budget. Only the owner can update.
@@ -434,34 +474,48 @@ func UpdateBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "billing_cutoff_day must be between 1 and 31")
 	}
 
-	// Fetch existing budget to verify ownership.
-	getQuery := database.NewFilter().
-		Select("*").
-		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
+	// PERF: persist inside a transaction that locks the budget row. The
+	// initial non-transactional "fetch-to-verify" SELECT has been removed —
+	// the FOR UPDATE below both verifies ownership and gives us the current
+	// row values, saving one round-trip on every PUT. The lock remains
+	// necessary when the caller is lowering monthly_income: without it a
+	// concurrent CreateCategory / UpdateCategory (which locks `budgets FOR
+	// UPDATE` before checking the allocation ceiling) could slip between our
+	// SUM check and our UPDATE, leaving total_allocation > new monthly_income.
+	tx, err := database.DB.Pool.Begin(c.Context())
+	if err != nil {
+		return errInternal(c, "failed to start transaction")
+	}
+	defer tx.Rollback(c.Context()) //nolint:errcheck
 
-	body, statusCode, err := database.DB.Get("budgets", getQuery)
-	if err != nil || statusCode != http.StatusOK {
+	var b models.Budget
+	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+	// without ::float8 cast.
+	if err := tx.QueryRow(c.Context(),
+		`SELECT id, user_id, name, icon, monthly_income::float8, currency,
+		        billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+		   FROM budgets
+		  WHERE id = $1 AND user_id = $2
+		  FOR UPDATE`,
+		budgetID, userID).Scan(
+		&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome, &b.Currency,
+		&b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+		&b.CreatedAt, &b.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "budget not found")
+		}
 		return errInternal(c, "failed to fetch budget")
 	}
 
-	var budgets []models.Budget
-	if err := json.Unmarshal(body, &budgets); err != nil || len(budgets) == 0 {
-		return errNotFound(c, "budget not found")
-	}
-
-	b := budgets[0]
-
-	// If the caller is lowering monthly_income, make sure the new value still
-	// covers the sum of existing category allocations. Without this check a
-	// user could drop income below their allocated amounts, leaving the budget
-	// in an inconsistent state that the category create/update guards would
-	// otherwise prevent.
 	if req.MonthlyIncome != nil && *req.MonthlyIncome < b.MonthlyIncome {
+		// Already hold the row lock from SELECT FOR UPDATE above; only need
+		// to check the total allocation against the proposed new income.
 		var totalAlloc float64
-		if err := database.DB.Pool.QueryRow(c.Context(),
-			`SELECT COALESCE(SUM(allocation_value), 0) FROM budget_categories WHERE budget_id = $1`,
+		// FIX: SUM(allocation_value) is NUMERIC — pgx binary format can't scan NUMERIC→float64
+		// without ::float8 cast.
+		if err := tx.QueryRow(c.Context(),
+			`SELECT COALESCE(SUM(allocation_value), 0)::float8 FROM budget_categories WHERE budget_id = $1`,
 			budgetID).Scan(&totalAlloc); err != nil {
 			return errInternal(c, "failed to verify existing allocations")
 		}
@@ -494,30 +548,23 @@ func UpdateBudget(c *fiber.Ctx) error {
 	}
 	b.UpdatedAt = time.Now().UTC()
 
-	updatePayload := map[string]interface{}{
-		"name":                  b.Name,
-		"icon":                  b.Icon,
-		"monthly_income":        b.MonthlyIncome,
-		"currency":              b.Currency,
-		"billing_period_months": b.BillingPeriodMonths,
-		"billing_cutoff_day":    b.BillingCutoffDay,
-		"mode":                  b.Mode,
-		"updated_at":            b.UpdatedAt.Format(time.RFC3339Nano),
-	}
-	updateBytes, err := marshalJSON(updatePayload)
-	if err != nil {
-		return errInternal(c, "failed to serialize request")
-	}
-
-	patchQuery := database.NewFilter().
-		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	_, statusCode, err = database.DB.Patch("budgets", patchQuery, updateBytes)
-	if err != nil || statusCode != http.StatusOK {
+	if _, err := tx.Exec(c.Context(),
+		`UPDATE budgets
+		 SET name = $1, icon = $2, monthly_income = $3, currency = $4,
+		     billing_period_months = $5, billing_cutoff_day = $6, mode = $7, updated_at = $8
+		 WHERE id = $9 AND user_id = $10`,
+		b.Name, b.Icon, b.MonthlyIncome, b.Currency, b.BillingPeriodMonths,
+		b.BillingCutoffDay, b.Mode, b.UpdatedAt, budgetID, userID); err != nil {
 		return errInternal(c, "failed to update budget")
 	}
+
+	if err := tx.Commit(c.Context()); err != nil {
+		return errInternal(c, "failed to commit budget update")
+	}
+
+	// PERF: drop cached summary so the next GET reflects the new income /
+	// metadata immediately.
+	invalidateBudget(budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeBudgetUpdated, b)
 
@@ -538,48 +585,38 @@ func DeleteBudget(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid budget ID")
 	}
 
-	// Verify ownership.
-	getQuery := database.NewFilter().
-		Select("id").
-		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
-
-	body, statusCode, err := database.DB.Get("budgets", getQuery)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to verify budget ownership")
-	}
-
-	var found []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
-		return errNotFound(c, "budget not found")
-	}
-
 	bid := budgetID.String()
+	reqCtx := c.Context()
 
-	// Delete budget in a transaction — CASCADE handles expenses, categories,
-	// collaborators, and invites.
-	tx, err := database.DB.Pool.Begin(context.Background())
+	// PERF: delete budget in a transaction — CASCADE handles expenses,
+	// categories, collaborators, and invites. The DELETE...RETURNING against
+	// (id,user_id) replaces the previous "SELECT id to verify + DELETE"
+	// pair: one round-trip now both verifies ownership and performs the
+	// deletion. Missing row -> pgx.ErrNoRows -> 404.
+	tx, err := database.DB.Pool.Begin(reqCtx)
 	if err != nil {
 		return errInternal(c, "failed to start transaction")
 	}
-	defer tx.Rollback(context.Background()) //nolint:errcheck
+	defer tx.Rollback(reqCtx) //nolint:errcheck
 
-	if _, err := tx.Exec(context.Background(),
-		`DELETE FROM budgets WHERE id = $1 AND user_id = $2`, budgetID, userID); err != nil {
+	var deletedID uuid.UUID
+	if err := tx.QueryRow(reqCtx,
+		`DELETE FROM budgets WHERE id = $1 AND user_id = $2 RETURNING id`,
+		budgetID, userID).Scan(&deletedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound(c, "budget not found")
+		}
 		return errInternal(c, "failed to delete budget")
 	}
 
 	// Also clean up budget_links where this user created them (created_by FK has no CASCADE).
-	if _, err := tx.Exec(context.Background(),
+	if _, err := tx.Exec(reqCtx,
 		`DELETE FROM budget_links WHERE created_by = $1 AND (source_budget_id = $2 OR target_budget_id = $2)`,
 		userID, budgetID); err != nil {
 		return errInternal(c, "failed to clean up budget links")
 	}
 
-	if err := tx.Commit(context.Background()); err != nil {
+	if err := tx.Commit(reqCtx); err != nil {
 		return errInternal(c, "failed to commit deletion")
 	}
 
@@ -587,6 +624,7 @@ func DeleteBudget(c *fiber.Ctx) error {
 	// (it could be the source of some links) and for any budget that we
 	// couldn't identify without another query.
 	invalidateLinkTargetsCacheAll()
+	invalidateBudget(budgetID)
 
 	broadcast(bid, ws.MessageTypeBudgetDeleted, map[string]string{"id": bid})
 

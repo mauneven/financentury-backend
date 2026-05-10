@@ -1,18 +1,18 @@
 package middleware
 
 import (
-	"crypto/rsa"
 	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"encoding/json"
 )
 
 // ==================== JWTSecret ====================
@@ -118,6 +118,7 @@ func TestProtected_RejectsTokenWithWrongSigningMethod_RSA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("RSA-signed token should be rejected, got status %d", resp.StatusCode)
 	}
@@ -187,6 +188,7 @@ func TestProtected_RejectsTokenWithFutureNBF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("token with future nbf should be rejected, got status %d", resp.StatusCode)
 	}
@@ -221,6 +223,7 @@ func TestProtected_RejectsTokenWithoutUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	// Empty UserID will fail uuid.Parse => 401
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("token without user_id should be rejected, got status %d", resp.StatusCode)

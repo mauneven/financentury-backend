@@ -3,13 +3,13 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
@@ -36,21 +36,21 @@ const (
 
 // validBudgetModes lists the accepted budget mode strings.
 var validBudgetModes = map[string]bool{
-	"manual":     true,
-	"balanced":   true,
-	"debt-free":  true,
+	"manual":      true,
+	"balanced":    true,
+	"debt-free":   true,
 	"debt-payoff": true,
-	"travel":     true,
-	"event":      true,
+	"travel":      true,
+	"event":       true,
 }
 
 // guidedModes lists modes that should seed template categories on creation.
 var guidedModes = map[string]bool{
-	"balanced":   true,
-	"debt-free":  true,
+	"balanced":    true,
+	"debt-free":   true,
 	"debt-payoff": true,
-	"travel":     true,
-	"event":      true,
+	"travel":      true,
+	"event":       true,
 }
 
 // validBillingPeriodMonths lists the accepted billing period values.
@@ -163,36 +163,58 @@ func broadcast(budgetID string, msgType string, data interface{}) {
 }
 
 // broadcastToLinkedTargets fans out a WS notification to all budgets that
-// have links from the given source budget. Best-effort: failures are logged.
+// have links from the given source budget. Best-effort: failures are swallowed.
 func broadcastToLinkedTargets(sourceBudgetID uuid.UUID, msgType string, data interface{}) {
-	targetIDs, err := fetchTargetBudgetIDs(sourceBudgetID)
+	targetIDs, err := fetchTargetBudgetIDs(context.Background(), sourceBudgetID)
 	if err != nil || len(targetIDs) == 0 {
 		return
 	}
 	for _, tid := range targetIDs {
-		broadcast(tid, msgType, data)
+		broadcast(tid.String(), msgType, data)
 	}
 }
 
 // --- DB Access Helpers ---
+//
+// PERF: These helpers each issue one EXISTS round-trip. They're cheap
+// (indexed equality probes) but not free — each one is a separate network
+// hop to Postgres. When a handler does verifyX followed by a data query,
+// it's almost always better to inline the ownership/access predicate
+// directly into the data query's WHERE clause and check RowsAffected() /
+// pgx.ErrNoRows instead. Callers that already do the combined pattern
+// (RemoveCollaborator uses DELETE ... RETURNING, UpdateProfile uses
+// UPDATE ... RETURNING, summary uses JOIN) are optimal.
+//
+// The standalone helpers remain for callers that genuinely need a
+// pre-check before performing non-DB work (e.g. CreateInvite needs to
+// verify ownership before generating a token and writing to the invites
+// table; there's no single query that covers both).
 
 // verifyBudgetOwnership checks that the authenticated user owns the budget
 // by querying the budgets table. Returns a non-nil error if the
 // user is not the owner.
+//
+// PERF: Rewritten from a Filter/GetCtx (JSON-aggregated wrapper) into a
+// direct EXISTS probe via pgx. Same number of round-trips (1), but skips
+// the json_agg(to_json(...)) wrapper and the Go-side JSON decode on the
+// hot-path helper used by nearly every mutation handler.
 func verifyBudgetOwnership(budgetID, userID uuid.UUID) error {
-	query := database.NewFilter().
-		Select("id").
-		Eq("id", budgetID.String()).
-		Eq("user_id", userID.String()).
-		Build()
+	return verifyBudgetOwnershipCtx(context.Background(), budgetID, userID)
+}
 
-	body, statusCode, err := database.DB.Get("budgets", query)
-	if err != nil || statusCode != http.StatusOK {
-		return fiber.ErrNotFound
-	}
-
-	var found []struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(body, &found); err != nil || len(found) == 0 {
+// verifyBudgetOwnershipCtx is the context-aware variant of
+// verifyBudgetOwnership so that a cancelled HTTP request propagates to the
+// database query.
+//
+// PERF: Prefer inlining `AND user_id = $userID` into the caller's data
+// query when the caller immediately follows this check with another query.
+// One round-trip vs two.
+func verifyBudgetOwnershipCtx(ctx context.Context, budgetID, userID uuid.UUID) error {
+	var exists bool
+	err := database.DB.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM budgets WHERE id = $1 AND user_id = $2)`,
+		budgetID, userID).Scan(&exists)
+	if err != nil || !exists {
 		return fiber.ErrNotFound
 	}
 	return nil
@@ -207,6 +229,11 @@ func verifyBudgetAccess(budgetID, userID uuid.UUID) error {
 
 // verifyBudgetAccessCtx is the context-aware variant of verifyBudgetAccess so
 // that a cancelled HTTP request propagates to the database query.
+//
+// PERF: The single EXISTS-with-UNION is already the cheapest possible
+// ownership-or-collaborator probe. Still one round-trip though — inline
+// into the data query when possible. The summary handlers do this via an
+// explicit JOIN across budgets/budget_collaborators in one SELECT.
 func verifyBudgetAccessCtx(ctx context.Context, budgetID, userID uuid.UUID) error {
 	var exists bool
 	err := database.DB.Pool.QueryRow(ctx,
@@ -222,51 +249,16 @@ func verifyBudgetAccessCtx(ctx context.Context, budgetID, userID uuid.UUID) erro
 	return nil
 }
 
-// verifyCategoryBelongsToBudget verifies that a category (by its ID) belongs
-// to the given budget. Categories are flat (no sections), so this is a single
-// existence check against budget_categories.
-func verifyCategoryBelongsToBudget(categoryID, budgetID uuid.UUID) error {
-	var exists bool
-	err := database.DB.Pool.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM budget_categories WHERE id = $1 AND budget_id = $2)`,
-		categoryID, budgetID).Scan(&exists)
-	if err != nil || !exists {
-		return fiber.ErrNotFound
-	}
-	return nil
-}
-
 // marshalJSON marshals v to JSON bytes, returning an error response on failure.
 func marshalJSON(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// --- Nullable deref helpers (used when scanning LEFT JOIN rows) ---
+// --- Nullable deref helper (used when scanning LEFT JOIN rows) ---
 
 func derefString(p *string) string {
 	if p == nil {
 		return ""
-	}
-	return *p
-}
-
-func derefFloat(p *float64) float64 {
-	if p == nil {
-		return 0
-	}
-	return *p
-}
-
-func derefInt(p *int) int {
-	if p == nil {
-		return 0
-	}
-	return *p
-}
-
-func derefTime(p *time.Time) time.Time {
-	if p == nil {
-		return time.Time{}
 	}
 	return *p
 }
