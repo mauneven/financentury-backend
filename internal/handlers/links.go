@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
@@ -347,6 +349,12 @@ func DeleteLink(c *fiber.Ctx) error {
 // GetLinkableBudgets returns budgets the user has access to (excluding the
 // current one) that share the same currency, together with their flat
 // category lists.
+//
+// PERF: Redis cache-aside (budgets:linkable:<userid>:<budgetid>, 60s TTL).
+// The "linkable" view is opened from the link-creation modal — usually
+// once per session per budget — but can fire repeatedly from autosuggest
+// flows. Cache + targeted invalidation on budget / collaborator mutations
+// keeps the result under one DB read regardless of UI fan-out.
 func GetLinkableBudgets(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -362,89 +370,99 @@ func GetLinkableBudgets(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 	defer cancel()
-
-	// PERF: fetch linkable budgets in a single round-trip by inlining the
-	// source budget's currency as a scalar subquery. Previously we ran two
-	// queries (SELECT currency, then SELECT matching budgets); now it's one.
-	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
-	// without ::float8 cast.
-	rows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, user_id, name, icon, monthly_income::float8, currency,
-		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
-		FROM budgets
-		WHERE currency = (SELECT currency FROM budgets WHERE id = $1)
-		  AND id != $1
-		  AND (user_id = $2 OR id IN (
-		    SELECT budget_id FROM budget_collaborators WHERE user_id = $2
-		  ))
-		ORDER BY name
-	`, budgetID, userID)
-	if err != nil {
-		return errInternal(c, "failed to fetch linkable budgets")
-	}
-	defer rows.Close()
 
 	type linkableBudget struct {
 		models.Budget
 		Categories []models.Category `json:"categories"`
 	}
 
-	// Pre-allocated as a zero-length slice so an empty result marshals as
-	// `[]` (not `null`) without needing a special-case early return.
-	budgets := make([]linkableBudget, 0)
-	budgetIDs := make([]uuid.UUID, 0)
-
-	for rows.Next() {
-		var b models.Budget
-		if err := rows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
-			&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
-			&b.CreatedAt, &b.UpdatedAt); err != nil {
-			continue
+	loader := func(ctx context.Context) ([]byte, error) {
+		// PERF: fetch linkable budgets in a single round-trip by inlining the
+		// source budget's currency as a scalar subquery. Previously we ran two
+		// queries (SELECT currency, then SELECT matching budgets); now it's one.
+		// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+		// without ::float8 cast.
+		rows, queryErr := database.DB.Pool.Query(ctx, `
+			SELECT id, user_id, name, icon, monthly_income::float8, currency,
+			       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+			FROM budgets
+			WHERE currency = (SELECT currency FROM budgets WHERE id = $1)
+			  AND id != $1
+			  AND (user_id = $2 OR id IN (
+			    SELECT budget_id FROM budget_collaborators WHERE user_id = $2
+			  ))
+			ORDER BY name
+		`, budgetID, userID)
+		if queryErr != nil {
+			return nil, queryErr
 		}
-		budgets = append(budgets, linkableBudget{Budget: b, Categories: make([]models.Category, 0)})
-		budgetIDs = append(budgetIDs, b.ID)
+		defer rows.Close()
+
+		// Pre-allocated as a zero-length slice so an empty result marshals as
+		// `[]` (not `null`) without needing a special-case early return.
+		budgets := make([]linkableBudget, 0)
+		budgetIDs := make([]uuid.UUID, 0)
+
+		for rows.Next() {
+			var b models.Budget
+			if scanErr := rows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
+				&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+				&b.CreatedAt, &b.UpdatedAt); scanErr != nil {
+				continue
+			}
+			budgets = append(budgets, linkableBudget{Budget: b, Categories: make([]models.Category, 0)})
+			budgetIDs = append(budgetIDs, b.ID)
+		}
+
+		if len(budgets) == 0 {
+			return json.Marshal(budgets)
+		}
+
+		// Build budget index map.
+		budgetIdx := make(map[uuid.UUID]int, len(budgets))
+		for i, b := range budgets {
+			budgetIdx[b.ID] = i
+		}
+
+		// Fetch categories for all budgets in one batched query.
+		// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
+		// without ::float8 cast.
+		catRows, catErr := database.DB.Pool.Query(ctx, `
+			SELECT id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
+			FROM budget_categories
+			WHERE budget_id = ANY($1)
+			ORDER BY sort_order, created_at
+		`, budgetIDs)
+		if catErr != nil {
+			return nil, catErr
+		}
+		defer catRows.Close()
+
+		for catRows.Next() {
+			var cat models.Category
+			if scanErr := catRows.Scan(&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue,
+				&cat.Icon, &cat.SortOrder, &cat.CreatedAt); scanErr != nil {
+				continue
+			}
+			idx, ok := budgetIdx[cat.BudgetID]
+			if !ok {
+				continue
+			}
+			budgets[idx].Categories = append(budgets[idx].Categories, cat)
+		}
+
+		return json.Marshal(budgets)
 	}
 
-	if len(budgets) == 0 {
-		return c.JSON(budgets)
-	}
-
-	// Build budget index map.
-	budgetIdx := make(map[uuid.UUID]int, len(budgets))
-	for i, b := range budgets {
-		budgetIdx[b.ID] = i
-	}
-
-	// Fetch categories for all budgets in one batched query.
-	// FIX: allocation_value is NUMERIC — pgx binary format can't scan NUMERIC→float64
-	// without ::float8 cast.
-	catRows, err := database.DB.Pool.Query(ctx, `
-		SELECT id, budget_id, name, allocation_value::float8, icon, sort_order, created_at
-		FROM budget_categories
-		WHERE budget_id = ANY($1)
-		ORDER BY sort_order, created_at
-	`, budgetIDs)
+	payload, err := rediscache.CacheAside(ctx,
+		linkableBudgetsCacheKey(userID, budgetID), linkableBudgetsCacheTTL, loader)
 	if err != nil {
-		return errInternal(c, "failed to fetch categories")
+		return errInternal(c, "failed to fetch linkable budgets")
 	}
-	defer catRows.Close()
-
-	for catRows.Next() {
-		var cat models.Category
-		if err := catRows.Scan(&cat.ID, &cat.BudgetID, &cat.Name, &cat.AllocationValue,
-			&cat.Icon, &cat.SortOrder, &cat.CreatedAt); err != nil {
-			continue
-		}
-		idx, ok := budgetIdx[cat.BudgetID]
-		if !ok {
-			continue
-		}
-		budgets[idx].Categories = append(budgets[idx].Categories, cat)
-	}
-
-	return c.JSON(budgets)
+	c.Set("Content-Type", "application/json")
+	return c.Send(payload)
 }
 
 // fetchTargetBudgetIDs returns all target budget IDs that have links from the

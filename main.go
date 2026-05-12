@@ -1,14 +1,11 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	_ "time/tzdata" // Embed IANA timezone database so time.LoadLocation works in minimal containers
 
@@ -19,10 +16,12 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/requestid"
 	"github.com/joho/godotenv"
 
+	"github.com/the-financial-workspace/backend/internal/captcha"
 	"github.com/the-financial-workspace/backend/internal/config"
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/handlers"
 	"github.com/the-financial-workspace/backend/internal/middleware"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 	"github.com/the-financial-workspace/backend/internal/routes"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
@@ -73,6 +72,11 @@ func run() error {
 	database.Init(cfg.DatabaseURL)
 	defer database.Close()
 	log.Println("initialized database connection pool")
+
+	// PERF: optional Redis cache-aside layer for read-mostly endpoints.
+	// REDIS_URL empty / unreachable -> no-op cache. Never required for correctness.
+	rediscache.SetDefault(rediscache.New(cfg.RedisURL))
+	defer rediscache.CloseDefault()
 
 	// Start background expense pruner (runs hourly).
 	handlers.StartExpensePruner()
@@ -127,34 +131,52 @@ func run() error {
 		TimeFormat: "2006-01-02 15:04:05",
 	}))
 	app.Use(recover.New())
-	// PERF: LevelBestSpeed. Our JSON payloads (summary / trends / list
-	// endpoints) repeat identifiers and enum strings heavily, so even the
-	// cheapest gzip level still hits a 4-6x ratio. LevelBestCompression
-	// adds measurable CPU and latency with negligible ratio improvement;
-	// LevelBestSpeed pairs better with the ETag / Cache-Control path added
-	// below (304s and cache hits skip compression entirely).
+	// PERF: Fiber's compress middleware delegates to fasthttp's
+	// CompressHandlerBrotliLevel, which negotiates Accept-Encoding in this
+	// preference order: br > gzip > deflate > zstd > identity. Modern
+	// clients (Chromium >= 50, Firefox >= 44, Safari >= 14, every current
+	// curl) advertise `br` and pick up brotli automatically; older clients
+	// fall back to gzip; ancient clients land on identity. Brotli typically
+	// gives ~15-25% better ratio than gzip on JSON, so the bandwidth bill
+	// drops without any client-side change.
+	//
+	// LevelBestSpeed maps to CompressBrotliBestSpeed for brotli AND
+	// CompressBestSpeed for gzip/deflate. Our JSON payloads repeat
+	// identifiers / enum strings heavily, so even the cheapest level still
+	// hits a 4-6x ratio for gzip and a slightly better one for brotli.
+	// LevelBestCompression adds CPU and latency with negligible ratio
+	// improvement; LevelBestSpeed pairs better with the ETag / 304 path
+	// (those skip compression entirely).
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))
 	app.Use(middleware.CORS(cfg.CORSOrigin))
 
+	// SECURITY: tighter body limits on the auth surface. The global
+	// BodyLimit (4 MB) is sized for migration payloads; auth requests
+	// only ever carry a Google ID token + small profile patch, so we cap
+	// at 64 KB to shrink the DoS / abuse surface. We enforce this with a
+	// pre-handler middleware mounted only on /api/auth/* — Fiber's
+	// global BodyLimit can't be tightened per-route otherwise.
+	app.Use("/api/auth", maxBodySize(64*1024))
+
 	// PERF: Cache-Control + ETag middleware.
 	//
 	// Runs after the handler has produced a JSON body. For GET requests on
-	// endpoints that are safe to soft-cache (auth/me, summary, trends,
-	// etc.) we:
-	//   - attach `Cache-Control: private, max-age=10, stale-while-revalidate=30`
-	//     so clients can skip us for 10s and asynchronously refresh for
-	//     another 30s without a blocking hit.
-	//   - compute a weak SHA-256 ETag over the response body. If the
+	// soft-cacheable endpoints (auth/me, summary, trends, etc.) we:
+	//   - attach a per-endpoint Cache-Control directive with stale-while-
+	//     revalidate + stale-if-error so clients keep working through
+	//     transient backend hiccups without blocking on us.
+	//   - compute a weak xxhash64 ETag over the response body. If the
 	//     incoming request carries `If-None-Match: <etag>`, we return 304
 	//     with an empty body — saving the full response size over the
 	//     wire.
 	//
 	// The middleware is intentionally conservative: only GETs with 2xx
 	// status and a JSON body are considered. Mutations always bypass
-	// (responses may differ per-request via generated IDs).
-	app.Use(cacheControlAndETag())
+	// (responses may differ per-request via generated IDs). The directive
+	// table lives in internal/middleware/cache.go.
+	app.Use(middleware.CacheControlAndETag())
 
 	// Security headers.
 	app.Use(func(c *fiber.Ctx) error {
@@ -163,6 +185,12 @@ func run() error {
 		c.Set("X-XSS-Protection", "0") // Disabled in favor of CSP; legacy header can cause issues.
 		c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		c.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// SECURITY: HSTS pins clients to HTTPS for 2 years, applies to
+		// every subdomain, and opts in to the Chromium / Firefox preload
+		// list. Set unconditionally so reverse proxies / Render / Fly /
+		// Railway don't have to remember to add it. The header is a
+		// no-op when served over plain HTTP locally.
+		c.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
 		// CSP allows self + Google OAuth + inline styles (needed by chart libraries).
 		c.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss: https://accounts.google.com https://oauth2.googleapis.com; font-src 'self'")
 		return c.Next()
@@ -176,8 +204,40 @@ func run() error {
 		})
 	})
 
+	// SECURITY: bot protection. Each platform's verifier is a no-op when
+	// its secret is missing — dev/staging without secrets stays
+	// functional. We log a warning per disabled platform so prod
+	// operators notice.
+	turnstileV := captcha.NewTurnstile(cfg.TurnstileSecret)
+	if reason := captcha.Reason(turnstileV); reason != "" {
+		log.Printf("[captcha] WARNING: %s", reason)
+	}
+	appleV := captcha.NewAppleAppAttest(
+		cfg.AppleAppAttestTeamID,
+		cfg.AppleAppAttestBundleID,
+		handlers.AttestKeyStore{},
+		handlers.AttestChallengeStore{},
+	)
+	if reason := captcha.Reason(appleV); reason != "" {
+		log.Printf("[captcha] WARNING: %s", reason)
+	}
+	playV := captcha.NewGooglePlayIntegrity(
+		cfg.GooglePlayIntegrityPackageName,
+		cfg.GooglePlayIntegrityDecryptionKey,
+		cfg.GooglePlayIntegrityVerificationKey,
+		handlers.AttestChallengeStore{},
+	)
+	if reason := captcha.Reason(playV); reason != "" {
+		log.Printf("[captcha] WARNING: %s", reason)
+	}
+	captchaV := captcha.NewMulti(captcha.MultiConfig{
+		Web:     turnstileV,
+		IOS:     appleV,
+		Android: playV,
+	})
+
 	// Setup routes (including WebSocket).
-	routes.Setup(app)
+	routes.SetupWith(app, routes.SetupConfig{Captcha: captchaV})
 
 	// Graceful shutdown.
 	quit := make(chan os.Signal, 1)
@@ -200,106 +260,31 @@ func run() error {
 	return nil
 }
 
-// cacheablePathPrefixes lists the GET-endpoint prefixes we want to mark as
-// soft-cacheable. Keep the list tight: anything whose response depends on
-// non-idempotent state (e.g. WS broadcast fan-out, user-presence counters)
-// must NOT be added here, or clients may serve stale data that the user
-// perceives as a bug.
+// maxBodySize returns a middleware that enforces a per-request body size
+// cap, independent of the Fiber app-level BodyLimit. We need this to apply
+// stricter limits on /api/auth/* (a 64 KB Google ID token + profile patch
+// will never come close) than on /api/migrate (which carries the user's
+// entire export and uses the global 4 MB limit).
 //
-// PERF: The dashboard paths below typically re-fetch on every tab switch.
-// A 10-second max-age turns those rapid-fire GETs into client-side hits,
-// removing them from Supabase's query meter entirely.
-var cacheablePathPrefixes = []string{
-	"/api/auth/me",
-	"/api/budgets", // covers list, :id, summary, trends, resume, categories, expenses, links, etc.
-}
-
-// isCacheablePath reports whether the request path should receive the
-// Cache-Control + ETag treatment. It excludes the known-mutation-heavy
-// subpaths of /api/budgets (invites, collaborators) so we don't serve stale
-// access control data.
-func isCacheablePath(path string) bool {
-	for _, p := range cacheablePathPrefixes {
-		if strings.HasPrefix(path, p) {
-			// Subpaths that should always hit the DB fresh.
-			if strings.Contains(path, "/invites") || strings.Contains(path, "/collaborators") {
-				return false
-			}
-			return true
-		}
-	}
-	return false
-}
-
-// cacheControlAndETag returns a Fiber middleware that:
-//   - sets `Cache-Control: private, max-age=10, stale-while-revalidate=30`
-//     on GET responses for cacheable paths.
-//   - computes an ETag over the response body and short-circuits with 304
-//     when If-None-Match matches.
-//
-// PERF: The 304 path is the big egress win. A fresh dashboard response is
-// typically 30-200 KB after gzip; reducing it to a 0-byte 304 when nothing
-// has changed takes that to near-zero.
-func cacheControlAndETag() fiber.Handler {
+// We trust Content-Length when present and fall back to inspecting the
+// post-read body for chunked transfers — the latter still rejects oversized
+// uploads but only after the bytes have been received, which is acceptable
+// for non-streaming API requests.
+func maxBodySize(limit int) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if c.Method() != fiber.MethodGet {
-			return c.Next()
+		if cl := c.Request().Header.ContentLength(); cl > limit {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error": "request body too large",
+			})
 		}
-		if !isCacheablePath(c.Path()) {
-			return c.Next()
+		// Defense in depth: chunked transfers (no Content-Length) reach
+		// here with the full body already read by fasthttp. Reject if it
+		// blew past the cap.
+		if len(c.Body()) > limit {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+				"error": "request body too large",
+			})
 		}
-
-		// Let the downstream handler run and fill in the body.
-		if err := c.Next(); err != nil {
-			return err
-		}
-
-		status := c.Response().StatusCode()
-		if status < 200 || status >= 300 {
-			return nil
-		}
-
-		body := c.Response().Body()
-		if len(body) == 0 {
-			return nil
-		}
-
-		// PERF: cap ETag computation at 256KB. These endpoints return small
-		// JSON (summary, trends, resume, category/expense lists), so the
-		// guard is a defense-in-depth fence: if a future change accidentally
-		// streams a very large payload through this path we avoid blocking
-		// the event loop on a SHA-256 over megabytes.
-		const maxETagBody = 256 * 1024
-		if len(body) > maxETagBody {
-			return nil
-		}
-
-		// SECURITY: `private` keeps user-scoped payloads out of shared caches
-		// (CDN / reverse proxy). `Vary: Authorization` prevents a shared
-		// cache from serving user A's response to user B when both requests
-		// differ only by token. Accept-Encoding ensures the ETag (computed
-		// over the uncompressed body, before the compress middleware
-		// unwinds) stays consistent with the encoding the client receives.
-		c.Set("Cache-Control", "private, max-age=10, stale-while-revalidate=30")
-		c.Set("Vary", "Authorization, Accept-Encoding")
-
-		sum := sha256.Sum256(body)
-		etag := `W/"` + hex.EncodeToString(sum[:16]) + `"`
-		c.Set("ETag", etag)
-
-		// If-None-Match from the client may contain multiple comma-separated
-		// etags; match if any of them equals ours.
-		if inm := c.Get("If-None-Match"); inm != "" {
-			for _, candidate := range strings.Split(inm, ",") {
-				if strings.TrimSpace(candidate) == etag {
-					// 304 Not Modified — strip the body.
-					c.Status(fiber.StatusNotModified)
-					c.Response().ResetBody()
-					c.Response().Header.Del("Content-Length")
-					return nil
-				}
-			}
-		}
-		return nil
+		return c.Next()
 	}
 }

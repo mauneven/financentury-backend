@@ -354,7 +354,11 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	// WAS: verifyBudgetAccessCtx (1) + fetchBudgetCtx (1) = 2 queries.
 	// NOW: single SQL returns the budget row iff the user is owner or
 	// collaborator. No row = no access.
-	budget, err := loadBudgetWithAccess(reqCtx, budgetID, userID)
+	//
+	// PERF: singleflight — when a WS broadcast invalidates the budget cache
+	// and 50 connected tabs all refetch within the same window, this collapses
+	// the burst into ONE DB call.
+	budget, err := loadBudgetWithAccessSF(reqCtx, budgetID, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errNotFound(c, "budget not found")
@@ -369,37 +373,28 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	}
 
 	// --- Query 2: categories ------------------------------------------
-	// WAS: `SELECT *` via the generic REST filter. NOW: explicit column
-	// enumeration — one less column (no hidden *-expanded fields) keeps
-	// the response bytes under control and gives the query planner the
-	// exact set it needs.
-	categories, err := loadBudgetCategories(reqCtx, budgetID)
+	// PERF: singleflight + shared key (no userID) — the category list is
+	// view-agnostic.
+	categories, err := loadBudgetCategoriesSF(reqCtx, budgetID)
 	if err != nil {
 		log.Printf("[summary] loadBudgetCategories budget=%s: %v", budgetID, err)
 		return errInternal(c, "failed to fetch summary data")
 	}
 
 	// --- Query 3: own-expense aggregates grouped in SQL --------------
-	// WAS: every expense row (category_id, amount, created_by) streamed to
-	// Go, aggregated client-side.
-	// NOW: SUM + COUNT grouped by (category_id, created_by). For a busy
-	// budget with 500 expenses the wire payload drops from 500 rows to
-	// ~categories * users rows (often <20).
-	ownAggs, err := loadOwnExpenseAggregates(reqCtx, budgetID, periodStart, budget.BillingPeriodMonths == 0)
+	// PERF: singleflight, key=budget+periodStart+oneTime. Same period
+	// start across all viewers means one query absorbs the whole fan-in.
+	ownAggs, err := loadOwnExpenseAggregatesSF(reqCtx, budgetID, periodStart, budget.BillingPeriodMonths == 0)
 	if err != nil {
 		log.Printf("[summary] loadOwnExpenseAggregates budget=%s: %v", budgetID, err)
 		return errInternal(c, "failed to fetch summary data")
 	}
 
 	// --- Query 4: ONE-shot linked aggregate --------------------------
-	// WAS: 3 + N queries (links + srcBudgets + srcCats + per-source
-	// expense fetches).
-	// NOW: single query returns (link meta, source budget, source cat,
-	// (createdBy, amount, count)) rows for every link this target budget
-	// has. Period start is computed per source budget inside the SQL so
-	// a target with links into 3-month and 1-month budgets still fires
-	// exactly one DB round-trip.
-	linkedAggs, err := loadLinkedAggregates(reqCtx, budgetID, userID, userToday)
+	// PERF: singleflight, key=target+viewer+today. The per-viewer key
+	// preserves filter_mode=mine isolation (different viewers see
+	// different rows; collapsing across viewers would leak data).
+	linkedAggs, err := loadLinkedAggregatesSF(reqCtx, budgetID, userID, userToday)
 	if err != nil {
 		log.Printf("[summary] loadLinkedAggregates budget=%s: %v", budgetID, err)
 		// Best-effort: degrade to own-budget summary rather than 500.
@@ -420,7 +415,10 @@ func GetBudgetSummary(c *fiber.Ctx) error {
 	// that case `buildUserSpending` would drop the slice anyway.
 	profileMap := map[uuid.UUID]*models.Profile{}
 	if len(agg.allUserIDs) > 1 {
-		profileMap, err = loadProfiles(reqCtx, agg.allUserIDs)
+		// PERF: singleflight — repeated identical profile-set lookups
+		// (same collaborators, same dashboard mount) collapse into one DB
+		// hit.
+		profileMap, err = loadProfilesSF(reqCtx, agg.allUserIDs)
 		if err != nil {
 			log.Printf("[summary] loadProfiles budget=%s: %v", budgetID, err)
 			profileMap = map[uuid.UUID]*models.Profile{}
@@ -965,7 +963,9 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 	}
 
 	reqCtx := c.Context()
-	budget, err := loadBudgetWithAccess(reqCtx, budgetID, userID)
+	// PERF: singleflight on the per-viewer access check so a 50-tab WS
+	// burst hits the budget+access SQL once.
+	budget, err := loadBudgetWithAccessSF(reqCtx, budgetID, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errNotFound(c, "budget not found")
@@ -974,63 +974,70 @@ func GetBudgetTrends(c *fiber.Ctx) error {
 		return errInternal(c, "failed to fetch budget")
 	}
 
-	categories, err := loadBudgetCategories(reqCtx, budgetID)
+	// PERF: singleflight — categories are view-agnostic.
+	categories, err := loadBudgetCategoriesSF(reqCtx, budgetID)
 	if err != nil {
 		return errInternal(c, "failed to fetch trends data")
 	}
 
-	// Aggregate in SQL: one row per (category_id, month_start_date). We
-	// pick `to_char(date_trunc('month', expense_date), 'YYYY-MM-DD')` to
-	// match the wire format of the original implementation (which passed
-	// raw expense_date strings). Consumers render the month label from
-	// this date, so the day component being the first-of-month is fine.
-	var rows pgx.Rows
+	// PERF: singleflight collapses the per-budget trends aggregate query
+	// (inline SQL below) so a WS-driven refresh burst from many clients
+	// only hits the DB once. The result is the bucketed map; per-category
+	// assembly afterwards is cheap and per-request.
 	useCutoff := budget.BillingPeriodMonths != 0
-	if useCutoff {
-		cutoff := expenseRetentionCutoffTime()
-		rows, err = database.DB.Pool.Query(reqCtx, `
-			SELECT category_id,
-			       to_char(date_trunc('month', expense_date), 'YYYY-MM-DD') AS month,
-			       SUM(amount)::float8 AS total
-			FROM budget_expenses
-			WHERE budget_id = $1
-			  AND expense_date >= $2
-			GROUP BY 1, 2
-			ORDER BY 1, 2
-		`, budgetID, cutoff)
-	} else {
-		rows, err = database.DB.Pool.Query(reqCtx, `
-			SELECT category_id,
-			       to_char(date_trunc('month', expense_date), 'YYYY-MM-DD') AS month,
-			       SUM(amount)::float8 AS total
-			FROM budget_expenses
-			WHERE budget_id = $1
-			GROUP BY 1, 2
-			ORDER BY 1, 2
-		`, budgetID)
-	}
-	if err != nil {
+	cmRaw, sfErr, _ := trendsSFGroup.Do(trendsAggregateKey(budgetID, useCutoff), func() (any, error) {
+		var qrows pgx.Rows
+		var qerr error
+		if useCutoff {
+			cutoff := expenseRetentionCutoffTime()
+			qrows, qerr = database.DB.Pool.Query(reqCtx, `
+				SELECT category_id,
+				       to_char(date_trunc('month', expense_date), 'YYYY-MM-DD') AS month,
+				       SUM(amount)::float8 AS total
+				FROM budget_expenses
+				WHERE budget_id = $1
+				  AND expense_date >= $2
+				GROUP BY 1, 2
+				ORDER BY 1, 2
+			`, budgetID, cutoff)
+		} else {
+			qrows, qerr = database.DB.Pool.Query(reqCtx, `
+				SELECT category_id,
+				       to_char(date_trunc('month', expense_date), 'YYYY-MM-DD') AS month,
+				       SUM(amount)::float8 AS total
+				FROM budget_expenses
+				WHERE budget_id = $1
+				GROUP BY 1, 2
+				ORDER BY 1, 2
+			`, budgetID)
+		}
+		if qerr != nil {
+			return nil, qerr
+		}
+		defer qrows.Close()
+
+		out := make(map[uuid.UUID][]models.MonthlyTrend)
+		for qrows.Next() {
+			var catID uuid.UUID
+			var month string
+			var total float64
+			if scanErr := qrows.Scan(&catID, &month, &total); scanErr != nil {
+				return nil, scanErr
+			}
+			out[catID] = append(out[catID], models.MonthlyTrend{
+				Month:      month,
+				TotalSpent: roundAmount(total),
+			})
+		}
+		if rerr := qrows.Err(); rerr != nil {
+			return nil, rerr
+		}
+		return out, nil
+	})
+	if sfErr != nil {
 		return errInternal(c, "failed to fetch trends data")
 	}
-
-	catMonths := make(map[uuid.UUID][]models.MonthlyTrend, len(categories))
-	for rows.Next() {
-		var catID uuid.UUID
-		var month string
-		var total float64
-		if err := rows.Scan(&catID, &month, &total); err != nil {
-			rows.Close()
-			return errInternal(c, "failed to parse trends row")
-		}
-		catMonths[catID] = append(catMonths[catID], models.MonthlyTrend{
-			Month:      month,
-			TotalSpent: roundAmount(total),
-		})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return errInternal(c, "failed to read trends rows")
-	}
+	catMonths := cmRaw.(map[uuid.UUID][]models.MonthlyTrend)
 
 	categoryTrends := make([]models.CategoryTrend, 0, len(categories))
 	for _, cat := range categories {
@@ -1102,7 +1109,8 @@ func GetBudgetResume(c *fiber.Ctx) error {
 		return c.Send(cached)
 	}
 
-	budget, err := loadBudgetWithAccess(reqCtx, budgetID, userID)
+	// PERF: singleflight on the per-viewer access check.
+	budget, err := loadBudgetWithAccessSF(reqCtx, budgetID, userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errNotFound(c, "budget not found")
@@ -1113,16 +1121,31 @@ func GetBudgetResume(c *fiber.Ctx) error {
 
 	// One-time budget: single period from creation to today.
 	if budget.BillingPeriodMonths == 0 {
-		var totalSpent float64
-		var expCount int
-		err := database.DB.Pool.QueryRow(reqCtx, `
-			SELECT COALESCE(SUM(amount)::float8, 0),
-			       COUNT(*)::int
-			FROM budget_expenses WHERE budget_id = $1
-		`, budgetID).Scan(&totalSpent, &expCount)
-		if err != nil {
+		// PERF: singleflight collapses the resume aggregate query so a
+		// WS burst from many tabs hits the DB once.
+		type oneTimeResult struct {
+			totalSpent float64
+			expCount   int
+		}
+		raw, sfErr, _ := resumeSFGroup.Do(resumeAggregateKey(budgetID, userToday), func() (any, error) {
+			var ts float64
+			var ec int
+			qerr := database.DB.Pool.QueryRow(reqCtx, `
+				SELECT COALESCE(SUM(amount)::float8, 0),
+				       COUNT(*)::int
+				FROM budget_expenses WHERE budget_id = $1
+			`, budgetID).Scan(&ts, &ec)
+			if qerr != nil {
+				return nil, qerr
+			}
+			return oneTimeResult{totalSpent: ts, expCount: ec}, nil
+		})
+		if sfErr != nil {
 			return errInternal(c, "failed to fetch expenses")
 		}
+		ot := raw.(oneTimeResult)
+		totalSpent := ot.totalSpent
+		expCount := ot.expCount
 
 		// Preserve original behavior: a period is returned iff there is at
 		// least one expense row (matches the old len(allExpenses) > 0 check,
@@ -1203,37 +1226,55 @@ func GetBudgetResume(c *fiber.Ctx) error {
 		ends[i] = p.end
 	}
 
-	rows, err := database.DB.Pool.Query(reqCtx, `
-		WITH ranges AS (
-		  SELECT generate_subscripts($2::date[], 1) AS idx,
-		         unnest($2::date[]) AS ps,
-		         unnest($3::date[]) AS pe
-		)
-		SELECT r.idx,
-		       COALESCE(SUM(e.amount)::float8, 0) AS spent,
-		       COUNT(e.id)::int AS cnt
-		FROM ranges r
-		LEFT JOIN budget_expenses e
-		  ON e.budget_id = $1
-		 AND e.expense_date >= r.ps
-		 AND e.expense_date < r.pe
-		GROUP BY r.idx
-		HAVING COUNT(e.id) > 0
-		ORDER BY r.idx
-	`, budgetID, starts, ends)
-	if err != nil {
+	// PERF: singleflight — collapses the per-period aggregate query so a
+	// 50-tab burst hits the DB once. Key embeds the user's "today" so day
+	// rollovers don't share buckets across timezones.
+	type periodAgg struct {
+		idx   int
+		spent float64
+		cnt   int
+	}
+	rawAggs, sfErr, _ := resumeSFGroup.Do(resumeAggregateKey(budgetID, userToday)+":r", func() (any, error) {
+		rs, qerr := database.DB.Pool.Query(reqCtx, `
+			WITH ranges AS (
+			  SELECT generate_subscripts($2::date[], 1) AS idx,
+			         unnest($2::date[]) AS ps,
+			         unnest($3::date[]) AS pe
+			)
+			SELECT r.idx,
+			       COALESCE(SUM(e.amount)::float8, 0) AS spent,
+			       COUNT(e.id)::int AS cnt
+			FROM ranges r
+			LEFT JOIN budget_expenses e
+			  ON e.budget_id = $1
+			 AND e.expense_date >= r.ps
+			 AND e.expense_date < r.pe
+			GROUP BY r.idx
+			HAVING COUNT(e.id) > 0
+			ORDER BY r.idx
+		`, budgetID, starts, ends)
+		if qerr != nil {
+			return nil, qerr
+		}
+		defer rs.Close()
+		out := make([]periodAgg, 0, len(periods))
+		for rs.Next() {
+			var pa periodAgg
+			if scanErr := rs.Scan(&pa.idx, &pa.spent, &pa.cnt); scanErr != nil {
+				return nil, scanErr
+			}
+			out = append(out, pa)
+		}
+		return out, rs.Err()
+	})
+	if sfErr != nil {
 		return errInternal(c, "failed to aggregate periods")
 	}
-	defer rows.Close()
-
+	aggs := rawAggs.([]periodAgg)
 	result := make([]models.BudgetResumePeriod, 0, len(periods))
-	for rows.Next() {
-		var idx int
-		var spent float64
-		var cnt int
-		if err := rows.Scan(&idx, &spent, &cnt); err != nil {
-			return errInternal(c, "failed to parse period row")
-		}
+	for _, pa := range aggs {
+		idx := pa.idx
+		spent := pa.spent
 		if idx < 1 || idx > len(periods) {
 			continue
 		}

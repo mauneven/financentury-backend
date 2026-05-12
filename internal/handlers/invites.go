@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -14,8 +15,32 @@ import (
 
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
+
+// Sentinel errors used by the invite cache-aside loader to signal which
+// HTTP error the outer handler should return. They never escape the
+// package — handlers translate them into errInternal / errNotFound /
+// errBadRequest as appropriate.
+var (
+	errInviteFetch    = errors.New("invite fetch failed")
+	errInviteNotFound = errors.New("invite not found")
+	errBudgetFetch    = errors.New("budget fetch failed")
+	errBudgetNotFound = errors.New("budget not found")
+)
+
+// inviteInfoCacheTTL bounds the staleness window for public invite info.
+// 60s is a balance between fresh "is the invite consumed?" feedback and
+// absorbing retries on the invite landing page.
+const inviteInfoCacheTTL = 60 * time.Second
+
+// inviteInfoCacheKey keys the public invite info payload by token. The
+// token is unguessable random bytes (inviteTokenBytes), safe to embed in
+// a Redis key.
+func inviteInfoCacheKey(token string) string {
+	return "invite:info:" + token
+}
 
 // Package-level frontend URL for invite links.
 var frontendURL string
@@ -63,8 +88,11 @@ func ListInvites(c *fiber.Ctx) error {
 		return errNotFound(c, "budget not found")
 	}
 
+	// Explicit columns instead of SELECT * so we never ship hidden columns
+	// (e.g. password_hash on a related join in the future) and the planner
+	// gets exactly the set the response model needs.
 	query := database.NewFilter().
-		Select("*").
+		Select("id,budget_id,invite_token,created_by,used_by,used_at,expires_at,created_at").
 		Eq("budget_id", budgetID.String()).
 		Order("created_at", "desc").
 		Build()
@@ -150,6 +178,12 @@ func CreateInvite(c *fiber.Ctx) error {
 }
 
 // GetInviteInfo returns public invite preview info (no auth required).
+//
+// PERF: Redis cache-aside (invite:info:<token>, 60s TTL). The endpoint is
+// public and has no auth context to scope per-user — the token itself
+// is the namespace. AcceptInvite drops the matching key so the
+// post-acceptance UI flips to "used" within one round-trip instead of
+// waiting for the TTL.
 func GetInviteInfo(c *fiber.Ctx) error {
 	token := strings.TrimSpace(c.Params("token"))
 	if token == "" {
@@ -159,76 +193,97 @@ func GetInviteInfo(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid invite token")
 	}
 
-	// Fetch the invite by token.
-	query := database.NewFilter().
-		Select("*").
-		Eq("invite_token", token).
-		Build()
+	reqCtx := c.Context()
+	payload, err := rediscache.CacheAside(reqCtx, inviteInfoCacheKey(token), inviteInfoCacheTTL,
+		func(_ context.Context) ([]byte, error) {
+			// Fetch only the columns this handler actually inspects: budget_id (for
+			// the budget-name lookup), created_by (for the inviter-name lookup),
+			// used_by (to surface IsUsed), and expires_at (to surface IsExpired).
+			query := database.NewFilter().
+				Select("budget_id,created_by,used_by,expires_at").
+				Eq("invite_token", token).
+				Build()
 
-	body, statusCode, err := database.DB.Get("budget_invites", query)
-	if err != nil || statusCode != http.StatusOK {
-		return errInternal(c, "failed to fetch invite")
-	}
+			body, statusCode, fetchErr := database.DB.Get("budget_invites", query)
+			if fetchErr != nil || statusCode != http.StatusOK {
+				return nil, errInviteFetch
+			}
 
-	var invites []models.Invite
-	if err := json.Unmarshal(body, &invites); err != nil || len(invites) == 0 {
-		return errNotFound(c, "invite not found")
-	}
+			var invites []models.Invite
+			if jsonErr := json.Unmarshal(body, &invites); jsonErr != nil || len(invites) == 0 {
+				return nil, errInviteNotFound
+			}
 
-	invite := invites[0]
+			invite := invites[0]
 
-	// Fetch budget name.
-	budgetQuery := database.NewFilter().
-		Select("name").
-		Eq("id", invite.BudgetID.String()).
-		Build()
+			budgetQuery := database.NewFilter().
+				Select("name").
+				Eq("id", invite.BudgetID.String()).
+				Build()
 
-	budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
-	if budgetErr != nil || budgetStatus != http.StatusOK {
-		return errInternal(c, "failed to fetch budget")
-	}
+			budgetBody, budgetStatus, budgetErr := database.DB.Get("budgets", budgetQuery)
+			if budgetErr != nil || budgetStatus != http.StatusOK {
+				return nil, errBudgetFetch
+			}
 
-	var budgets []struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(budgetBody, &budgets); err != nil || len(budgets) == 0 {
-		return errNotFound(c, "budget not found")
-	}
+			var budgets []struct {
+				Name string `json:"name"`
+			}
+			if bgErr := json.Unmarshal(budgetBody, &budgets); bgErr != nil || len(budgets) == 0 {
+				return nil, errBudgetNotFound
+			}
 
-	// Fetch inviter name.
-	profileQuery := database.NewFilter().
-		Select("full_name").
-		Eq("id", invite.CreatedBy.String()).
-		Build()
+			profileQuery := database.NewFilter().
+				Select("full_name").
+				Eq("id", invite.CreatedBy.String()).
+				Build()
 
-	profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
-	inviterName := "Unknown"
-	if profileErr == nil && profileStatus == http.StatusOK {
-		var profiles []struct {
-			FullName string `json:"full_name"`
+			profileBody, profileStatus, profileErr := database.DB.Get("profiles", profileQuery)
+			inviterName := "Unknown"
+			if profileErr == nil && profileStatus == http.StatusOK {
+				var profiles []struct {
+					FullName string `json:"full_name"`
+				}
+				if pErr := json.Unmarshal(profileBody, &profiles); pErr == nil && len(profiles) > 0 {
+					inviterName = profiles[0].FullName
+				}
+			}
+
+			isExpired := false
+			expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
+			if parseErr != nil {
+				expiresAt, parseErr = time.Parse(time.RFC3339, invite.ExpiresAt)
+			}
+			if parseErr == nil && time.Now().UTC().After(expiresAt) {
+				isExpired = true
+			}
+
+			return json.Marshal(models.InviteInfo{
+				BudgetName:  budgets[0].Name,
+				InviterName: inviterName,
+				ExpiresAt:   invite.ExpiresAt,
+				IsExpired:   isExpired,
+				IsUsed:      invite.UsedBy != nil,
+			})
+		},
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, errInviteFetch):
+			return errInternal(c, "failed to fetch invite")
+		case errors.Is(err, errInviteNotFound):
+			return errNotFound(c, "invite not found")
+		case errors.Is(err, errBudgetFetch):
+			return errInternal(c, "failed to fetch budget")
+		case errors.Is(err, errBudgetNotFound):
+			return errNotFound(c, "budget not found")
+		default:
+			return errInternal(c, "failed to fetch invite")
 		}
-		if err := json.Unmarshal(profileBody, &profiles); err == nil && len(profiles) > 0 {
-			inviterName = profiles[0].FullName
-		}
 	}
 
-	// Determine expiry.
-	isExpired := false
-	expiresAt, parseErr := time.Parse(time.RFC3339Nano, invite.ExpiresAt)
-	if parseErr != nil {
-		expiresAt, parseErr = time.Parse(time.RFC3339, invite.ExpiresAt)
-	}
-	if parseErr == nil && time.Now().UTC().After(expiresAt) {
-		isExpired = true
-	}
-
-	return c.JSON(models.InviteInfo{
-		BudgetName:  budgets[0].Name,
-		InviterName: inviterName,
-		ExpiresAt:   invite.ExpiresAt,
-		IsExpired:   isExpired,
-		IsUsed:      invite.UsedBy != nil,
-	})
+	c.Set("Content-Type", "application/json")
+	return c.Send(payload)
 }
 
 // AcceptInvite accepts an invite and adds the user as a collaborator.
@@ -247,9 +302,11 @@ func AcceptInvite(c *fiber.Ctx) error {
 		return errBadRequest(c, "invalid invite token")
 	}
 
-	// Fetch the invite by token.
+	// Fetch only the columns this handler inspects: id (to consume the
+	// invite atomically below), budget_id (to add the collaborator and
+	// return the budget), and expires_at (to enforce expiry).
 	query := database.NewFilter().
-		Select("*").
+		Select("id,budget_id,expires_at").
 		Eq("invite_token", token).
 		Build()
 
@@ -348,6 +405,17 @@ func AcceptInvite(c *fiber.Ctx) error {
 	// could still be holding a stale collaborator list / spending_by_user
 	// view, so purge it before the accepting user's first dashboard load.
 	invalidateBudget(invite.BudgetID)
+	// Invalidate the public invite info cache so the post-accept landing
+	// page flips to "used" without waiting on the 60s TTL. The acceptor's
+	// /budgets list now includes this budget; drop their list cache too.
+	rediscache.Delete(c.Context(),
+		inviteInfoCacheKey(token),
+		budgetsListCacheKey(userID),
+	)
+	rediscache.DeletePattern(c.Context(), "budgets:linkable:"+userID.String()+":*")
+	// And the owner's linkable view since the new collaborator can now
+	// participate in linked categories.
+	rediscache.DeletePattern(c.Context(), "budgets:linkable:*:"+invite.BudgetID.String())
 
 	// PERF: Fetch the budget via a direct pgx QueryRow instead of
 	// database.DB.Get, which wraps the SELECT in a json_agg(to_json(...))

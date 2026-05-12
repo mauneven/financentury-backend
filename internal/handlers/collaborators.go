@@ -10,6 +10,7 @@ import (
 
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
 
@@ -210,6 +211,13 @@ func RemoveCollaborator(c *fiber.Ctx) error {
 	// removed user's expenses stay but attribution changes, so drop the
 	// budget's cached summary/trends/resume too.
 	invalidateBudget(budgetID)
+	// Removed collaborator's /budgets list shrinks; their /linkable view
+	// for this budget is now obsolete. Owner sees no /budgets change.
+	rediscache.Delete(reqCtx, budgetsListCacheKey(targetUserID))
+	rediscache.DeletePattern(reqCtx, "budgets:linkable:"+targetUserID.String()+":*")
+	// The owner's view of /linkable for THIS budget no longer enumerates
+	// the now-departed collaborator's other budgets.
+	rediscache.DeletePattern(reqCtx, "budgets:linkable:*:"+budgetID.String())
 
 	broadcast(budgetID.String(), ws.MessageTypeCollabRemoved, map[string]string{
 		"user_id": targetUserID.String(),

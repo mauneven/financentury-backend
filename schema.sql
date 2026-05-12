@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_profiles_email ON profiles(email);
+-- email lookups are served by the implicit UNIQUE-constraint btree.
 
 ALTER TABLE profiles DISABLE ROW LEVEL SECURITY;
 
@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS budget_categories (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_budget_categories_budget_id ON budget_categories(budget_id);
+-- (budget_id, sort_order) covers both equality-on-budget_id lookups and the
+-- ListCategories ORDER BY sort_order; no standalone (budget_id) index needed.
 CREATE INDEX IF NOT EXISTS idx_budget_categories_budget_sort ON budget_categories(budget_id, sort_order);
 
 ALTER TABLE budget_categories DISABLE ROW LEVEL SECURITY;
@@ -87,9 +88,16 @@ CREATE TABLE IF NOT EXISTS budget_expenses (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_budget_expenses_budget_id ON budget_expenses(budget_id);
+-- (budget_id) lookups are covered by idx_budget_expenses_budget_date and
+-- idx_budget_expenses_budget_category below. Separate (budget_id) index would
+-- duplicate them.
 CREATE INDEX IF NOT EXISTS idx_budget_expenses_category_id ON budget_expenses(category_id);
 CREATE INDEX IF NOT EXISTS idx_budget_expenses_expense_date ON budget_expenses(expense_date);
+-- Account-deletion path nulls out created_by FKs; partial index on
+-- IS NOT NULL keeps the index small (NULL `created_by` rows from legacy
+-- imports are excluded).
+CREATE INDEX IF NOT EXISTS idx_budget_expenses_created_by
+    ON budget_expenses(created_by) WHERE created_by IS NOT NULL;
 
 ALTER TABLE budget_expenses DISABLE ROW LEVEL SECURITY;
 
@@ -104,7 +112,9 @@ CREATE TABLE IF NOT EXISTS budget_collaborators (
     UNIQUE(budget_id, user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_budget_collaborators_budget_id ON budget_collaborators(budget_id);
+-- The UNIQUE(budget_id, user_id) constraint creates an implicit btree that
+-- serves both budget-only and (budget,user) probes. Only the per-user lookup
+-- (user_id leading) needs its own index.
 CREATE INDEX IF NOT EXISTS idx_budget_collaborators_user_id ON budget_collaborators(user_id);
 
 ALTER TABLE budget_collaborators DISABLE ROW LEVEL SECURITY;
@@ -122,8 +132,12 @@ CREATE TABLE IF NOT EXISTS budget_invites (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_budget_invites_invite_token ON budget_invites(invite_token);
+-- invite_token lookups are served by the UNIQUE-constraint btree.
 CREATE INDEX IF NOT EXISTS idx_budget_invites_budget_id ON budget_invites(budget_id);
+-- Used by DeleteAccount to clean up FK references from removed users.
+CREATE INDEX IF NOT EXISTS idx_budget_invites_created_by ON budget_invites(created_by);
+CREATE INDEX IF NOT EXISTS idx_budget_invites_used_by
+    ON budget_invites(used_by) WHERE used_by IS NOT NULL;
 
 ALTER TABLE budget_invites DISABLE ROW LEVEL SECURITY;
 
@@ -143,8 +157,18 @@ CREATE TABLE IF NOT EXISTS user_sessions (
     revoked_at      TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_hash);
+-- token_hash uniqueness is enforced by the UNIQUE constraint; the covering
+-- index below adds INCLUDE columns so the per-request session probe
+-- (middleware/auth.go Protected) can be served as an index-only scan.
+CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash_covering
+    ON user_sessions(token_hash)
+    INCLUDE (id, user_id, revoked_at, last_active_at);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
+-- Active-only sessions ordered by last activity (ListSessions). Partial on
+-- revoked_at IS NULL keeps the index small as revoked rows accumulate.
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user_active
+    ON user_sessions(user_id, last_active_at DESC)
+    WHERE revoked_at IS NULL;
 
 ALTER TABLE user_sessions DISABLE ROW LEVEL SECURITY;
 
@@ -168,6 +192,10 @@ CREATE TABLE IF NOT EXISTS budget_links (
 CREATE INDEX IF NOT EXISTS idx_budget_links_source_budget ON budget_links(source_budget_id);
 CREATE INDEX IF NOT EXISTS idx_budget_links_target_budget ON budget_links(target_budget_id);
 CREATE INDEX IF NOT EXISTS idx_budget_links_source_category ON budget_links(source_category_id);
+-- Used by budget delete, collaborator removal, and account deletion to
+-- clean up links created by a specific user.
+CREATE INDEX IF NOT EXISTS idx_budget_links_created_by
+    ON budget_links(created_by) WHERE created_by IS NOT NULL;
 
 ALTER TABLE budget_links DISABLE ROW LEVEL SECURITY;
 
@@ -182,11 +210,49 @@ CREATE TABLE IF NOT EXISTS display_orders (
     UNIQUE(user_id, scope_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_display_orders_user_id ON display_orders(user_id);
+-- The UNIQUE(user_id, scope_key) constraint creates an implicit btree that
+-- serves user_id-leading lookups; no standalone (user_id) index needed.
 
 ALTER TABLE display_orders DISABLE ROW LEVEL SECURITY;
 
 -- ─── composite indexes for common query patterns ─────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_budget_expenses_budget_date ON budget_expenses(budget_id, expense_date);
 CREATE INDEX IF NOT EXISTS idx_budget_expenses_budget_category ON budget_expenses(budget_id, category_id);
-CREATE INDEX IF NOT EXISTS idx_budget_collaborators_budget_user ON budget_collaborators(budget_id, user_id);
+-- (budget_id, user_id) is already enforced as a UNIQUE constraint above
+-- (UNIQUE(budget_id, user_id) on budget_collaborators), which creates an
+-- implicit btree that serves both equality probes — no separate index needed.
+
+-- ─── attest_keys (mobile hardware attestation) ──────────────────────────────
+-- App Attest (iOS) + Play Integrity (Android) key registration. See
+-- migrations/003_attest_keys.sql for rationale; this file mirrors the
+-- post-migration state so schema.sql stays bootstrap-safe.
+
+CREATE TABLE IF NOT EXISTS attest_keys (
+    id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID         NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    platform     TEXT         NOT NULL CHECK (platform IN ('ios', 'android')),
+    key_id       TEXT         NOT NULL,
+    public_key   BYTEA        NULL,
+    counter      BIGINT       NOT NULL DEFAULT 0,
+    last_seen_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    UNIQUE (platform, key_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attest_keys_user
+    ON attest_keys(user_id) WHERE user_id IS NOT NULL;
+
+ALTER TABLE attest_keys DISABLE ROW LEVEL SECURITY;
+
+-- ─── attest_challenges (single-use App Attest challenges) ───────────────────
+
+CREATE TABLE IF NOT EXISTS attest_challenges (
+    challenge    BYTEA       PRIMARY KEY,
+    issued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_attest_challenges_expires
+    ON attest_challenges(expires_at);
+
+ALTER TABLE attest_challenges DISABLE ROW LEVEL SECURITY;

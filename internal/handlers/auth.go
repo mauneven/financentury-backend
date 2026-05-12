@@ -17,7 +17,32 @@ import (
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 	"github.com/the-financial-workspace/backend/internal/models"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 )
+
+// authMeCacheTTL bounds the staleness window of /auth/me payloads in Redis.
+// Profile name + display orders rarely change for a given user; a 60-second
+// TTL absorbs the burst of /auth/me calls every dashboard mount fires.
+// Mutations (UpdateProfile, DeleteAccount) explicitly invalidate so the next
+// call rebuilds from the DB regardless of TTL.
+const authMeCacheTTL = 60 * time.Second
+
+// authMeCacheKey returns the Redis key for a user's /auth/me payload. Scoped
+// per-user so a stale entry can never leak across accounts.
+func authMeCacheKey(userID uuid.UUID) string {
+	return "auth:me:" + userID.String()
+}
+
+// profileCacheTTL is longer because we cache the raw profile row used by
+// summary's spending_by_user join, and that row mutates rarely.
+const profileCacheTTL = 5 * time.Minute
+
+// profileCacheKey is the Redis key for a single profile row. Used by the
+// cross-handler profile loader so summary/trends/etc. can deduplicate a
+// scattering of identical profile lookups.
+func profileCacheKey(userID uuid.UUID) string {
+	return "profile:" + userID.String()
+}
 
 // maskEmail returns a masked version of an email address for safe logging,
 // showing only the first 2 characters of the local part plus the domain.
@@ -452,6 +477,11 @@ func createNewProfile(userInfo googleUserInfo) (models.Profile, error) {
 // sub-SELECT with json_agg so the result arrives as one row on one
 // round-trip. /auth/me is called on every cold-start and token refresh, so
 // this saves 1 DB query per call on the hottest authenticated endpoint.
+//
+// PERF: Redis cache-aside (auth:me:<userid>, 60s TTL) deflects repeat
+// /auth/me hits from many devices / tabs into a single DB read. Mutations
+// (UpdateProfile, DeleteAccount) invalidate the entry so the next read
+// reflects the new state immediately.
 func Me(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -459,46 +489,55 @@ func Me(c *fiber.Ctx) error {
 	}
 
 	reqCtx := c.Context()
-	var p models.Profile
-	var createdAt, updatedAt time.Time
-	var ordersJSON []byte
-	// PERF: single query — profile columns + aggregated display_orders as
-	// JSON. COALESCE keeps the result shape stable when the user has no
-	// saved orders (returns []). The sub-SELECT is cheaper than a LEFT JOIN
-	// LATERAL because we never need the full cross-product.
-	err := database.DB.Pool.QueryRow(reqCtx,
-		`SELECT p.id, p.email, p.full_name, p.created_at, p.updated_at,
-		        COALESCE((
-		          SELECT json_agg(json_build_object(
-		            'scope_key', d.scope_key,
-		            'ordered_ids', d.ordered_ids
-		          ))
-		          FROM display_orders d
-		          WHERE d.user_id = p.id
-		        ), '[]'::json) AS display_orders
-		 FROM profiles p
-		 WHERE p.id = $1`, userID,
-	).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt, &ordersJSON)
+	cacheKey := authMeCacheKey(userID)
+
+	payload, err := rediscache.CacheAside(reqCtx, cacheKey, authMeCacheTTL,
+		func(ctx context.Context) ([]byte, error) {
+			var p models.Profile
+			var createdAt, updatedAt time.Time
+			var ordersJSON []byte
+			// PERF: single query — profile columns + aggregated display_orders as
+			// JSON. COALESCE keeps the result shape stable when the user has no
+			// saved orders (returns []). The sub-SELECT is cheaper than a LEFT JOIN
+			// LATERAL because we never need the full cross-product.
+			if dbErr := database.DB.Pool.QueryRow(ctx,
+				`SELECT p.id, p.email, p.full_name, p.created_at, p.updated_at,
+				        COALESCE((
+				          SELECT json_agg(json_build_object(
+				            'scope_key', d.scope_key,
+				            'ordered_ids', d.ordered_ids
+				          ))
+				          FROM display_orders d
+				          WHERE d.user_id = p.id
+				        ), '[]'::json) AS display_orders
+				 FROM profiles p
+				 WHERE p.id = $1`, userID,
+			).Scan(&p.ID, &p.Email, &p.FullName, &createdAt, &updatedAt, &ordersJSON); dbErr != nil {
+				return nil, dbErr
+			}
+			p.CreatedAt = createdAt.Format(time.RFC3339Nano)
+			p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
+
+			ordersMsg := json.RawMessage(ordersJSON)
+			if len(ordersMsg) == 0 {
+				ordersMsg = json.RawMessage("[]")
+			}
+
+			return json.Marshal(fiber.Map{
+				"id":             p.ID,
+				"email":          p.Email,
+				"full_name":      p.FullName,
+				"display_orders": ordersMsg,
+			})
+		},
+	)
 	if err != nil {
 		log.Printf("Me: profile lookup failed for user %s: %v", userID, err)
 		return errNotFound(c, "profile not found")
 	}
-	p.CreatedAt = createdAt.Format(time.RFC3339Nano)
-	p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
 
-	// Ship the aggregated display_orders as raw JSON so we don't round-trip
-	// through Go structs just to serialize them again.
-	ordersMsg := json.RawMessage(ordersJSON)
-	if len(ordersMsg) == 0 {
-		ordersMsg = json.RawMessage("[]")
-	}
-
-	return c.JSON(fiber.Map{
-		"id":             p.ID,
-		"email":          p.Email,
-		"full_name":      p.FullName,
-		"display_orders": ordersMsg,
-	})
+	c.Set("Content-Type", "application/json")
+	return c.Send(payload)
 }
 
 // UpdateProfile updates the authenticated user's profile (currently only name).
@@ -539,6 +578,10 @@ func UpdateProfile(c *fiber.Ctx) error {
 	}
 	p.CreatedAt = createdAt.Format(time.RFC3339Nano)
 	p.UpdatedAt = updatedAt.Format(time.RFC3339Nano)
+
+	// PERF: drop cached /auth/me + profile entries so the next read reflects
+	// the new full_name. TTL would otherwise paper over the change for ~60s.
+	rediscache.Delete(c.Context(), authMeCacheKey(userID), profileCacheKey(userID))
 
 	return c.JSON(p)
 }
@@ -646,6 +689,15 @@ func DeleteAccount(c *fiber.Ctx) error {
 	// request could repopulate the cache from still-extant rows between
 	// cache-delete and tx-commit.
 	middleware.InvalidateUserSessionCache(uid)
+
+	// PERF/SECURITY: drop the user's cached /auth/me + profile + budget
+	// list entries so a stale read can never serve data for a deleted
+	// account. The DB rows are gone — these caches must follow.
+	rediscache.Delete(c.Context(),
+		authMeCacheKey(userID),
+		profileCacheKey(userID),
+		budgetsListCacheKey(userID),
+	)
 
 	return c.SendStatus(fiber.StatusNoContent)
 }

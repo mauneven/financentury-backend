@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -14,8 +15,81 @@ import (
 
 	"github.com/the-financial-workspace/backend/internal/database"
 	"github.com/the-financial-workspace/backend/internal/models"
+	rediscache "github.com/the-financial-workspace/backend/internal/redis"
 	"github.com/the-financial-workspace/backend/internal/ws"
 )
+
+// budgetsListCacheTTL bounds /budgets list staleness in Redis. The endpoint
+// fans out from every dashboard / budget switcher mount, so a 30-second
+// window absorbs that burst into a single DB read while keeping the
+// "newly-created budget" delay short.
+const budgetsListCacheTTL = 30 * time.Second
+
+// budgetsListCacheKey returns the Redis key for a user's /budgets list
+// payload. Per-user scoping prevents collaborator visibility leakage.
+func budgetsListCacheKey(userID uuid.UUID) string {
+	return "budgets:list:" + userID.String()
+}
+
+// linkableBudgetsCacheTTL is the TTL for the /budgets/:id/linkable response.
+// Linkable budgets change only when budgets are CRUDed or collaborators
+// move — invalidated explicitly on those events.
+const linkableBudgetsCacheTTL = 60 * time.Second
+
+// linkableBudgetsCacheKey returns the Redis key for a (user, budget) pair's
+// linkable budgets list.
+func linkableBudgetsCacheKey(userID, budgetID uuid.UUID) string {
+	return "budgets:linkable:" + userID.String() + ":" + budgetID.String()
+}
+
+// invalidateBudgetsListCachesForCollaborators drops the cached /budgets
+// list entries for every user that can see this budget (owner +
+// collaborators). Called from any mutation that changes the budget itself
+// (create/update/delete), which would otherwise leave collaborators
+// staring at stale shells for up to budgetsListCacheTTL.
+//
+// Best-effort: a DB lookup error degrades silently; the TTL will heal
+// the entry within 30 seconds.
+func invalidateBudgetsListCachesForCollaborators(ctx context.Context, budgetID uuid.UUID) {
+	if database.DB == nil || database.DB.Pool == nil {
+		return
+	}
+	rows, err := database.DB.Pool.Query(ctx,
+		`SELECT user_id FROM budgets WHERE id = $1
+		 UNION
+		 SELECT user_id FROM budget_collaborators WHERE budget_id = $1`,
+		budgetID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	keys := make([]string, 0, 4)
+	for rows.Next() {
+		var uid uuid.UUID
+		if scanErr := rows.Scan(&uid); scanErr == nil {
+			keys = append(keys, budgetsListCacheKey(uid))
+			// Each collaborator's linkable view changes when this budget
+			// is mutated; drop them too.
+			keys = append(keys, "budgets:linkable:"+uid.String()+":*")
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	// Direct delete for the exact keys; pattern delete for the linkable
+	// glob. Splitting keeps the SCAN scope small.
+	exact := make([]string, 0, len(keys)/2)
+	for _, k := range keys {
+		if strings.HasSuffix(k, "*") {
+			rediscache.DeletePattern(ctx, k)
+		} else {
+			exact = append(exact, k)
+		}
+	}
+	if len(exact) > 0 {
+		rediscache.Delete(ctx, exact...)
+	}
+}
 
 // guidedCategory defines a single flat category entry in a budget template.
 // Percent represents the percentage of the TOTAL budget income. The former
@@ -115,6 +189,11 @@ func getCategoriesForMode(mode string) []guidedCategory {
 
 // ListBudgets returns all budgets for the authenticated user (owned + collaborative).
 // Supports limit/offset pagination via query params.
+//
+// PERF: Redis cache-aside (budgets:list:<userid>, 30s TTL) collapses the
+// dashboard-mount fan-out into one DB read. Pagination params bypass the
+// cache because non-default offsets/limits would explode the key space and
+// almost never come from real users (the UI only fires defaults).
 func ListBudgets(c *fiber.Ctx) error {
 	userID, ok := requireUserID(c)
 	if !ok {
@@ -122,42 +201,64 @@ func ListBudgets(c *fiber.Ctx) error {
 	}
 
 	limit, offset := parsePaginationParams(c)
-
-	// Single query returning both owned and collaborated budgets. This replaces
-	// the old 2-3 query pattern (owned list + collab IDs + collab budgets) that
-	// required two round-trips plus a second Unmarshal of budget rows.
 	reqCtx := c.Context()
-	// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
-	// without ::float8 cast.
-	rows, err := database.DB.Pool.Query(reqCtx, `
-		SELECT id, user_id, name, icon, monthly_income::float8, currency,
-		       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
-		FROM budgets
-		WHERE user_id = $1
-		   OR id IN (SELECT budget_id FROM budget_collaborators WHERE user_id = $1)
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3
-	`, userID, limit, offset)
+
+	// Skip the cache when the caller asked for a non-default page; that
+	// path is rare and the per-paginated-window cache space is not worth
+	// it.
+	useCache := offset == 0 && limit == 100
+
+	loader := func(ctx context.Context) ([]byte, error) {
+		// Single query returning both owned and collaborated budgets. This replaces
+		// the old 2-3 query pattern (owned list + collab IDs + collab budgets) that
+		// required two round-trips plus a second Unmarshal of budget rows.
+		// FIX: monthly_income is NUMERIC — pgx binary format can't scan NUMERIC→float64
+		// without ::float8 cast.
+		rows, queryErr := database.DB.Pool.Query(ctx, `
+			SELECT id, user_id, name, icon, monthly_income::float8, currency,
+			       billing_period_months, billing_cutoff_day, mode, created_at, updated_at
+			FROM budgets
+			WHERE user_id = $1
+			   OR id IN (SELECT budget_id FROM budget_collaborators WHERE user_id = $1)
+			ORDER BY created_at DESC
+			LIMIT $2 OFFSET $3
+		`, userID, limit, offset)
+		if queryErr != nil {
+			return nil, queryErr
+		}
+		defer rows.Close()
+
+		budgets := make([]models.Budget, 0)
+		for rows.Next() {
+			var b models.Budget
+			if scanErr := rows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
+				&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
+				&b.CreatedAt, &b.UpdatedAt); scanErr != nil {
+				return nil, scanErr
+			}
+			budgets = append(budgets, b)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			return nil, rowsErr
+		}
+		return json.Marshal(budgets)
+	}
+
+	if !useCache {
+		payload, err := loader(reqCtx)
+		if err != nil {
+			return errInternal(c, "failed to fetch budgets")
+		}
+		c.Set("Content-Type", "application/json")
+		return c.Send(payload)
+	}
+
+	payload, err := rediscache.CacheAside(reqCtx, budgetsListCacheKey(userID), budgetsListCacheTTL, loader)
 	if err != nil {
 		return errInternal(c, "failed to fetch budgets")
 	}
-	defer rows.Close()
-
-	budgets := make([]models.Budget, 0)
-	for rows.Next() {
-		var b models.Budget
-		if err := rows.Scan(&b.ID, &b.UserID, &b.Name, &b.Icon, &b.MonthlyIncome,
-			&b.Currency, &b.BillingPeriodMonths, &b.BillingCutoffDay, &b.Mode,
-			&b.CreatedAt, &b.UpdatedAt); err != nil {
-			return errInternal(c, "failed to parse budget row")
-		}
-		budgets = append(budgets, b)
-	}
-	if err := rows.Err(); err != nil {
-		return errInternal(c, "failed to iterate budgets")
-	}
-
-	return c.JSON(budgets)
+	c.Set("Content-Type", "application/json")
+	return c.Send(payload)
 }
 
 // maxBudgetsPerUser is the maximum number of budgets a user can access
@@ -299,6 +400,10 @@ func CreateBudget(c *fiber.Ctx) error {
 	// PERF: invalidate any cached summary for the new budget so the first
 	// dashboard load after creation doesn't serve a pre-seed shell.
 	invalidateBudget(budgetID)
+	// New budget changes this user's /budgets list cache. Linkable lookups
+	// across this user's other budgets also shift.
+	rediscache.Delete(c.Context(), budgetsListCacheKey(userID))
+	rediscache.DeletePattern(c.Context(), "budgets:linkable:"+userID.String()+":*")
 
 	broadcast(budgetID.String(), ws.MessageTypeBudgetCreated, budget)
 
@@ -565,6 +670,11 @@ func UpdateBudget(c *fiber.Ctx) error {
 	// PERF: drop cached summary so the next GET reflects the new income /
 	// metadata immediately.
 	invalidateBudget(budgetID)
+	// Budget metadata change can shift name/icon/currency rendered by the
+	// /budgets list and the /linkable view. Drop both caches for every user
+	// who can see this budget so collaborators don't get stuck on stale
+	// names.
+	invalidateBudgetsListCachesForCollaborators(c.Context(), budgetID)
 
 	broadcast(budgetID.String(), ws.MessageTypeBudgetUpdated, b)
 
@@ -625,6 +735,12 @@ func DeleteBudget(c *fiber.Ctx) error {
 	// couldn't identify without another query.
 	invalidateLinkTargetsCacheAll()
 	invalidateBudget(budgetID)
+	// Owner's /budgets list shrinks; collaborator lookups also shift. We
+	// can't query the (now-deleted) budget's collaborators after CASCADE,
+	// so invalidate the owner only and let TTL clean up the collaborator
+	// caches within budgetsListCacheTTL.
+	rediscache.Delete(reqCtx, budgetsListCacheKey(userID))
+	rediscache.DeletePattern(reqCtx, "budgets:linkable:"+userID.String()+":*")
 
 	broadcast(bid, ws.MessageTypeBudgetDeleted, map[string]string{"id": bid})
 

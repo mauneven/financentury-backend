@@ -323,3 +323,98 @@ func TestLoad_PortBoundary65535(t *testing.T) {
 		t.Errorf("Port = %d, want 65535", cfg.Port)
 	}
 }
+
+// ==================== Load — Bot Protection (captcha) =====================
+
+// TestLoad_CaptchaVarsOptional verifies that every captcha-related env
+// var defaults to "" — the backend must start without bot protection
+// configured (no-op verifiers + startup warning, per the spec).
+func TestLoad_CaptchaVarsOptional(t *testing.T) {
+	cleanup := setRequiredEnvVars(t)
+	defer cleanup()
+
+	for _, k := range []string{
+		"TURNSTILE_SECRET",
+		"APPLE_APP_ATTEST_TEAM_ID",
+		"APPLE_APP_ATTEST_BUNDLE",
+		"GOOGLE_PLAY_INTEGRITY_PACKAGE_NAME",
+		"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY",
+		"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY",
+	} {
+		os.Unsetenv(k)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed without captcha vars: %v", err)
+	}
+	if cfg.TurnstileSecret != "" ||
+		cfg.AppleAppAttestTeamID != "" ||
+		cfg.AppleAppAttestBundleID != "" ||
+		cfg.GooglePlayIntegrityPackageName != "" ||
+		cfg.GooglePlayIntegrityDecryptionKey != "" ||
+		cfg.GooglePlayIntegrityVerificationKey != "" {
+		t.Errorf("unset captcha vars should produce empty strings, got %+v", cfg)
+	}
+}
+
+// TestLoad_CaptchaVarsParsed verifies that all six captcha vars are read
+// off the environment exactly as the spec documents.
+func TestLoad_CaptchaVarsParsed(t *testing.T) {
+	cleanup := setRequiredEnvVars(t)
+	defer cleanup()
+
+	vars := map[string]string{
+		"TURNSTILE_SECRET":                       "0x4Asecret",
+		"APPLE_APP_ATTEST_TEAM_ID":               "ABCD123456",
+		"APPLE_APP_ATTEST_BUNDLE":                "com.test.app",
+		"GOOGLE_PLAY_INTEGRITY_PACKAGE_NAME":     "com.test.android",
+		"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY":   "ZGVj",
+		"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY": "dmVy",
+	}
+	for k, v := range vars {
+		os.Setenv(k, v)
+		defer os.Unsetenv(k)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if cfg.TurnstileSecret != "0x4Asecret" {
+		t.Errorf("TurnstileSecret = %q", cfg.TurnstileSecret)
+	}
+	if cfg.AppleAppAttestTeamID != "ABCD123456" {
+		t.Errorf("AppleAppAttestTeamID = %q", cfg.AppleAppAttestTeamID)
+	}
+	if cfg.AppleAppAttestBundleID != "com.test.app" {
+		t.Errorf("AppleAppAttestBundleID = %q", cfg.AppleAppAttestBundleID)
+	}
+	if cfg.GooglePlayIntegrityPackageName != "com.test.android" {
+		t.Errorf("GooglePlayIntegrityPackageName = %q", cfg.GooglePlayIntegrityPackageName)
+	}
+	if cfg.GooglePlayIntegrityDecryptionKey != "ZGVj" {
+		t.Errorf("GooglePlayIntegrityDecryptionKey = %q", cfg.GooglePlayIntegrityDecryptionKey)
+	}
+	if cfg.GooglePlayIntegrityVerificationKey != "dmVy" {
+		t.Errorf("GooglePlayIntegrityVerificationKey = %q", cfg.GooglePlayIntegrityVerificationKey)
+	}
+}
+
+// TestLoad_CaptchaVarsTrimmed verifies the whitespace-tolerance of env
+// var parsing — operators sometimes wrap secrets in quotes or paste with
+// trailing newlines.
+func TestLoad_CaptchaVarsTrimmed(t *testing.T) {
+	cleanup := setRequiredEnvVars(t)
+	defer cleanup()
+
+	os.Setenv("TURNSTILE_SECRET", "  the-secret  \n")
+	defer os.Unsetenv("TURNSTILE_SECRET")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if cfg.TurnstileSecret != "the-secret" {
+		t.Errorf("TurnstileSecret = %q, want trimmed", cfg.TurnstileSecret)
+	}
+}

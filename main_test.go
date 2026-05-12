@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
+
+	"github.com/the-financial-workspace/backend/internal/middleware"
 )
 
 // TestCacheControlAndETag_304OnMatch wires the middleware onto a minimal
@@ -15,7 +18,7 @@ import (
 // body plus preserved Cache-Control + ETag + Vary headers.
 func TestCacheControlAndETag_304OnMatch(t *testing.T) {
 	app := fiber.New()
-	app.Use(cacheControlAndETag())
+	app.Use(middleware.CacheControlAndETag())
 	app.Get("/api/budgets/abc/summary", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"income": 100, "expenses": 42})
 	})
@@ -33,7 +36,7 @@ func TestCacheControlAndETag_304OnMatch(t *testing.T) {
 	if etag == "" {
 		t.Fatal("missing ETag on initial response")
 	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "private, max-age=10, stale-while-revalidate=30" {
+	if cc := resp.Header.Get("Cache-Control"); cc != "private, max-age=10, stale-while-revalidate=60, stale-if-error=300" {
 		t.Errorf("Cache-Control = %q", cc)
 	}
 	if vary := resp.Header.Get("Vary"); vary != "Authorization, Accept-Encoding" {
@@ -60,7 +63,7 @@ func TestCacheControlAndETag_304OnMatch(t *testing.T) {
 	if got := resp2.Header.Get("ETag"); got != etag {
 		t.Errorf("ETag on 304 = %q, want %q", got, etag)
 	}
-	if cc := resp2.Header.Get("Cache-Control"); cc != "private, max-age=10, stale-while-revalidate=30" {
+	if cc := resp2.Header.Get("Cache-Control"); cc != "private, max-age=10, stale-while-revalidate=60, stale-if-error=300" {
 		t.Errorf("Cache-Control on 304 = %q", cc)
 	}
 }
@@ -69,7 +72,7 @@ func TestCacheControlAndETag_304OnMatch(t *testing.T) {
 // receive ETag or Cache-Control, even on a whitelisted path.
 func TestCacheControlAndETag_SkipsWriteMethods(t *testing.T) {
 	app := fiber.New()
-	app.Use(cacheControlAndETag())
+	app.Use(middleware.CacheControlAndETag())
 	app.Post("/api/budgets/abc/expenses", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"ok": true})
 	})
@@ -92,7 +95,7 @@ func TestCacheControlAndETag_SkipsWriteMethods(t *testing.T) {
 // subpaths that must always hit the DB fresh.
 func TestCacheControlAndETag_SkipsExcludedSubpaths(t *testing.T) {
 	app := fiber.New()
-	app.Use(cacheControlAndETag())
+	app.Use(middleware.CacheControlAndETag())
 	app.Get("/api/budgets/abc/invites", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"invites": []string{}})
 	})
@@ -117,4 +120,39 @@ func TestCacheControlAndETag_SkipsExcludedSubpaths(t *testing.T) {
 			t.Errorf("%s: expected no Cache-Control", path)
 		}
 	}
+}
+
+// TestMaxBodySize_RejectsOversize ensures the auth body cap rejects payloads
+// larger than the configured limit with a 413 and lets small bodies through.
+func TestMaxBodySize_RejectsOversize(t *testing.T) {
+	app := fiber.New()
+	app.Use("/api/auth", maxBodySize(64))
+	app.Post("/api/auth/google", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
+	})
+
+	// Small body — must pass.
+	smallReq := httptest.NewRequest(http.MethodPost, "/api/auth/google", bytes.NewReader([]byte("ok")))
+	smallReq.Header.Set("Content-Type", "application/json")
+	smallResp, err := app.Test(smallReq)
+	if err != nil {
+		t.Fatalf("small request failed: %v", err)
+	}
+	if smallResp.StatusCode != http.StatusOK {
+		t.Errorf("small request status = %d, want 200", smallResp.StatusCode)
+	}
+	_ = smallResp.Body.Close()
+
+	// Body > limit — must be rejected with 413.
+	bigBody := bytes.Repeat([]byte("a"), 256)
+	bigReq := httptest.NewRequest(http.MethodPost, "/api/auth/google", bytes.NewReader(bigBody))
+	bigReq.Header.Set("Content-Type", "application/json")
+	bigResp, err := app.Test(bigReq)
+	if err != nil {
+		t.Fatalf("big request failed: %v", err)
+	}
+	if bigResp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("big request status = %d, want 413", bigResp.StatusCode)
+	}
+	_ = bigResp.Body.Close()
 }

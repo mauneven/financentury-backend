@@ -3,13 +3,28 @@ package routes
 import (
 	"github.com/gofiber/fiber/v2"
 
+	"github.com/the-financial-workspace/backend/internal/captcha"
 	"github.com/the-financial-workspace/backend/internal/handlers"
 	"github.com/the-financial-workspace/backend/internal/middleware"
 )
 
-// Setup registers all API routes on the Fiber app, including the WebSocket
-// endpoint for real-time updates.
+// SetupConfig wires per-route captcha verifiers + future configuration
+// without forcing callers to plumb every knob through Setup's signature.
+type SetupConfig struct {
+	// Captcha is the platform-aware verifier used by /api/auth/* and the
+	// public invite routes. nil → no-op (dev / staging without secrets).
+	Captcha captcha.Verifier
+}
+
+// Setup is the legacy entry point. Defaults all knobs to no-op behaviour
+// so existing tests keep compiling against a one-arg API.
 func Setup(app *fiber.App) {
+	SetupWith(app, SetupConfig{})
+}
+
+// SetupWith registers all API routes on the Fiber app with explicit
+// captcha + (future) per-feature configuration.
+func SetupWith(app *fiber.App, cfg SetupConfig) {
 	// WebSocket endpoint (before API group to avoid prefix conflicts).
 	// Authentication is handled inside the WebSocket handler via first message.
 	app.Use("/ws", handlers.WebSocketUpgrade())
@@ -17,12 +32,35 @@ func Setup(app *fiber.App) {
 
 	api := app.Group("/api")
 
-	// Public auth routes with strict rate limiting to prevent brute-force.
-	api.Post("/auth/google", middleware.AuthRateLimiter(), handlers.GoogleLogin)
-	api.Post("/auth/google/mobile", middleware.AuthRateLimiter(), handlers.GoogleMobileLogin)
+	// SECURITY: captcha gates the brute-force / abuse surface. The
+	// middleware short-circuits with 403 on a failed verification, so it
+	// must run BEFORE the rate limiter (otherwise bots burn through the
+	// 10/min/IP budget before captcha gets a say) and BEFORE the actual
+	// handler (which performs the expensive bcrypt / OAuth round-trip).
+	authCaptcha := middleware.Captcha(middleware.CaptchaConfig{
+		Verifier: cfg.Captcha,
+		Action:   "auth",
+	})
+	inviteCaptcha := middleware.Captcha(middleware.CaptchaConfig{
+		Verifier: cfg.Captcha,
+		Action:   "invite",
+	})
 
-	// Public invite info (no auth needed).
-	api.Get("/invites/:token", handlers.GetInviteInfo)
+	// Public auth routes with strict rate limiting to prevent brute-force.
+	api.Post("/auth/google", authCaptcha, middleware.AuthRateLimiter(), handlers.GoogleLogin)
+	api.Post("/auth/google/mobile", authCaptcha, middleware.AuthRateLimiter(), handlers.GoogleMobileLogin)
+	// Email login/register handlers exist (auth_email.go) but aren't
+	// mounted yet — captcha is wired so when those routes go live no
+	// follow-up change is required.
+
+	// Bootstrap endpoints for App Attest. No captcha (this IS the
+	// bootstrap). Rate-limit at the proxy layer.
+	api.Get("/attest/challenge", middleware.AuthRateLimiter(), handlers.AttestChallenge)
+	api.Post("/attest/register", middleware.AuthRateLimiter(), handlers.AttestRegister)
+
+	// Public invite info (no auth needed) — captcha guards against
+	// token-enumeration attacks.
+	api.Get("/invites/:token", inviteCaptcha, handlers.GetInviteInfo)
 
 	// Protected routes.
 	protected := api.Group("", middleware.Protected(), middleware.APIRateLimiter())
@@ -40,8 +78,10 @@ func Setup(app *fiber.App) {
 	// Migration route with strict rate limiting since it is a heavy operation.
 	protected.Post("/migrate", middleware.MigrateRateLimiter(), handlers.Migrate)
 
-	// Protected invite routes.
-	protected.Post("/invites/:token/accept", handlers.AcceptInvite)
+	// Protected invite routes. Even though the request is auth'd, captcha
+	// adds an attest signal that defends against replayed invite tokens
+	// pulled from leaked JWTs.
+	protected.Post("/invites/:token/accept", inviteCaptcha, handlers.AcceptInvite)
 
 	// Display order route (save only — read is bundled in /auth/me).
 	protected.Put("/display-orders", handlers.SaveDisplayOrder)
@@ -83,4 +123,10 @@ func Setup(app *fiber.App) {
 	budgets.Get("/:id/summary", handlers.GetBudgetSummary)
 	budgets.Get("/:id/trends", handlers.GetBudgetTrends)
 	budgets.Get("/:id/budget-resume", handlers.GetBudgetResume)
+
+	// PERF: aggregate dashboard endpoint. Returns summary+expenses+trends
+	// +resume in one envelope so clients save 3 RTTs on every dashboard
+	// mount. Each sub-builder still uses the in-process cache + singleflight,
+	// so a hot dashboard mount is O(1) DB queries.
+	budgets.Get("/:id/dashboard", handlers.GetBudgetDashboard)
 }
